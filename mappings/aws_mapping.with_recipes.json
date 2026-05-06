@@ -36,7 +36,21 @@
           "newSourceCfType": "AWS::DynamoDB::Table",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "sum",
+            "newAggregation": "max",
+            "newAggregationMode": "raw",
+            "scale": 0.8725490196078431,
+            "verdict": "good-fit",
+            "pearsonR": 0.9892567855288639,
+            "residualSmape": 0.1460674157303371,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.dynamo.capacityUnits.consumed.write",
@@ -50,7 +64,21 @@
           "newSourceCfType": "AWS::DynamoDB::Table",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "sum",
+            "newAggregation": "max",
+            "newAggregationMode": "raw",
+            "scale": 1.8823529411764708,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9999999999999952,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.dynamo.capacityUnits.provisioned.read",
@@ -64,7 +92,21 @@
           "newSourceCfType": "AWS::DynamoDB::Table",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "scale-only",
+            "pearsonR": null,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 6,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.dynamo.capacityUnits.provisioned.write",
@@ -78,7 +120,21 @@
           "newSourceCfType": "AWS::DynamoDB::Table",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "scale-only",
+            "pearsonR": 0.7543002551314258,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 7,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.dynamo.capacityUnits.read",
@@ -236,7 +292,21 @@
           "newSourceCfType": "AWS::DynamoDB::Table",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "sum",
+            "newAggregation": "sum",
+            "newAggregationMode": "raw",
+            "scale": 2,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 3,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.dynamo.throttledEvents.write",
@@ -250,7 +320,21 @@
           "newSourceCfType": "AWS::DynamoDB::Table",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "sum",
+            "newAggregation": "sum",
+            "newAggregationMode": "raw",
+            "scale": 2,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.dynamo.tables",
@@ -298,7 +382,21 @@
           "newSourceCfType": "AWS::EC2::Instance",
           "category": "direct",
           "notes": "both Percent",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1.0008484831543556,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9910453463771678,
+            "residualSmape": 0.021157311136090907,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 5,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.ec2.disk.readOps",
@@ -368,7 +466,21 @@
           "newSourceCfType": "AWS::EC2::Instance",
           "category": "unit_conversion",
           "notes": "Byte/s vs bytes/period — divide by period",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "sum",
+            "newAggregationMode": "per_second",
+            "scale": 0.9750963071683834,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9989986628827603,
+            "residualSmape": 0.03645446818511093,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 4,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.ec2.net.tx",
@@ -382,7 +494,21 @@
           "newSourceCfType": "AWS::EC2::Instance",
           "category": "unit_conversion",
           "notes": "Byte/s vs bytes/period",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "sum",
+            "newAggregationMode": "per_second",
+            "scale": 0.9746516401067744,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9995970132628976,
+            "residualSmape": 0.0098116172682829,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 3,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.az.running",
@@ -738,17 +864,17 @@
           "source": "override",
           "detectedRecipe": {
             "classicAggregation": "sum",
-            "newAggregation": "sum",
+            "newAggregation": "avg",
             "newAggregationMode": "raw",
-            "scale": 2.4949231991954974,
-            "verdict": "exact-fit",
-            "pearsonR": 0.9999955331701806,
-            "residualSmape": 0.0036089436848184306,
-            "detectedAt": "2026-05-06T20:23:02.442Z",
+            "scale": 1,
+            "verdict": "scale-only",
+            "pearsonR": null,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
             "detectedFromWindow": "-25h → -1h",
             "source": "detect-per-resource",
-            "perResourceQualifying": 2,
-            "perResourceTested": 50
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
           }
         },
         {
@@ -1178,7 +1304,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "both Percent",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 6.789964247993692e-18,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 3,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.latency.read",
@@ -1206,7 +1346,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9999999999999999,
+            "residualSmape": 2.330748575879271e-18,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.memory.freeable",
@@ -1220,7 +1374,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 3,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.memory.swap",
@@ -1234,7 +1402,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 3,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.net.rx",
@@ -1248,7 +1430,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "both are Bytes/second",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 3.047596347932807e-18,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 3,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.net.tx",
@@ -1262,7 +1458,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 6.536066347458391e-18,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 3,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.ops.read",
@@ -1276,7 +1486,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "both are per-second",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.ops.write",
@@ -1290,7 +1514,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 4.878754771849423e-18,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.throughput.read",
@@ -1304,7 +1542,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "both Bytes/second",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.throughput.write",
@@ -1318,7 +1570,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 3.931623082026217e-18,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.connections",
@@ -1332,7 +1598,21 @@
           "newSourceCfType": "AWS::RDS::DBInstance",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 1,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 2,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.rds.free",
@@ -1428,7 +1708,21 @@
           "newSourceCfType": "AWS::EC2::Volume",
           "category": "unit_conversion",
           "notes": "rate vs count/period",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "max",
+            "newAggregationMode": "per_second",
+            "scale": 0.9998530082247226,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9999325755885049,
+            "residualSmape": 0.011007996030454874,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.ebs.ops.write",
@@ -1470,7 +1764,21 @@
           "newSourceCfType": "AWS::EC2::Volume",
           "category": "unit_conversion",
           "notes": "Bytes/second vs bytes/period",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "max",
+            "newAggregationMode": "per_second",
+            "scale": 0.9998642866253208,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9999331878352641,
+            "residualSmape": 0.010413352690081958,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 1,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.ebs.throughput.write",
@@ -1498,7 +1806,21 @@
           "newSourceCfType": "AWS::EC2::Volume",
           "category": "unit_conversion",
           "notes": "classic is % of period idle; CW is seconds idle — divide by period and *100",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "sum",
+            "newAggregation": "sum",
+            "newAggregationMode": "raw",
+            "scale": 0.46672904518091174,
+            "verdict": "exact-fit",
+            "pearsonR": 0.2749486921038933,
+            "residualSmape": 0.0003112393128059425,
+            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 3,
+            "perResourceTested": 25
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.ebs.queue",
