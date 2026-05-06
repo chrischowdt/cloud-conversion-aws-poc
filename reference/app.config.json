@@ -1,0 +1,22 @@
+{
+  "$schema": "./.dt-app/app.config.schema.json",
+  "environmentUrl": "https://jxw01498.dev.apps.dynatracelabs.com/",
+  "app": {
+    "name": "cloud-migration-helper",
+    "version": "0.0.9",
+    "description": "A starting project with routing, fetching data, and charting",
+    "id": "my.cloud.migration.helper",
+    "scopes": [
+      { "name": "storage:logs:read", "comment": "default template" },
+      { "name": "app-engine:functions:run", "comment": "Needed for request to config API v1 to scan classic dashboards" },
+      { "name": "storage:buckets:read", "comment": "default template" },
+      { "name": "storage:smartscape:read", "comment": "DQL smartscapeNodes queries for new connection detection (AWS_ACCOUNT, AZURE_MICROSOFT_RESOURCES_SUBSCRIPTIONS, GCP_CLOUDRESOURCEMANAGER_GOOGLEAPIS_COM_PROJECT)" },
+      { "name": "storage:metrics:read", "comment": "DQL metric.series queries for connection classification" },
+      { "name": "storage:entities:read", "comment": "DQL dt.entity.* queries for classic connection detection" },
+      { "name": "settings:objects:read", "comment": "Settings V2 API — new cloud connection detection (hyperscaler-authentication)" },
+      { "name": "document:documents:read", "comment": "List and read new dashboards via Document Service API (Story 002)" },
+      { "name": "document:documents:admin", "comment": "Scan dashboards owned by other users — confirmed available without special approval (Story 002)" },
+      { "name": "environment-api:slo:read", "comment": "Classic SLO list via GET /classic/environment-api/v2/slo — required for Sub-scan A in Story 005" }
+    ]
+  }
+}

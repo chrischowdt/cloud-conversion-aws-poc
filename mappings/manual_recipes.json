@@ -1,0 +1,57 @@
+{
+  "_doc": "Manually curated recipes for classic metrics that detect can't recover empirically. These get folded into aws_mapping.with_recipes.json by `cct merge-recipes` AFTER the auto-detected recipes (so manual entries win on conflict).",
+  "compositeFormulas": [
+    {
+      "classicMetricId": "builtin:cloud.aws.dynamo.capacityUnits.read",
+      "classicDisplayName": "DynamoDB read capacity units %",
+      "explanation": "Classic Dynatrace computed this as the percentage of provisioned read capacity actually consumed. No single CloudWatch metric is equivalent — the percentage is rebuilt from two raw CW metrics.",
+      "formula": "(consumed / provisioned) * 100",
+      "components": [
+        {
+          "role": "consumed",
+          "newDtMetricKey": "cloud.aws.dynamodb.ConsumedReadCapacityUnits.By.TableName",
+          "newAggregation": "sum",
+          "newAggregationMode": "raw",
+          "cloudwatchName": "ConsumedReadCapacityUnits"
+        },
+        {
+          "role": "provisioned",
+          "newDtMetricKey": "cloud.aws.dynamodb.ProvisionedReadCapacityUnits.By.TableName",
+          "newAggregation": "avg",
+          "newAggregationMode": "raw",
+          "cloudwatchName": "ProvisionedReadCapacityUnits"
+        }
+      ],
+      "outputUnit": "Percent",
+      "source": "manual",
+      "verified": false,
+      "verificationNotes": "2026-05-06: empirical test on table cwd-sitrep-table-dev showed formula doesn't fit. classic values (54-307) don't reconcile with (consumed_sum/3600)/provisioned*100 (which gives 50-80). Ratio is variable 1-4x. Classic likely has additional factors (sampling differences, custom burst calculation, or different denominator). DO NOT TRUST until classic source code or DAC team confirms exact formula."
+    },
+    {
+      "classicMetricId": "builtin:cloud.aws.dynamo.capacityUnits.write",
+      "classicDisplayName": "DynamoDB write capacity units %",
+      "explanation": "Classic Dynatrace computed this as the percentage of provisioned write capacity actually consumed. No single CloudWatch metric is equivalent.",
+      "formula": "(consumed / provisioned) * 100",
+      "components": [
+        {
+          "role": "consumed",
+          "newDtMetricKey": "cloud.aws.dynamodb.ConsumedWriteCapacityUnits.By.TableName",
+          "newAggregation": "sum",
+          "newAggregationMode": "raw",
+          "cloudwatchName": "ConsumedWriteCapacityUnits"
+        },
+        {
+          "role": "provisioned",
+          "newDtMetricKey": "cloud.aws.dynamodb.ProvisionedWriteCapacityUnits.By.TableName",
+          "newAggregation": "avg",
+          "newAggregationMode": "raw",
+          "cloudwatchName": "ProvisionedWriteCapacityUnits"
+        }
+      ],
+      "outputUnit": "Percent",
+      "source": "manual",
+      "verified": false,
+      "verificationNotes": "2026-05-06: empirical test on table cwd-sitrep-table-dev showed formula doesn't fit. classic values (54-307) don't reconcile with (consumed_sum/3600)/provisioned*100 (which gives 50-80). Ratio is variable 1-4x. Classic likely has additional factors (sampling differences, custom burst calculation, or different denominator). DO NOT TRUST until classic source code or DAC team confirms exact formula."
+    }
+  ]
+}

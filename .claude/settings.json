@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Read(//c/Users/chris.chow/.claude/projects/**)",
+      "Bash(python -)",
+      "Bash(python scripts/fetch_and_parse.py)",
+      "Bash(python scripts/build_mapping.py)",
+      "Bash(unzip -q \"cloud-migration-helper-main@2c12648fb14.zip\" -d reference/)",
+      "Bash(python -c \"import json; m=json.load\\(open\\('c:/Users/chris.chow/source/vscode/cloud-conversion/mappings/aws_mapping.json'\\)\\); print\\('top-level keys:', list\\(m.keys\\(\\)\\) if isinstance\\(m, dict\\) else 'list len='+str\\(len\\(m\\)\\)\\); print\\('sample:', json.dumps\\(m if isinstance\\(m, list\\) else next\\(iter\\(m.values\\(\\)\\)\\), indent=2\\)[:1500] if m else 'empty'\\)\")",
+      "Bash(npm --version)",
+      "Bash(npm install *)",
+      "Bash(npx tsc *)",
+      "Bash(npm run *)",
+      "Bash(node --experimental-strip-types --no-warnings=ExperimentalWarning --test src/lib/stats.test.ts)",
+      "Bash(npm test *)",
+      "Bash(unset DT_BASE_URL DT_TOKEN)",
+      "Bash(node --experimental-strip-types --no-warnings=ExperimentalWarning --test src/lib/dql-parser.test.ts)",
+      "Bash(tee out/detect-all-run.log)",
+      "Bash(grep -c \"\\\\\\\\.\\\\\\\\.\\\\\\\\. \" c:/Users/chris.chow/source/vscode/cloud-conversion/tools/out/detect-all-run.log)",
+      "Bash(tee out/detect-per-resource-run.log)",
+      "Bash(tee out/detect-pr-k20-run.log)",
+      "Bash(awk '{print $2}')",
+      "Bash(python c:/Users/chris.chow/source/vscode/cloud-conversion/tools/out/_scan_perms.py)",
+      "Bash(python c:/Users/chris.chow/source/vscode/cloud-conversion/tools/out/_scan_python.py)",
+      "Bash(tee out/detect-pr-rerun.log)",
+      "Bash(cat /c/Users/chris.chow/AppData/Local/Temp/claude/c--Users-chris-chow-source-vscode-cloud-conversion/31b3b3c3-7f30-4438-ae8a-2065def5e946/tasks/bnkirqz05.output 2>/dev/null | head -40)",
+      "Read(//c/Users/chris.chow/AppData/Local/Temp/claude/c--Users-chris-chow-source-vscode-cloud-conversion/31b3b3c3-7f30-4438-ae8a-2065def5e946/tasks/**)",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+# Node
+node_modules/
+*.log
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Tool generated outputs (regeneratable from source)
+tools/out/
+
+# Source archives we extracted (extracted contents are tracked under reference/)
+*.zip
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+.Python
+.venv/
+venv/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Claude Code per-machine state (settings.json IS tracked — it's the project's permission allowlist)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

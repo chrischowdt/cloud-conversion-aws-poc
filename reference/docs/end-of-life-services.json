@@ -1,0 +1,86 @@
+[
+  {
+    "cloud": "Azure",
+    "resourceType": "Microsoft.ServiceFabricMesh/applications",
+    "kind": null,
+    "endOfLifeDate": "2021-04-28",
+    "announcementUrl": "https://azure.microsoft.com/updates/azure-service-fabric-mesh-preview-retirement/"
+  },
+  {
+    "cloud": "Azure",
+    "resourceType": "Microsoft.ClassicCompute/virtualMachines",
+    "kind": null,
+    "endOfLifeDate": "2023-09-06",
+    "announcementUrl": "https://learn.microsoft.com/en-us/azure/virtual-machines/classic-vm-deprecation"
+  },
+  {
+    "cloud": "Azure",
+    "resourceType": "Microsoft.ClassicStorage/storageAccounts",
+    "kind": null,
+    "endOfLifeDate": "2024-08-31",
+    "announcementUrl": "https://learn.microsoft.com/en-us/azure/storage/common/classic-account-migration-overview"
+  },
+  {
+    "cloud": "Azure",
+    "resourceType": "Microsoft.CognitiveServices/accounts",
+    "kind": "InkRecognizer",
+    "endOfLifeDate": "2021-01-31",
+    "announcementUrl": "https://learn.microsoft.com/en-us/previous-versions/azure/cognitive-services/Ink-Recognizer/overview"
+  },
+  {
+    "cloud": "Azure",
+    "resourceType": "Microsoft.CognitiveServices/accounts",
+    "kind": "LUIS",
+    "endOfLifeDate": "2026-03-31",
+    "announcementUrl": "https://learn.microsoft.com/en-us/previous-versions/azure/ai-services/luis/what-is-luis"
+  },
+  {
+    "cloud": "Azure",
+    "resourceType": "Microsoft.CognitiveServices/accounts",
+    "kind": "LUIS.Authoring",
+    "endOfLifeDate": "2026-03-31",
+    "announcementUrl": "https://learn.microsoft.com/en-us/previous-versions/azure/ai-services/luis/what-is-luis"
+  },
+  {
+    "cloud": "Azure",
+    "resourceType": "Microsoft.CognitiveServices/accounts",
+    "kind": "ContentModerator",
+    "endOfLifeDate": "2027-03-15",
+    "announcementUrl": "https://learn.microsoft.com/en-us/azure/ai-services/content-moderator/overview"
+  },
+  {
+    "cloud": "Azure",
+    "resourceType": "Microsoft.CognitiveServices/accounts",
+    "kind": "Personalizer",
+    "endOfLifeDate": "2026-10-01",
+    "announcementUrl": "https://learn.microsoft.com/en-us/azure/ai-services/personalizer/what-is-personalizer"
+  },
+  {
+    "cloud": "Azure",
+    "resourceType": "Microsoft.CognitiveServices/accounts",
+    "kind": "AnomalyDetector",
+    "endOfLifeDate": "2026-10-01",
+    "announcementUrl": "https://learn.microsoft.com/en-us/azure/ai-services/anomaly-detector/overview"
+  },
+  {
+    "cloud": "AWS",
+    "resourceType": "AWS::OpsWorks::Stack",
+    "kind": null,
+    "endOfLifeDate": "2024-05-26",
+    "announcementUrl": "https://docs.aws.amazon.com/opsworks/latest/userguide/stacks-eol-faqs.html"
+  },
+  {
+    "cloud": "AWS",
+    "resourceType": "AWS::QLDB::Ledger",
+    "kind": null,
+    "endOfLifeDate": "2025-07-31",
+    "announcementUrl": "https://aws.amazon.com/qldb/"
+  },
+  {
+    "cloud": "AWS",
+    "resourceType": "AWS::AppMesh::Mesh",
+    "kind": null,
+    "endOfLifeDate": "2026-09-30",
+    "announcementUrl": "https://docs.aws.amazon.com/app-mesh/latest/userguide/what-is-app-mesh.html"
+  }
+]

@@ -1,0 +1,30 @@
+{
+  "name": "@cloud-conversion/tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node tooling to build, reconcile, and validate Dynatrace classic-to-new cloud metric mappings.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.7"
+  },
+  "bin": {
+    "cct": "./src/cli.ts"
+  },
+  "scripts": {
+    "cli": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts",
+    "build-mapping": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts build-mapping",
+    "discover": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts discover",
+    "equivalence": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts equivalence",
+    "detect": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts detect",
+    "detect-all": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts detect-all",
+    "detect-per-resource": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts detect-per-resource",
+    "merge-recipes": "node --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts merge-recipes",
+    "dql": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts dql",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --no-warnings=ExperimentalWarning --test src/**/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0"
+  }
+}
