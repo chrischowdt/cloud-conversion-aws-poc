@@ -19,6 +19,7 @@
     "detect-all": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts detect-all",
     "detect-per-resource": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts detect-per-resource",
     "merge-recipes": "node --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts merge-recipes",
+    "rewrite-dql": "node --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts rewrite-dql",
     "dql": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts dql",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --no-warnings=ExperimentalWarning --test src/**/*.test.ts"

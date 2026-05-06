@@ -21,6 +21,7 @@ import { runDiscover } from './commands/discover.ts';
 import { runDql } from './commands/dql.ts';
 import { runEquivalence } from './commands/equivalence.ts';
 import { runMergeRecipes } from './commands/merge-recipes.ts';
+import { runRewriteDql } from './commands/rewrite-dql.ts';
 import type { CloudProvider } from './lib/types.ts';
 
 interface Args {
@@ -113,6 +114,9 @@ COMMANDS
                     ID and aws.arn), then output consensus recipes.
   merge-recipes     Fold detected recipes back into mappings/aws_mapping.json
                     and emit a punchlist of pairs that need manual research.
+  rewrite-dql       Apply metric mapping + dt-migration entity rules to a
+                    classic DQL query. Flags constructs needing manual
+                    migration (classicEntitySelector, relationships, formulas).
   dql               Run a raw DQL query and dump records (for iteration).
 
 CREDENTIALS
@@ -291,6 +295,15 @@ async function main(): Promise<void> {
         minSeries: getNumber(args.flags, 'min-series'),
         maxRatio: getNumber(args.flags, 'max-ratio'),
         maxClusters: getNumber(args.flags, 'max-clusters'),
+        outDir,
+      });
+      return;
+    }
+    case 'rewrite-dql': {
+      await runRewriteDql({
+        query: getString(args.flags, 'query'),
+        file: getString(args.flags, 'file'),
+        mappingPath: getString(args.flags, 'mapping'),
         outDir,
       });
       return;
