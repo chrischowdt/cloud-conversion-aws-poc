@@ -22,6 +22,50 @@
  */
 
 import type { Predicate, StringOp } from './classic-selector-parser.ts';
+import { classicEntityToSmartscape, lookupBySmartscapeDim } from './entity-mappings.ts';
+import { findEdgesBetween } from './smartscape-edges.ts';
+
+/**
+ * Map a classic relationship name (as it appears in
+ * fromRelationships.<name> / toRelationships.<name>) to the corresponding
+ * Smartscape edge type.
+ *
+ * Source: dt-migration/references/entity-selector-predicates.md
+ *         "Mapping to Semantic Dictionary Relationship Types" + the
+ *         edge inventory in relationship-mappings.md.
+ *
+ * When a name has multiple semantically related smartscape edges, the
+ * generic / most-common edge is used.
+ */
+const CLASSIC_RELATIONSHIP_TO_EDGE: Record<string, string> = {
+  runsOn: 'runs_on',
+  runsOnHost: 'runs_on',
+  runsOnResource: 'runs_on',
+  isProcessOf: 'runs_on',
+  belongsTo: 'belongs_to',
+  isPartOf: 'is_part_of',
+  isStepOf: 'is_part_of',
+  isAttachedTo: 'is_attached_to',
+  isBalancedBy: 'balanced_by',
+  calls: 'calls',
+  manages: 'manages',
+  monitors: 'monitors',
+  isAccessibleBy: 'accessible_by',
+  isInstanceOf: 'is_part_of',  // closest fit; flagged when used
+  isHostGroupOf: 'belongs_to', // host_group isn't a smartscape entity; flagged
+  propagatesTo: 'propagates_to',
+  sendsToQueue: 'sends_to',
+  receivesFromQueue: 'receives_from',
+  listensOnQueue: 'receives_from',
+};
+
+/** Classic relationship names that translate but with caveats (worth a note). */
+const RELATIONSHIPS_NEEDING_CAVEAT: Record<string, string> = {
+  isInstanceOf:
+    'isInstanceOf has no clean Smartscape edge — translated to is_part_of as closest fit; verify on relationship-mappings.md.',
+  isHostGroupOf:
+    'isHostGroupOf points at host_group which is not a standalone Smartscape entity — use dt.host_group.id field on HOST instead.',
+};
 
 export interface TranslationResult {
   /** Joined DQL filter string. Empty when no translatable predicate produced output. */
@@ -120,13 +164,7 @@ function translatePredicate(
       return translateAttribute(p, dim);
 
     case 'relationship':
-      return {
-        note:
-          `${p.direction === 'from' ? 'fromRelationships' : 'toRelationships'}` +
-          `${p.relationshipName ? '.' + p.relationshipName : ''}(...) — relationship traversal needs ` +
-          `manual translation via smartscapeEdges or traverse on the corresponding edge. ` +
-          `Verify the edge exists in dt-migration/references/relationship-mappings.md.`,
-      };
+      return translateRelationship(p, dim, hints);
 
     case 'modifier': {
       const inner = translateSelector(p.inner, dim, hints);
@@ -296,4 +334,251 @@ function stringOpToClause(fieldRef: string, op: StringOp, values: string[]): str
 
 function jsonString(s: string): string {
   return JSON.stringify(s);
+}
+
+/**
+ * Translate a relationship predicate inside a classicEntitySelector wrapped
+ * by `in(<outer_dim>, classicEntitySelector(...))`.
+ *
+ * Strategy (Check 3 from mass-data-filtering-strategy.md):
+ *
+ *     <outer_dim> in [
+ *       smartscapeNodes <inner_node_type>
+ *       | filter <inner predicates as direct fields>
+ *       | traverse <edge>, <outer_node_type>, direction:<dir>
+ *       | fields id
+ *     ]
+ *
+ * Direction:
+ *   - fromRelationships.X — outer entity has the X edge going FROM it TO
+ *     inner. Starting at inner and traversing the edge backward lands on
+ *     the outer entity. → direction:backward
+ *   - toRelationships.X — inverse. → direction:forward
+ *
+ * Returns no clause and a note when:
+ *   - the relationship name has no documented Smartscape edge
+ *   - the outer dim doesn't map to a known Smartscape node type
+ *   - the inner selector has no `type(X)` predicate or X has no node-type mapping
+ *   - the inner selector contains its own (nested) relationship — flag for manual,
+ *     since chained traversals are entity-pair-specific.
+ */
+function translateRelationship(
+  rel: Predicate & { kind: 'relationship' },
+  outerDim: string,
+  hints: TranslationHints
+): PredicateTranslation {
+  const relName = rel.relationshipName;
+  const edge = relName ? CLASSIC_RELATIONSHIP_TO_EDGE[relName] : undefined;
+  if (!edge) {
+    return {
+      note:
+        `${rel.direction === 'from' ? 'fromRelationships' : 'toRelationships'}` +
+        `${relName ? '.' + relName : ''}(...) has no documented Smartscape edge mapping — ` +
+        `translate manually using smartscapeEdges or traverse. ` +
+        `See dt-migration/references/entity-selector-predicates.md and relationship-mappings.md.`,
+    };
+  }
+
+  const outerMapping = lookupBySmartscapeDim(outerDim);
+  if (!outerMapping || !outerMapping.smartscapeNodeType) {
+    return {
+      note:
+        `Cannot determine outer Smartscape node type from ${outerDim} — relationship not translated.`,
+    };
+  }
+
+  const innerTypePred = rel.inner.find((p): p is Predicate & { kind: 'type' } => p.kind === 'type');
+  if (!innerTypePred || !innerTypePred.value) {
+    return {
+      note:
+        `Relationship inner selector has no type(X) predicate — cannot determine inner node type. ` +
+        `Add an explicit type() inside the relationship or translate manually.`,
+    };
+  }
+  const innerMapping = classicEntityToSmartscape(innerTypePred.value);
+  if (!innerMapping || !innerMapping.smartscapeNodeType) {
+    return {
+      note:
+        `Inner type "${innerTypePred.value}" has no Smartscape node-type mapping — relationship not translated. ` +
+        `See dt-migration/references/type-mappings.md.`,
+    };
+  }
+
+  const nestedRel = rel.inner.find((p) => p.kind === 'relationship');
+  if (nestedRel) {
+    return {
+      note:
+        `Nested relationship inside ${rel.direction}Relationships.${relName}(...) — chained traversals ` +
+        `need manual translation. Each traversal step depends on the specific (source, target) edge ` +
+        `which is best expressed by hand for now.`,
+    };
+  }
+
+  // Build inner-side filter (excluding the type predicate; that's the smartscapeNodes target).
+  const innerPreds = rel.inner.filter((p) => p.kind !== 'type');
+  const innerXlate = translateForSmartscapeNode(innerPreds, hints);
+
+  // Validate the edge against the relationship-mappings table. The naive
+  // classic-name → smartscape-name mapping is often wrong for a specific
+  // (source, target) pair (e.g. EC2_INSTANCE↔AVAILABILITY_ZONE is `runs_on`,
+  // NOT `belongs_to` even though classic `belongsTo` → smartscape `belongs_to`).
+  // When the table has exactly one edge between the pair, prefer that.
+  const innerType = innerMapping.smartscapeNodeType;
+  const outerType = outerMapping.smartscapeNodeType;
+  const validEdges = findEdgesBetween(innerType, outerType);
+  let chosenEdge = edge;
+  let directionOverride: 'forward' | 'backward' | null = null;
+  const validationNotes: string[] = [];
+  if (validEdges.length === 0) {
+    validationNotes.push(
+      `No edge between (${innerType}, ${outerType}) in the AWS subset of relationship-mappings.md. ` +
+        `Emitting "${edge}" from classic-name mapping; verify by hand or expand smartscape-edges.ts.`
+    );
+  } else {
+    const direct = validEdges.find((e) => e.edge === edge);
+    if (direct) {
+      // Our naive choice is supported — check direction is consistent.
+      // For from-relationships we expect outer→inner forward (the user is
+      // saying "outer has X going to inner"), so the registered edge should
+      // be source=outer, target=inner (i.e. forward=false from inner's POV).
+      const expectsForwardFromInner = rel.direction === 'to';
+      if (direct.forward !== expectsForwardFromInner) {
+        // Edge exists but the wiring is the other way — flip direction.
+        directionOverride = direct.forward ? 'forward' : 'backward';
+      }
+    } else if (validEdges.length === 1) {
+      // Exactly one edge connects the pair and it isn't the naive pick —
+      // prefer the actual edge and note the substitution.
+      const only = validEdges[0]!;
+      validationNotes.push(
+        `Classic relationship "${relName}" naively maps to "${edge}", but the only Smartscape edge ` +
+          `between ${innerType} and ${outerType} is "${only.edge}" (${only.forward ? 'inner→outer' : 'outer→inner'}). ` +
+          `Substituting that edge.`
+      );
+      chosenEdge = only.edge;
+      // Recompute direction from the actual edge wiring.
+      directionOverride = only.forward ? 'forward' : 'backward';
+    } else {
+      // Multiple candidate edges and our naive pick isn't among them.
+      validationNotes.push(
+        `Classic relationship "${relName}" maps to "${edge}", but the Smartscape edges between ` +
+          `${innerType} and ${outerType} are [${validEdges.map((e) => e.edge).join(', ')}]. ` +
+          `Pick the right edge by hand.`
+      );
+    }
+  }
+
+  const direction = directionOverride ?? (rel.direction === 'from' ? 'backward' : 'forward');
+  const lines: string[] = [];
+  lines.push(`smartscapeNodes ${innerType}`);
+  if (innerXlate.filter) lines.push(`  | filter ${innerXlate.filter}`);
+  lines.push(`  | traverse ${chosenEdge}, ${outerType}, direction:${direction}`);
+  lines.push(`  | fields id`);
+  const subquery = lines.join('\n');
+
+  const notes: string[] = [];
+  if (validationNotes.length > 0) notes.push(...validationNotes);
+  if (RELATIONSHIPS_NEEDING_CAVEAT[relName!]) {
+    notes.push(RELATIONSHIPS_NEEDING_CAVEAT[relName!]!);
+  }
+  notes.push(...innerXlate.notes);
+
+  return {
+    clause: `${outerDim} in [\n${subquery}\n]`,
+    note: notes.length > 0 ? notes.join(' ') : undefined,
+  };
+}
+
+/**
+ * Translate a list of predicates in a smartscapeNodes context — i.e., when
+ * we ARE the node, fields are accessed directly (`name`, `aws.region`,
+ * `` `tags:aws`[key] ``) rather than via `getNodeField()`.
+ */
+function translateForSmartscapeNode(
+  predicates: Predicate[],
+  hints: TranslationHints
+): TranslationResult {
+  const clauses: string[] = [];
+  const notes: string[] = [];
+  for (const p of predicates) {
+    const t = translatePredicateForNode(p, hints);
+    if (t.clause) clauses.push(t.clause);
+    if (t.note) notes.push(t.note);
+  }
+  return { filter: clauses.join(' and '), notes };
+}
+
+function translatePredicateForNode(
+  p: Predicate,
+  hints: TranslationHints
+): PredicateTranslation {
+  switch (p.kind) {
+    case 'type':
+      return {};
+    case 'entityName': {
+      const values = p.values.map(jsonString);
+      return { clause: stringOpToClause('name', p.op, values) };
+    }
+    case 'entityId':
+      return {
+        note: `entityId in inner selector — classic IDs do not carry over; translate manually.`,
+      };
+    case 'tag':
+      return translateTagForNode(p, hints);
+    case 'mz':
+      return { note: `${p.field}() inside relationship — management zones are not migratable.` };
+    case 'healthState': {
+      const values = p.values.map(jsonString);
+      return { clause: stringOpToClause('availability.state', 'equals', values) };
+    }
+    case 'attribute': {
+      const field = ATTRIBUTE_FIELD_MAP[p.predicate] ?? p.predicate;
+      const values = p.values.map(jsonString);
+      const clause = stringOpToClause(field, p.op, values);
+      const note =
+        ATTRIBUTE_FIELD_MAP[p.predicate]
+          ? undefined
+          : `Inner predicate "${p.predicate}" has no documented field mapping; using bare name — verify with fieldsSnapshot.`;
+      return { clause, note };
+    }
+    case 'relationship':
+      return {
+        note: `Nested relationship inside relationship — flagged earlier; translate manually.`,
+      };
+    case 'modifier': {
+      const inner = translateForSmartscapeNode(p.inner, hints);
+      if (!inner.filter) return {};
+      if (p.modifier === 'not') return { clause: `not (${inner.filter})` };
+      return { clause: inner.filter };
+    }
+    case 'unknown':
+      return { note: `Unknown predicate "${p.raw}" inside inner selector.` };
+  }
+}
+
+function translateTagForNode(
+  p: Predicate & { kind: 'tag' },
+  hints: TranslationHints
+): PredicateTranslation {
+  // Direct field access on a smartscapeNode — the tag context becomes a
+  // backticked field name. Example: `tags:azure`[dt_owner_email] == "..."
+  if (p.context && p.key && p.value !== undefined) {
+    const ctx = p.context.toLowerCase();
+    return { clause: `\`tags:${ctx}\`[${p.key}] == ${jsonString(p.value)}` };
+  }
+  if (!p.context && p.key && p.value !== undefined) {
+    const guess = hints.defaultTagContext ?? 'aws';
+    return {
+      clause: `\`tags:${guess}\`[${p.key}] == ${jsonString(p.value)}`,
+      note:
+        `tag("${p.raw}") inside relationship had no [Context] — assumed "${guess}". ` +
+        `If this is rule-based or non-AWS, change the context.`,
+    };
+  }
+  // Value-only — substring on serialized tags.
+  const v = p.value ?? p.raw;
+  return {
+    clause: `tags ~ ${jsonString(v)}`,
+    note: `tag("${p.raw}") inside relationship — substring match; verify intent.`,
+  };
 }

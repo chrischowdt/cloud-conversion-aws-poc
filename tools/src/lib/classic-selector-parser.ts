@@ -30,7 +30,15 @@ export type Predicate =
 
 export type StringOp = 'equals' | 'contains' | 'startsWith' | 'in' | 'exists' | 'gte' | 'gt' | 'lte' | 'lt';
 
-const RELATIONSHIP_PREFIXES = ['fromRelationships', 'toRelationships'];
+// Both plural and singular forms are accepted in classic selectors. The
+// official docs document the plural; multiple in-the-wild examples (and
+// dt-migration/references/examples.md Example 003) use the singular.
+const RELATIONSHIP_PREFIXES = [
+  'fromRelationships',
+  'toRelationships',
+  'fromRelationship',
+  'toRelationship',
+];
 const MODIFIERS = new Set(['not', 'caseSensitive']);
 const TAG_NAMES = new Set(['tag']);
 const TYPE_NAMES = new Set(['type']);
@@ -88,7 +96,7 @@ class Parser {
       const inner = parseSelector(argsRaw);
       return {
         kind: 'relationship',
-        direction: name === 'fromRelationships' ? 'from' : 'to',
+        direction: name.startsWith('from') ? 'from' : 'to',
         relationshipName: dottedSuffix,
         inner,
       };

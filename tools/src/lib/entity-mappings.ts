@@ -62,11 +62,17 @@ export const AWS_ENTITY_MAPPINGS: EntityMapping[] = [
   { classicEntityType: 'cloud:aws:applicationelb',        smartscapeDimension: 'dt.smartscape.aws_elasticloadbalancingv2_loadbalancer', smartscapeNodeType: 'AWS_ELASTICLOADBALANCINGV2_LOADBALANCER',     status: 'available', source: 'discovered', notes: 'alias of aws_application_load_balancer' },
 ];
 
-const BY_CLASSIC_TYPE = new Map(AWS_ENTITY_MAPPINGS.map((m) => [m.classicEntityType, m]));
+const BY_CLASSIC_TYPE = new Map(
+  AWS_ENTITY_MAPPINGS.map((m) => [m.classicEntityType.toLowerCase(), m])
+);
 
-/** Look up by `dt.entity.<type>` segment (the part after `dt.entity.`). */
+/**
+ * Look up by `dt.entity.<type>` segment (the part after `dt.entity.`).
+ * Case-insensitive — the classic API accepts both forms (e.g., `type("HOST")`
+ * and `type("host")`) and we want to be robust to either.
+ */
 export function classicEntityToSmartscape(classicType: string): EntityMapping | null {
-  return BY_CLASSIC_TYPE.get(classicType) ?? null;
+  return BY_CLASSIC_TYPE.get(classicType.toLowerCase()) ?? null;
 }
 
 /**
@@ -79,4 +85,18 @@ export function lookupByDimRef(dimRef: string): EntityMapping | null {
   const stripped = dimRef.replace(/^`|`$/g, '');
   if (!stripped.startsWith('dt.entity.')) return null;
   return classicEntityToSmartscape(stripped.slice('dt.entity.'.length));
+}
+
+/**
+ * Reverse lookup: given a smartscape dimension reference (e.g.
+ * `dt.smartscape.aws_ec2_instance`), find the corresponding mapping. Used
+ * when we need the smartscape node TYPE (e.g. AWS_EC2_INSTANCE) for use
+ * with `smartscapeNodes` / `traverse`.
+ */
+export function lookupBySmartscapeDim(smartscapeDimRef: string): EntityMapping | null {
+  const stripped = smartscapeDimRef.replace(/^`|`$/g, '');
+  for (const m of AWS_ENTITY_MAPPINGS) {
+    if (m.smartscapeDimension === stripped) return m;
+  }
+  return null;
 }

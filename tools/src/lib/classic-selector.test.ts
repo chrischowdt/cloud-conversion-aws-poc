@@ -174,11 +174,94 @@ describe('translateSelector — DQL emission', () => {
     assert.ok(r.notes.some((n) => n.includes('management zone')));
   });
 
-  it('flags relationships for manual translation', () => {
-    const ast = parseSelector('fromRelationships.runsOn(type("HOST"))');
-    const r = translateSelector(ast, dim);
+  it('translates fromRelationships.runsOn into a smartscapeNodes/traverse subquery (direction:backward)', () => {
+    // service-side outer dim, relationship to host, inner has tag
+    const ast = parseSelector(
+      'type("service"),fromRelationships.runsOn(type("host"),tag("[Azure]dt_owner_email:team-ops@example.com"))'
+    );
+    const r = translateSelector(ast, 'dt.smartscape.service');
+    assert.match(r.filter, /dt\.smartscape\.service in \[/);
+    assert.match(r.filter, /smartscapeNodes HOST/);
+    assert.match(r.filter, /`tags:azure`\[dt_owner_email\] == "team-ops@example\.com"/);
+    assert.match(r.filter, /traverse runs_on, SERVICE, direction:backward/);
+    assert.match(r.filter, /\| fields id/);
+  });
+
+  it('translates toRelationships.X with direction:forward (when edge wiring matches)', () => {
+    // From an EC2 instance: "this EC2 has runs_on coming TO it from HOST"
+    // Smartscape edge: HOST → runs_on → AWS_EC2_INSTANCE (forward from HOST POV)
+    const ast = parseSelector('toRelationships.runsOn(type("host"))');
+    const r = translateSelector(ast, 'dt.smartscape.aws_ec2_instance');
+    assert.match(r.filter, /smartscapeNodes HOST/);
+    assert.match(r.filter, /traverse runs_on, AWS_EC2_INSTANCE, direction:forward/);
+  });
+
+  it('accepts singular fromRelationship (no s) per dt-migration examples.md', () => {
+    const ast = parseSelector('fromRelationship.runsOnHost(type("host"))');
+    const r = translateSelector(ast, 'dt.smartscape.service');
+    assert.match(r.filter, /smartscapeNodes HOST/);
+    assert.match(r.filter, /traverse runs_on, SERVICE, direction:backward/);
+  });
+
+  it('flags unknown relationship name with reference to skill docs', () => {
+    const ast = parseSelector('fromRelationships.totallyMadeUpRel(type("host"))');
+    const r = translateSelector(ast, 'dt.smartscape.service');
     assert.equal(r.filter, '');
-    assert.ok(r.notes.some((n) => n.includes('relationship')));
+    assert.ok(r.notes.some((n) => /no documented Smartscape edge mapping/.test(n)));
+  });
+
+  it('flags relationship missing inner type()', () => {
+    const ast = parseSelector('fromRelationships.runsOn(tag("foo"))');
+    const r = translateSelector(ast, 'dt.smartscape.service');
+    assert.equal(r.filter, '');
+    assert.ok(r.notes.some((n) => /no type\(X\) predicate/.test(n)));
+  });
+
+  it('flags nested relationship inside relationship', () => {
+    const ast = parseSelector(
+      'fromRelationships.runsOn(type("host"),fromRelationships.belongsTo(type("aws_availability_zone")))'
+    );
+    const r = translateSelector(ast, 'dt.smartscape.service');
+    assert.equal(r.filter, '');
+    assert.ok(r.notes.some((n) => /[Nn]ested relationship/.test(n)));
+  });
+
+  it('combines relationship subquery with sibling tag/attribute predicates', () => {
+    const ast = parseSelector(
+      'type("ec2_instance"),tag("[AWS]env:prod"),fromRelationships.belongsTo(type("aws_availability_zone"),entityName("us-east-1a"))'
+    );
+    const r = translateSelector(ast, 'dt.smartscape.aws_ec2_instance');
+    // Both clauses present, joined by " and "
+    assert.match(
+      r.filter,
+      /getNodeField\(dt\.smartscape\.aws_ec2_instance, "tags:aws"\)\[env\] == "prod"/
+    );
+    assert.match(r.filter, /dt\.smartscape\.aws_ec2_instance in \[/);
+    assert.match(r.filter, /smartscapeNodes AWS_AVAILABILITY_ZONE/);
+    assert.match(r.filter, /name == "us-east-1a"/);
+    assert.match(r.filter, / and /);
+  });
+
+  it('per-pair validation substitutes the actual Smartscape edge when classic-name mapping is wrong', () => {
+    // Classic `belongsTo` would naively map to `belongs_to`, but the actual
+    // Smartscape edge between AWS_EC2_INSTANCE and AWS_AVAILABILITY_ZONE is
+    // `runs_on`. The validator should detect and substitute.
+    const ast = parseSelector(
+      'fromRelationships.belongsTo(type("aws_availability_zone"),entityName("us-east-1a"))'
+    );
+    const r = translateSelector(ast, 'dt.smartscape.aws_ec2_instance');
+    assert.match(r.filter, /traverse runs_on, AWS_EC2_INSTANCE/);
+    assert.doesNotMatch(r.filter, /belongs_to/);
+    assert.ok(r.notes.some((n) => /Substituting/.test(n)));
+  });
+
+  it('case-insensitive type lookup (HOST and host both work)', () => {
+    const upper = parseSelector('fromRelationships.runsOn(type("HOST"))');
+    const lower = parseSelector('fromRelationships.runsOn(type("host"))');
+    const a = translateSelector(upper, 'dt.smartscape.service');
+    const b = translateSelector(lower, 'dt.smartscape.service');
+    assert.match(a.filter, /smartscapeNodes HOST/);
+    assert.match(b.filter, /smartscapeNodes HOST/);
   });
 
   it('translates not() wrapping a translatable predicate', () => {
