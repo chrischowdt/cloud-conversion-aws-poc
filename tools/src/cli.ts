@@ -17,6 +17,7 @@ import { runBuildMapping } from './commands/build-mapping.ts';
 import { runDetect } from './commands/detect.ts';
 import { runDetectAll } from './commands/detect-all.ts';
 import { runDetectPerResource } from './commands/detect-per-resource.ts';
+import { runDownloadDashboards } from './commands/download-dashboards.ts';
 import { runDiscover } from './commands/discover.ts';
 import { runDql } from './commands/dql.ts';
 import { runEquivalence } from './commands/equivalence.ts';
@@ -117,6 +118,10 @@ COMMANDS
   rewrite-dql       Apply metric mapping + dt-migration entity rules to a
                     classic DQL query. Flags constructs needing manual
                     migration (classicEntitySelector, relationships, formulas).
+  download-dashboards
+                    Pull every dashboard from the tenant for offline
+                    analysis: new dashboards via Document Service, classic
+                    dashboards via Config API v1.
   dql               Run a raw DQL query and dump records (for iteration).
 
 CREDENTIALS
@@ -295,6 +300,18 @@ async function main(): Promise<void> {
         minSeries: getNumber(args.flags, 'min-series'),
         maxRatio: getNumber(args.flags, 'max-ratio'),
         maxClusters: getNumber(args.flags, 'max-clusters'),
+        outDir,
+      });
+      return;
+    }
+    case 'download-dashboards': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDownloadDashboards({
+        baseUrl,
+        token,
+        limit: getNumber(args.flags, 'limit'),
+        skipNew: args.flags.get('skip-new') === true,
+        skipClassic: args.flags.get('skip-classic') === true,
         outDir,
       });
       return;
