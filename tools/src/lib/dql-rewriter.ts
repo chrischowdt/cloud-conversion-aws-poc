@@ -15,7 +15,9 @@
  * edge cases the output flags a warning rather than producing wrong DQL.
  */
 
-import { lookupByDimRef } from './entity-mappings.ts';
+import { parseSelector } from './classic-selector-parser.ts';
+import { translateSelector } from './classic-selector-translator.ts';
+import { classicEntityToSmartscape, lookupByDimRef } from './entity-mappings.ts';
 import {
   type DetectedRecipe,
   type LookupResult,
@@ -25,7 +27,7 @@ import {
 } from './recipe-lookup.ts';
 
 export interface Transform {
-  kind: 'metric-key' | 'entity-dim' | 'recipe-applied' | 'composite-formula';
+  kind: 'metric-key' | 'entity-dim' | 'recipe-applied' | 'composite-formula' | 'classic-selector';
   before: string;
   after: string;
   detail?: string;
@@ -241,6 +243,13 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     }
   );
 
+  // Pass 1.5: rewrite `in(<classic_or_new_dim>, classicEntitySelector("..."))`
+  // into a translated filter clause. Run before the dt.entity.* sweep so we
+  // can use the original classic dim to determine which smartscape dim
+  // applies. Both forms are matched: pre-pass-2 (with `dt.entity.X`) and the
+  // already-renamed form (`dt.smartscape.X`).
+  rewritten = rewriteClassicSelectorIns(rewritten, transforms, warnings);
+
   // Pass 2: replace dt.entity.<type> with dt.smartscape.<...>
   rewritten = rewritten.replace(ENTITY_DIM_PATTERN, (full, entityType: string) => {
     const mapping = lookupByDimRef(full);
@@ -324,4 +333,93 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   }
 
   return { original: input, rewritten, transforms, warnings };
+}
+
+/**
+ * Find each `in(<dim>, classicEntitySelector("..."))` and replace with the
+ * translated filter clause. Handles both `dt.entity.<type>` and the
+ * already-rewritten `dt.smartscape.<type>` forms.
+ *
+ * Implemented by manual paren-balancing rather than pure regex, because the
+ * selector string can contain nested parens and quoted commas.
+ */
+function rewriteClassicSelectorIns(
+  input: string,
+  transforms: Transform[],
+  warnings: Warning[]
+): string {
+  // Find all `in(` openings followed by a classic/smartscape dim ref, then
+  // walk the parens to find the matching close.
+  const result: string[] = [];
+  let i = 0;
+  while (i < input.length) {
+    const remaining = input.slice(i);
+    const m = /^in\(\s*(`?dt\.(?:entity|smartscape)\.[\w:]+`?)\s*,\s*classicEntitySelector\(\s*"((?:\\.|[^"\\])*)"\s*\)\s*\)/.exec(remaining);
+    if (!m) {
+      result.push(input[i]!);
+      i++;
+      continue;
+    }
+    const fullMatch = m[0];
+    const dimRef = m[1]!;
+    const selectorStr = m[2]!;
+
+    // Determine the smartscape dim to use. If user wrote dt.entity.X, look
+    // up the mapping; if they already wrote dt.smartscape.X, use as-is.
+    const cleanDim = dimRef.replace(/^`|`$/g, '');
+    let smartscapeDim = cleanDim;
+    if (cleanDim.startsWith('dt.entity.')) {
+      const mapping = classicEntityToSmartscape(cleanDim.slice('dt.entity.'.length));
+      if (!mapping || !mapping.smartscapeDimension) {
+        warnings.push({
+          kind: 'unmapped-entity-type',
+          text: `classicEntitySelector wraps an unmapped entity type ${cleanDim}; left unchanged.`,
+          match: fullMatch,
+        });
+        result.push(fullMatch);
+        i += fullMatch.length;
+        continue;
+      }
+      smartscapeDim = mapping.smartscapeDimension;
+    }
+
+    // Parse + translate.
+    const ast = parseSelector(unescapeDqlString(selectorStr));
+    const translation = translateSelector(ast, smartscapeDim, { defaultTagContext: 'aws' });
+
+    if (!translation.filter) {
+      warnings.push({
+        kind: 'classic-entity-selector',
+        text:
+          `classicEntitySelector("${selectorStr}") produced no auto-translatable predicates.\n` +
+          translation.notes.map((n) => `  - ${n}`).join('\n'),
+        reference: 'dt-migration/references/mass-data-filtering-strategy.md',
+        match: fullMatch,
+      });
+      result.push(fullMatch);
+      i += fullMatch.length;
+      continue;
+    }
+
+    transforms.push({
+      kind: 'classic-selector',
+      before: fullMatch,
+      after: translation.filter,
+      detail: `predicates=${ast.length}; defaulted to Check 2 (getNodeField) — verify with fieldsSnapshot.`,
+    });
+    for (const note of translation.notes) {
+      warnings.push({
+        kind: 'classic-entity-selector',
+        text: note,
+        reference: 'dt-migration/references/mass-data-filtering-strategy.md',
+      });
+    }
+    result.push(translation.filter);
+    i += fullMatch.length;
+  }
+  return result.join('');
+}
+
+function unescapeDqlString(s: string): string {
+  return s.replace(/\\(.)/g, '$1');
 }

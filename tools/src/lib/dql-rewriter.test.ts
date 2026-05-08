@@ -220,18 +220,51 @@ describe('rewriteDql — composite formulas', () => {
 });
 
 describe('rewriteDql — end-to-end', () => {
-  it('combines metric swap + entity dim + warnings on a typical dashboard query', () => {
+  it('translates classicEntitySelector inside in(dim, ...) into a Smartscape filter', () => {
     const idx = buildIndex([cpuEntry]);
-    const input = `timeseries cpu = avg(builtin:cloud.aws.ec2.cpu.usage),
-  filter:{ in(dt.entity.ec2_instance, classicEntitySelector("type(ec2_instance),tag(env:prod)")) },
-  by:{ dt.entity.ec2_instance }`;
+    const input =
+      'timeseries cpu = avg(builtin:cloud.aws.ec2.cpu.usage), ' +
+      'filter:{ in(dt.entity.ec2_instance, classicEntitySelector("type(ec2_instance),tag([AWS]env:prod)")) }, ' +
+      'by:{ dt.entity.ec2_instance }';
     const r = rewriteDql(input, idx);
-    // Metric swapped
+
+    // Metric key swapped.
     assert.match(r.rewritten, /cloud\.aws\.ec2\.CPUUtilization\.By\.InstanceId/);
-    // Entity dim swapped (in by:)
+    // by-dim swapped.
     assert.match(r.rewritten, /by:\{ dt\.smartscape\.aws_ec2_instance \}/);
-    // classicEntitySelector flagged but not removed
+    // classicEntitySelector replaced by tag filter.
+    assert.doesNotMatch(r.rewritten, /classicEntitySelector/);
+    assert.match(
+      r.rewritten,
+      /getNodeField\(dt\.smartscape\.aws_ec2_instance, "tags:aws"\)\[env\] == "prod"/
+    );
+
+    // Transform recorded.
+    const cs = r.transforms.find((t) => t.kind === 'classic-selector');
+    assert.ok(cs);
+  });
+
+  it('falls back to flagging when selector contains untranslatable predicates', () => {
+    const idx = buildIndex([cpuEntry]);
+    const input =
+      'timeseries avg(builtin:cloud.aws.ec2.cpu.usage), ' +
+      'filter:{ in(dt.entity.ec2_instance, classicEntitySelector("entityId(\\"EC2_INSTANCE-ABC\\")")) }, ' +
+      'by:{ dt.entity.ec2_instance }';
+    const r = rewriteDql(input, idx);
+
+    // entityId is non-translatable → no clause emitted → original kept and flagged.
     assert.match(r.rewritten, /classicEntitySelector/);
     assert.ok(r.warnings.some((w) => w.kind === 'classic-entity-selector'));
+  });
+
+  it('handles classicEntitySelector against an already-rewritten dt.smartscape dim', () => {
+    const idx = buildIndex([cpuEntry]);
+    const input =
+      'filter:{ in(dt.smartscape.aws_ec2_instance, classicEntitySelector("awsRegion(\\"us-east-1\\")")) }';
+    const r = rewriteDql(input, idx);
+    assert.match(
+      r.rewritten,
+      /getNodeField\(dt\.smartscape\.aws_ec2_instance, "aws\.region"\) == "us-east-1"/
+    );
   });
 });
