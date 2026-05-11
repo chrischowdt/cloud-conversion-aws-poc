@@ -198,16 +198,58 @@ describe('rewriteDql — flags constructs needing manual migration', () => {
     assert.match(w.reference ?? '', /mass-data-filtering/);
   });
 
-  it('flags entityName / entityAttr', () => {
+  it('translates entityName(x) to getNodeName(x)', () => {
     const idx = buildIndex([]);
     const r = rewriteDql('fields name = entityName(dt.entity.host)', idx);
-    assert.ok(r.warnings.some((w) => w.kind === 'entity-name-attr'));
+    assert.match(r.rewritten, /getNodeName\(dt\.smartscape\.host\)/);
+    assert.doesNotMatch(r.rewritten, /entityName/);
   });
 
-  it('flags relationship-bracket access', () => {
+  it('translates entityAttr(x, "f") to getNodeField(x, "f")', () => {
     const idx = buildIndex([]);
-    const r = rewriteDql('fieldsAdd host = belongs_to[dt.entity.host]', idx);
-    assert.ok(r.warnings.some((w) => w.kind === 'entity-relationship-traversal'));
+    const r = rewriteDql(
+      'fields tags = entityAttr(dt.entity.aws_lambda_function, "tags")',
+      idx
+    );
+    assert.match(
+      r.rewritten,
+      /getNodeField\(dt\.smartscape\.aws\.lambda_function, "tags"\)/
+    );
+    assert.doesNotMatch(r.rewritten, /entityAttr/);
+  });
+
+  it('drops type: argument from entityName per skill rule', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fields name = entityName(dt.entity.host, type:"dt.entity.host")',
+      idx
+    );
+    assert.match(r.rewritten, /getNodeName\(dt\.smartscape\.host\)/);
+    assert.doesNotMatch(r.rewritten, /type:/);
+  });
+
+  it('translates simple <edge>[dt.entity.X] to references[<edge>.<x>]', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.network_interface | fieldsAdd host = belongs_to[dt.entity.host]',
+      idx
+    );
+    // fetch restructure + bracket translation
+    assert.match(r.rewritten, /smartscapeNodes NETWORK_INTERFACE/);
+    assert.match(r.rewritten, /references\[belongs_to\.host\]/);
+  });
+
+  it('relationship-bracket validator substitutes edge when classic name is wrong for source-target pair', () => {
+    const idx = buildIndex([]);
+    // EC2 instance -> aws_availability_zone is `runs_on` in Smartscape, not `belongs_to`.
+    const r = rewriteDql(
+      'fetch dt.entity.ec2_instance | fieldsAdd az = belongs_to[dt.entity.aws_availability_zone]',
+      idx
+    );
+    assert.match(r.rewritten, /references\[runs_on\.aws_availability_zone\]/);
+    assert.ok(
+      r.warnings.some((w) => /substituting "runs_on"/i.test(w.text))
+    );
   });
 
   it('flags hardcoded classic ID literals', () => {
@@ -233,6 +275,40 @@ describe('rewriteDql — composite formulas', () => {
     assert.ok(w);
     assert.match(w.text, /consumed \/ provisioned/);
     assert.match(w.text, /UNVERIFIED/);
+  });
+});
+
+describe('rewriteDql — fetch restructure (Situation 3)', () => {
+  it('rewrites fetch dt.entity.X to smartscapeNodes <TYPE>', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('fetch dt.entity.host | fields entity.name, id', idx);
+    assert.match(r.rewritten, /smartscapeNodes HOST/);
+    assert.doesNotMatch(r.rewritten, /fetch dt\.entity/);
+  });
+
+  it('translates entity.name to bare name when fetch was restructured', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.ec2_instance | fields entity.name, id',
+      idx
+    );
+    assert.match(r.rewritten, /\bname\b/);
+    assert.doesNotMatch(r.rewritten, /entity\.name/);
+  });
+
+  it('leaves entity.name alone when no fetch was restructured', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('timeseries avg(x), by:{entity.name}', idx);
+    assert.match(r.rewritten, /entity\.name/);
+  });
+
+  it('flags fetch dt.entity.host_group as not-planned and leaves it alone', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('fetch dt.entity.host_group | fields id', idx);
+    assert.match(r.rewritten, /fetch dt\.entity\.host_group/);
+    assert.ok(
+      r.warnings.some((w) => /no Smartscape replacement/i.test(w.text))
+    );
   });
 });
 

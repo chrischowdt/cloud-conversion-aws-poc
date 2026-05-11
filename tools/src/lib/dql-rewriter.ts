@@ -18,6 +18,7 @@
 import { parseSelector } from './classic-selector-parser.ts';
 import { translateSelector } from './classic-selector-translator.ts';
 import { classicEntityToSmartscape, lookupByDimRef } from './entity-mappings.ts';
+import { findEdgesBetween } from './smartscape-edges.ts';
 import {
   type DetectedRecipe,
   type LookupResult,
@@ -87,8 +88,6 @@ const ENTITY_DIM_PATTERN =
   /`?\bdt\.entity\.([\w:]+)`?/g;
 
 const CLASSIC_ENTITY_SELECTOR_PATTERN = /\bclassicEntitySelector\s*\(/g;
-const ENTITY_NAME_ATTR_PATTERN = /\b(entityName|entityAttr)\s*\(/g;
-const RELATIONSHIP_BRACKET_PATTERN = /\b(belongs_to|runs|instance_of|clustered_by|contains)\s*\[/g;
 const ENTITY_ID_LITERAL_PATTERN = /"(EC2_INSTANCE|HOST|SERVICE|PROCESS_GROUP|PROCESS|CONTAINER|AWS_LAMBDA_FUNCTION|DYNAMO_DB_TABLE|AWS_APPLICATION_LOAD_BALANCER|AWS_NETWORK_LOAD_BALANCER)-[A-F0-9]+"/g;
 
 /**
@@ -262,6 +261,19 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // already-renamed form (`dt.smartscape.X`).
   rewritten = rewriteClassicSelectorIns(rewritten, transforms, warnings);
 
+  // Pass 1.6: `fetch dt.entity.X` → `smartscapeNodes <TYPE>`. Must come
+  // before the relationship-bracket pass so we know the source type for
+  // edge validation.
+  const fetchContext: FetchContext = { sourceSmartscapeType: null, didRewriteFetch: false };
+  rewritten = rewriteFetchEntity(rewritten, transforms, warnings, fetchContext);
+
+  // Pass 1.7: rewrite classic relationship-bracket projections like
+  // `belongs_to[dt.entity.host]` into `references[belongs_to.host]`. Use
+  // fetchContext.sourceSmartscapeType (when known) to validate the edge
+  // against smartscape-edges.ts and substitute the correct edge if the
+  // classic name doesn't match the actual edge for the source-target pair.
+  rewritten = rewriteRelationshipBrackets(rewritten, transforms, warnings, fetchContext);
+
   // Pass 2: replace dt.entity.<type> with dt.smartscape.<...>
   rewritten = rewritten.replace(ENTITY_DIM_PATTERN, (full, entityType: string) => {
     const mapping = lookupByDimRef(full);
@@ -297,6 +309,24 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     return full.startsWith('`') ? '`' + mapping.smartscapeDimension + '`' : mapping.smartscapeDimension;
   });
 
+  // Pass 2.5: entityName(x) → getNodeName(x); entityAttr(x, "f") → getNodeField(x, "f").
+  // Runs AFTER the dt.entity.* dim swap so x is already in smartscape form.
+  rewritten = rewriteEntityNameAttr(rewritten, transforms);
+
+  // Pass 2.6: when we rewrote `fetch dt.entity.X` to `smartscapeNodes`,
+  // any `entity.name` field reference inside should become bare `name`.
+  if (fetchContext.didRewriteFetch) {
+    rewritten = rewritten.replace(/\bentity\.name\b/g, () => {
+      transforms.push({
+        kind: 'entity-dim',
+        before: 'entity.name',
+        after: 'name',
+        detail: 'smartscapeNodes uses bare `name` field instead of `entity.name`',
+      });
+      return 'name';
+    });
+  }
+
   // Pass 3: detect constructs we don't auto-rewrite — flag them.
   const flagPatterns: Array<{
     re: RegExp;
@@ -311,21 +341,6 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
         'classicEntitySelector(...) needs manual migration: resolve each predicate, run fieldsSnapshot, ' +
         'then choose Check 1 (direct dim filter), Check 2 (getNodeField), or Check 3 (smartscapeNodes subquery).',
       reference: SKILL_REFS.massData,
-    },
-    {
-      re: ENTITY_NAME_ATTR_PATTERN,
-      kind: 'entity-name-attr',
-      text:
-        'entityName(...) / entityAttr(...) need migration: prefer node `name` field directly, or `getNodeName()` / `getNodeField()` for ID-based access.',
-      reference: SKILL_REFS.dqlFunctions,
-    },
-    {
-      re: RELATIONSHIP_BRACKET_PATTERN,
-      kind: 'entity-relationship-traversal',
-      text:
-        'Relationship-bracket access (belongs_to[...], runs[...], etc.) → use `traverse` or `references[...]` on Smartscape edges. ' +
-        'Validate the edge exists in the relationship-mappings table.',
-      reference: SKILL_REFS.relationships,
     },
     {
       re: ENTITY_ID_LITERAL_PATTERN,
@@ -434,4 +449,197 @@ function rewriteClassicSelectorIns(
 
 function unescapeDqlString(s: string): string {
   return s.replace(/\\(.)/g, '$1');
+}
+
+// ─── Pass 1.6: fetch dt.entity.X → smartscapeNodes <TYPE> ─────────────────
+
+interface FetchContext {
+  sourceSmartscapeType: string | null;
+  didRewriteFetch: boolean;
+}
+
+const FETCH_ENTITY_PATTERN = /\bfetch\s+`?dt\.entity\.([\w:]+)`?/g;
+
+function rewriteFetchEntity(
+  input: string,
+  transforms: Transform[],
+  warnings: Warning[],
+  ctx: FetchContext
+): string {
+  return input.replace(FETCH_ENTITY_PATTERN, (full, entityType: string) => {
+    const mapping = classicEntityToSmartscape(entityType);
+    if (!mapping || !mapping.smartscapeNodeType) {
+      if (mapping?.status === 'not-planned') {
+        warnings.push({
+          kind: 'unmapped-entity-type',
+          text:
+            `fetch dt.entity.${entityType} — this entity has no Smartscape replacement ` +
+            `(${mapping.notes ?? 'not planned'}). Manual rewrite required.`,
+          reference: SKILL_REFS.specialCases,
+          match: full,
+        });
+      } else {
+        warnings.push({
+          kind: 'unmapped-entity-type',
+          text: `fetch dt.entity.${entityType} — no Smartscape mapping; cannot restructure automatically.`,
+          reference: SKILL_REFS.typeMappings,
+          match: full,
+        });
+      }
+      return full;
+    }
+    ctx.sourceSmartscapeType = mapping.smartscapeNodeType;
+    ctx.didRewriteFetch = true;
+    transforms.push({
+      kind: 'entity-dim',
+      before: full,
+      after: `smartscapeNodes ${mapping.smartscapeNodeType}`,
+      detail: `Situation-3 restructure: pure entity list query`,
+    });
+    return `smartscapeNodes ${mapping.smartscapeNodeType}`;
+  });
+}
+
+// ─── Pass 1.7: <edge>[dt.entity.X] → references[<edge>.<x>] ───────────────
+
+/**
+ * Classic relationship-bracket projection names that appear in `fetch
+ * dt.entity.*` pipelines. Listed in the dql-function-migration.md "Classic
+ * relationship fields" section.
+ */
+const RELATIONSHIP_BRACKET_KEYWORDS = [
+  'belongs_to',
+  'runs',
+  'runs_on',
+  'instance_of',
+  'clustered_by',
+  'contains',
+  'monitors',
+  'calls',
+  'manages',
+  'is_part_of',
+  'is_attached_to',
+  'balanced_by',
+  'balances',
+  'accessible_by',
+  'uses',
+  'sends_to',
+  'receives_from',
+  'propagates_to',
+];
+
+const RELATIONSHIP_BRACKET_PROJECTION_RE = new RegExp(
+  `\\b(${RELATIONSHIP_BRACKET_KEYWORDS.join('|')})\\[\\s*\`?dt\\.entity\\.([\\w:]+)\`?\\s*\\]`,
+  'g'
+);
+
+function rewriteRelationshipBrackets(
+  input: string,
+  transforms: Transform[],
+  warnings: Warning[],
+  ctx: FetchContext
+): string {
+  return input.replace(RELATIONSHIP_BRACKET_PROJECTION_RE, (full, classicEdge: string, targetClassicType: string) => {
+    const targetMapping = classicEntityToSmartscape(targetClassicType);
+    if (!targetMapping || !targetMapping.smartscapeNodeType) {
+      warnings.push({
+        kind: 'entity-relationship-traversal',
+        text:
+          `${classicEdge}[dt.entity.${targetClassicType}] target has no Smartscape mapping. ` +
+          `Translate by hand.`,
+        reference: SKILL_REFS.relationships,
+        match: full,
+      });
+      return full;
+    }
+    const targetType = targetMapping.smartscapeNodeType;
+    const targetDot = targetType.toLowerCase();
+
+    // Validate against smartscape-edges when source is known. Substitute the
+    // correct edge when the classic name doesn't match the actual edge for
+    // the (source, target) pair.
+    let chosenEdge = classicEdge;
+    const validationNotes: string[] = [];
+    if (ctx.sourceSmartscapeType) {
+      const valid = findEdgesBetween(ctx.sourceSmartscapeType, targetType);
+      if (valid.length === 0) {
+        validationNotes.push(
+          `No edge between (${ctx.sourceSmartscapeType}, ${targetType}) in smartscape-edges.ts; ` +
+            `using literal "${classicEdge}" — verify by hand or expand the edge table.`
+        );
+      } else {
+        const direct = valid.find((e) => e.edge === classicEdge);
+        if (!direct && valid.length === 1) {
+          chosenEdge = valid[0]!.edge;
+          validationNotes.push(
+            `Classic "${classicEdge}" doesn't match the (${ctx.sourceSmartscapeType}, ${targetType}) ` +
+              `edge in smartscape-edges.ts — substituting "${chosenEdge}".`
+          );
+        } else if (!direct) {
+          validationNotes.push(
+            `Classic "${classicEdge}" doesn't match smartscape-edges.ts for (${ctx.sourceSmartscapeType}, ${targetType}); ` +
+              `candidates: [${valid.map((e) => e.edge).join(', ')}] — pick by hand.`
+          );
+        }
+      }
+    } else {
+      validationNotes.push(
+        `Source type unknown (no preceding fetch dt.entity.*) — using literal "${classicEdge}". Verify edge by hand.`
+      );
+    }
+
+    const replacement = `references[${chosenEdge}.${targetDot}]`;
+    transforms.push({
+      kind: 'entity-dim',
+      before: full,
+      after: replacement,
+      detail:
+        ctx.sourceSmartscapeType
+          ? `relationship projection (source ${ctx.sourceSmartscapeType} → target ${targetType})`
+          : `relationship projection (target ${targetType}; source unknown)`,
+    });
+    for (const note of validationNotes) {
+      warnings.push({
+        kind: 'entity-relationship-traversal',
+        text: note,
+        reference: SKILL_REFS.relationships,
+      });
+    }
+    return replacement;
+  });
+}
+
+// ─── Pass 2.5: entityName / entityAttr → getNodeName / getNodeField ───────
+
+function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
+  // entityAttr(x, "field") → getNodeField(x, "field"). Must run before
+  // entityName replacement so we don't accidentally match Attr's "Name" prefix.
+  let rewritten = input.replace(
+    /\bentityAttr\(\s*([^,)]+?)\s*,\s*("[^"]+")\s*\)/g,
+    (full, arg: string, field: string) => {
+      transforms.push({
+        kind: 'entity-dim',
+        before: full,
+        after: `getNodeField(${arg}, ${field})`,
+        detail: 'entityAttr(x, "f") → getNodeField(x, "f")',
+      });
+      return `getNodeField(${arg}, ${field})`;
+    }
+  );
+
+  // entityName(x) — drop optional `type:"..."` argument per skill rule.
+  rewritten = rewritten.replace(
+    /\bentityName\(\s*([^,)]+?)(?:\s*,\s*type:\s*"[^"]+")?\s*\)/g,
+    (full, arg: string) => {
+      transforms.push({
+        kind: 'entity-dim',
+        before: full,
+        after: `getNodeName(${arg})`,
+        detail: 'entityName(x) → getNodeName(x); type: argument dropped (skill rule)',
+      });
+      return `getNodeName(${arg})`;
+    }
+  );
+
+  return rewritten;
 }
