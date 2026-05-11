@@ -72,13 +72,16 @@ const SKILL_REFS = {
  * backtick-quoted, and only when they appear inside an aggregation call so
  * we don't false-match documentation strings.
  */
-// Capture the entire `agg(metric)` or `agg(metric,` shape. The trailing char
-// determines how we replace:
+// Capture the entire `agg(metric)` or `agg(metric,` shape. Matches both
+// classic metric-key forms a dashboard might reference:
+//   - v2 API form:  builtin:cloud.aws.<svc>.<dotted camelCase>
+//   - DQL form:     dt.cloud.aws.<svc>.<dotted snake_case>
+// The trailing char determines how we replace:
 //   - `)` → metric is the only arg; we can wrap the whole call freely
 //   - `,` → metric has extra args (e.g. filter); only swap the metric, keep
 //           the original agg, and flag if the recipe disagrees
 const CLASSIC_KEY_PATTERN =
-  /\b(avg|sum|max|min|count|percentile|median)\(\s*`?(builtin:cloud\.aws\.[\w.:]+)`?\s*([,)])/g;
+  /\b(avg|sum|max|min|count|percentile|median)\(\s*`?((?:builtin:cloud\.aws|dt\.cloud\.aws)\.[\w.:]+)`?\s*([,)])/g;
 
 const ENTITY_DIM_PATTERN =
   /`?\bdt\.entity\.([\w:]+)`?/g;

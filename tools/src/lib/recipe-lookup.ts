@@ -11,6 +11,8 @@
 
 import { readFile } from 'node:fs/promises';
 
+import { builtinToDqlClassic } from './schema-transforms.ts';
+
 export type Aggregation = 'avg' | 'sum' | 'max' | 'min' | 'count';
 export type NewAggMode = 'raw' | 'per_second';
 export type Verdict = 'exact-fit' | 'good-fit' | 'scale-only' | 'shape-only' | 'no-fit' | 'no-data';
@@ -65,18 +67,29 @@ interface MergedMappingFile {
 }
 
 export interface RecipeIndex {
+  /** Keyed by the v2-API form: `builtin:cloud.aws.X.camelCase`. */
   byClassicId: Map<string, MappingEntry>;
+  /**
+   * Keyed by the DQL form: `dt.cloud.aws.X.snake_case`. Same entries as
+   * byClassicId, just under a different key. Real dashboards reference
+   * metrics in the DQL form, so the rewriter needs to look them up by it.
+   */
+  byDqlClassicKey: Map<string, MappingEntry>;
 }
 
 export async function loadRecipeIndex(path: string): Promise<RecipeIndex> {
   const file = JSON.parse(await readFile(path, 'utf8')) as MergedMappingFile;
   const byClassicId = new Map<string, MappingEntry>();
+  const byDqlClassicKey = new Map<string, MappingEntry>();
   for (const svc of file.serviceMappings ?? []) {
     for (const bm of svc.builtinMetricMappings ?? []) {
-      byClassicId.set(bm.classicMetricId, { ...bm, service: svc.service });
+      const entry: MappingEntry = { ...bm, service: svc.service };
+      byClassicId.set(bm.classicMetricId, entry);
+      const dqlKey = builtinToDqlClassic(bm.classicMetricId);
+      if (dqlKey) byDqlClassicKey.set(dqlKey, entry);
     }
   }
-  return { byClassicId };
+  return { byClassicId, byDqlClassicKey };
 }
 
 export type LookupResult =
@@ -85,8 +98,14 @@ export type LookupResult =
   | { kind: 'mapped-no-recipe'; entry: MappingEntry }
   | { kind: 'unknown' };
 
+/**
+ * Look up a classic metric reference by EITHER form:
+ *   - v2-API:  builtin:cloud.aws.X.camelCase
+ *   - DQL:     dt.cloud.aws.X.snake_case
+ */
 export function lookupClassicKey(index: RecipeIndex, classicMetricId: string): LookupResult {
-  const entry = index.byClassicId.get(classicMetricId);
+  let entry = index.byClassicId.get(classicMetricId);
+  if (!entry) entry = index.byDqlClassicKey.get(classicMetricId);
   if (!entry) return { kind: 'unknown' };
   if (entry.compositeFormula) return { kind: 'composite', entry, formula: entry.compositeFormula };
   if (entry.detectedRecipe && entry.newDtMetricKey) {

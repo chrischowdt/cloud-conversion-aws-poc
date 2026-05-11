@@ -11,8 +11,16 @@ import type {
 
 function buildIndex(entries: MappingEntry[]): RecipeIndex {
   const byClassicId = new Map<string, MappingEntry>();
-  for (const e of entries) byClassicId.set(e.classicMetricId, e);
-  return { byClassicId };
+  const byDqlClassicKey = new Map<string, MappingEntry>();
+  for (const e of entries) {
+    byClassicId.set(e.classicMetricId, e);
+    // Build the corresponding dt.cloud.aws.* key the same way the real loader does.
+    const builtinSuffix = e.classicMetricId.replace(/^builtin:/, '');
+    const dqlKey =
+      'dt.' + builtinSuffix.split('.').map((p) => p.replace(/(?<!^)(?=[A-Z])/g, '_').toLowerCase()).join('.');
+    byDqlClassicKey.set(dqlKey, e);
+  }
+  return { byClassicId, byDqlClassicKey };
 }
 
 const cpuRecipe: DetectedRecipe = {
