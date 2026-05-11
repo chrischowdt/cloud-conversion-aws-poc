@@ -111,19 +111,28 @@ describe('rewriteDql — metric key swap (basic)', () => {
     assert.equal(r.transforms[0]?.kind, 'metric-key');
   });
 
-  it('applies per_second mode by dividing by interval', () => {
+  it('emits clean agg call for per_second recipe + warns to apply division as a pipeline step', () => {
     const idx = buildIndex([netRxEntry]);
     const r = rewriteDql('timeseries x = avg(builtin:cloud.aws.ec2.net.rx)', idx);
-    assert.match(r.rewritten, /sum\(`cloud\.aws\.ec2\.NetworkIn\.By\.InstanceId`\) \/ 300/);
-    // Also wraps in scale (0.97 ≠ 1)
-    assert.match(r.rewritten, /\* 0\.97/);
+    // Clean agg call — no inline arithmetic (DQL rejects that).
+    assert.match(r.rewritten, /sum\(`cloud\.aws\.ec2\.NetworkIn\.By\.InstanceId`\)/);
+    assert.doesNotMatch(r.rewritten, /\/ 300/);
+    assert.doesNotMatch(r.rewritten, /\* 0\.97/);
+    // Warning describes the post-aggregation math.
+    const w = r.warnings.find((w) => /post-aggregation math/.test(w.text));
+    assert.ok(w);
+    assert.match(w!.text, /divide by bucket-interval seconds/);
+    assert.match(w!.text, /multiply by scale 0\.97/);
   });
 
-  it('applies non-1 scale wrapper', () => {
+  it('emits clean agg call for non-1 scale + warns', () => {
     const idx = buildIndex([throttleWriteEntry]);
     const r = rewriteDql('timeseries x = sum(builtin:cloud.aws.dynamo.throttledEvents.write)', idx);
-    assert.match(r.rewritten, /\* 2/);
     assert.match(r.rewritten, /sum\(`cloud\.aws\.dynamodb\.WriteThrottleEvents\.By\.TableName`\)/);
+    assert.doesNotMatch(r.rewritten, /\* 2/);
+    const w = r.warnings.find((w) => /post-aggregation math/.test(w.text));
+    assert.ok(w);
+    assert.match(w!.text, /multiply by scale 2/);
   });
 
   it('skips unmodified scale=1 (no scale wrapper)', () => {

@@ -126,30 +126,39 @@ function applyRecipe(
     });
   }
 
-  let call = `${recipe.newAggregation}(\`${newDtMetricKey}\`)`;
+  const call = `${recipe.newAggregation}(\`${newDtMetricKey}\`)`;
 
-  // per_second mode: divide by interval seconds (assume 5m bucket for now).
-  // Downstream consumer can swap the divisor if they bucket differently.
-  const PERIOD_SECONDS = 300;
-  if (recipe.newAggregationMode === 'per_second') {
-    call = `(${call} / ${PERIOD_SECONDS})`;
-    transforms.push({
-      kind: 'recipe-applied',
-      before: '(no divisor)',
-      after: `/ ${PERIOD_SECONDS}`,
-      detail: 'recipe says per_second mode — added /interval',
+  // DQL rejects arithmetic inside the timeseries aggregation slot
+  // ("The parameter has to be a metric-based timeseries aggregation").
+  // We therefore emit the metric swap as a clean call and surface the
+  // recipe's per_second / scale math as a warning describing the
+  // pipeline step the consumer should append after the timeseries clause.
+  const needsPerSecond = recipe.newAggregationMode === 'per_second';
+  const needsScale = recipe.scale !== null && Math.abs(recipe.scale - 1) > 0.02;
+  if (needsPerSecond || needsScale) {
+    const example =
+      needsPerSecond && needsScale
+        ? `<var>[] / 300 * ${recipe.scale}`
+        : needsPerSecond
+        ? '<var>[] / 300'
+        : `<var>[] * ${recipe.scale}`;
+    const parts: string[] = [];
+    if (needsPerSecond) parts.push('divide by bucket-interval seconds');
+    if (needsScale) parts.push(`multiply by scale ${recipe.scale}`);
+    warnings.push({
+      kind: 'recipe-aggregation-mismatch',
+      text:
+        `Recipe needs post-aggregation math: ${parts.join(' AND ')}. DQL doesn't allow arithmetic in ` +
+        `the timeseries aggregation slot, so append this as a pipeline step (replace <var> with the ` +
+        `variable name from your timeseries clause; 300 = seconds for interval:5m — adjust if your ` +
+        `bucket size differs):\n    | fieldsAdd <var> = ${example}`,
+      reference: SKILL_REFS.dqlFunctions,
     });
-  }
-
-  // Skip the scale wrapper when scale is essentially 1 (tolerance ~2%). Wraps
-  // for scale=0.97 or 1.05 are meaningful; for 1.0006 the wrap is just noise.
-  if (recipe.scale !== null && Math.abs(recipe.scale - 1) > 0.02) {
-    call = `(${call} * ${recipe.scale})`;
     transforms.push({
       kind: 'recipe-applied',
-      before: '(no scale)',
-      after: `* ${recipe.scale}`,
-      detail: `recipe scale factor (verdict=${recipe.verdict})`,
+      before: '(metric-only swap)',
+      after: `| fieldsAdd <var> = ${example}`,
+      detail: 'recipe math captured as post-processing step — DQL aggregation slot is metric-only',
     });
   }
 
