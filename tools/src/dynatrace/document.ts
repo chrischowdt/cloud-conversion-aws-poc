@@ -190,8 +190,12 @@ export class DocumentClient {
   }
 
   /** Get document metadata (no content). */
-  async getMetadata(id: string): Promise<Document> {
-    const res = await this.request('GET', `/documents/${encodeURIComponent(id)}`);
+  async getMetadata(id: string, adminAccess = true): Promise<Document> {
+    const res = await this.request(
+      'GET',
+      `/documents/${encodeURIComponent(id)}`,
+      adminAccess ? { 'admin-access': 'true' } : undefined
+    );
     return JSON.parse(res.text) as Document;
   }
 
@@ -199,9 +203,21 @@ export class DocumentClient {
    * Download the document body. Returns the parsed JSON when content-type is
    * JSON, otherwise returns the raw text. Dashboards and notebooks come back
    * as JSON.
+   *
+   * `adminAccess=true` is passed by default so a token with admin scope can
+   * read other users' dashboards. The content endpoint, like the list
+   * endpoint, refuses to return data without it when the document isn't owned
+   * by the calling user.
    */
-  async getContent(id: string): Promise<{ raw: string; parsed: unknown; contentType: string | null }> {
-    const res = await this.request('GET', `/documents/${encodeURIComponent(id)}/content`);
+  async getContent(
+    id: string,
+    adminAccess = true
+  ): Promise<{ raw: string; parsed: unknown; contentType: string | null }> {
+    const res = await this.request(
+      'GET',
+      `/documents/${encodeURIComponent(id)}/content`,
+      adminAccess ? { 'admin-access': 'true' } : undefined
+    );
     let parsed: unknown = res.text;
     if (res.contentType?.includes('json')) {
       try {
