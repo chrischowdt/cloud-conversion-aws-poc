@@ -17,7 +17,11 @@
 
 import { parseSelector } from './classic-selector-parser.ts';
 import { translateSelector } from './classic-selector-translator.ts';
+import { lookupInDac } from './dac-lookup.ts';
+import { ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE } from './entity-field-mappings.ts';
 import { classicEntityToSmartscape, lookupByDimRef } from './entity-mappings.ts';
+import { lookupEolForClassicKey } from './eol-lookup.ts';
+import { isMetricCarrier, isKnownNonCarrier } from './metric-dim-carriers.ts';
 import { findEdgesBetween } from './smartscape-edges.ts';
 import {
   type DetectedRecipe,
@@ -45,7 +49,8 @@ export interface Warning {
     | 'entity-name-attr'
     | 'classic-id-literal'
     | 'recipe-aggregation-mismatch'
-    | 'verdict-not-exact';
+    | 'verdict-not-exact'
+    | 'end-of-life-service';
   text: string;
   /** Pointer to the relevant dt-migration reference (if any). */
   reference?: string;
@@ -73,16 +78,46 @@ const SKILL_REFS = {
  * backtick-quoted, and only when they appear inside an aggregation call so
  * we don't false-match documentation strings.
  */
-// Capture the entire `agg(metric)` or `agg(metric,` shape. Matches both
-// classic metric-key forms a dashboard might reference:
-//   - v2 API form:  builtin:cloud.aws.<svc>.<dotted camelCase>
-//   - DQL form:     dt.cloud.aws.<svc>.<dotted snake_case>
+// Capture the entire `agg(metric)` or `agg(metric,` shape. Matches every
+// classic AWS metric-key prefix surfaced by the dt-migration skill's
+// [classic-detection-patterns.md §1]:
+//   - `dt.cloud.aws.*`       — classic built-in (Grail)
+//   - `builtin:cloud.aws.*`  — classic built-in (Cassandra-era selector)
+//   - `ext:cloud.aws.*`      — classic non-built-in (Cassandra-era selector)
+//   - bare `cloud.aws.<service>.<snake_case_metric>` — classic non-built-in
+//     (Grail). REQUIRES disambiguation: the new connection emits keys in the
+//     shape `cloud.aws.<Service>.<PascalCase>.By.<Dim>`; we reject those
+//     inside the replace handler by spotting `.By.<UpperFirst>`.
+//
 // The trailing char determines how we replace:
 //   - `)` → metric is the only arg; we can wrap the whole call freely
 //   - `,` → metric has extra args (e.g. filter); only swap the metric, keep
 //           the original agg, and flag if the recipe disagrees
+//
+// Negative lookbehind `(?<!`)` keeps us from matching inside backtick-quoted
+// column refs like `\`avg(dt.cloud.aws.rds.cpu.usage)\``. Rewriting metric
+// keys inside those produces nested backticks and a parse error. The orphan
+// pattern below catches and warns about those separately.
 const CLASSIC_KEY_PATTERN =
-  /\b(avg|sum|max|min|count|percentile|median)\(\s*`?((?:builtin:cloud\.aws|dt\.cloud\.aws)\.[\w.:]+)`?\s*([,)])/g;
+  /(?<!`)\b(avg|sum|max|min|count|percentile|median)\(\s*`?((?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+\.[a-z][\w]*)`?\s*([,)])/g;
+
+/**
+ * True when a metric key matches the new-connection shape
+ * `cloud.<provider>.<Service>.<PascalCase>.By.<Dim>`. Used to reject
+ * accidental matches when `CLASSIC_KEY_PATTERN`'s bare `cloud.aws.*`
+ * branch picks up a new-form key the skill calls "new connection".
+ */
+function isNewConnectionShape(key: string): boolean {
+  return /\.By\.[A-Z][a-zA-Z0-9]*/.test(key);
+}
+
+// Backtick-quoted column reference that LOOKS like an agg(metric) expression.
+// These are downstream references to a column emitted by an earlier
+// `timeseries avg(metric)` clause — the column inherits the agg-call string
+// as its name. After we swap the metric key in the timeseries call, the
+// column name changes and these references go stale; warn the user.
+const BACKTICK_COLUMN_REF_PATTERN =
+  /`(avg|sum|max|min|count|percentile|median)\(\s*((?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+\.[a-z][\w]*)\s*\)`/g;
 
 const ENTITY_DIM_PATTERN =
   /`?\bdt\.entity\.([\w:]+)`?/g;
@@ -103,10 +138,16 @@ function applyRecipe(
   const warnings: Warning[] = [];
   const transforms: Transform[] = [];
 
+  // `count(metric)` semantically counts non-null occurrences, not "the
+  // recipe's aggregation of metric". Preserve user intent rather than
+  // silently swapping to recipe.newAggregation.
+  const preserveUserAgg = userAgg === 'count';
+  const effectiveNewAgg = preserveUserAgg ? userAgg : recipe.newAggregation;
+
   // If the user's aggregation differs from recipe.classicAggregation, warn —
   // we still respect user intent and DON'T silently swap to recipe's classic
   // agg. The recipe assumed the user would use classicAggregation.
-  if (userAgg !== recipe.classicAggregation && (userAgg === 'avg' || userAgg === 'sum')) {
+  if (!preserveUserAgg && userAgg !== recipe.classicAggregation && (userAgg === 'avg' || userAgg === 'sum')) {
     warnings.push({
       kind: 'recipe-aggregation-mismatch',
       text:
@@ -116,7 +157,7 @@ function applyRecipe(
     });
   }
 
-  if (recipe.verdict !== 'exact-fit' && recipe.verdict !== 'good-fit') {
+  if (!preserveUserAgg && recipe.verdict !== 'exact-fit' && recipe.verdict !== 'good-fit') {
     warnings.push({
       kind: 'verdict-not-exact',
       text:
@@ -125,15 +166,15 @@ function applyRecipe(
     });
   }
 
-  const call = `${recipe.newAggregation}(\`${newDtMetricKey}\`)`;
+  const call = `${effectiveNewAgg}(\`${newDtMetricKey}\`)`;
 
   // DQL rejects arithmetic inside the timeseries aggregation slot
   // ("The parameter has to be a metric-based timeseries aggregation").
   // We therefore emit the metric swap as a clean call and surface the
   // recipe's per_second / scale math as a warning describing the
   // pipeline step the consumer should append after the timeseries clause.
-  const needsPerSecond = recipe.newAggregationMode === 'per_second';
-  const needsScale = recipe.scale !== null && Math.abs(recipe.scale - 1) > 0.02;
+  const needsPerSecond = !preserveUserAgg && recipe.newAggregationMode === 'per_second';
+  const needsScale = !preserveUserAgg && recipe.scale !== null && Math.abs(recipe.scale - 1) > 0.02;
   if (needsPerSecond || needsScale) {
     const example =
       needsPerSecond && needsScale
@@ -168,10 +209,74 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   const transforms: Transform[] = [];
   const warnings: Warning[] = [];
 
+  // Pre-pass: bail out if the query contains a `lookup [fetch
+  // dt.entity.<not-planned-type>]` chain (e.g. `custom_device`,
+  // `host_group`, `process_group`). The lookup's output prefixes downstream
+  // column references back to classic relationship arrays, and Smartscape's
+  // `references[…]` only works on entity records — not on prefixed lookup
+  // output. Translating partially produces invalid DQL (the AAP_JET case:
+  // `device.references[…]` raised FIELD_DOES_NOT_EXIST). Classic DQL still
+  // runs on the new platform, so leaving the query verbatim is correct —
+  // the user gets the same behavior they had before, plus a clear warning
+  // that the chain needs manual redesign.
+  const notPlannedLookup = findNotPlannedLookupSource(input);
+  if (notPlannedLookup) {
+    warnings.push({
+      kind: 'unmapped-entity-type',
+      text:
+        `Query has a not-planned-type \`lookup [fetch dt.entity.${notPlannedLookup}]\` subquery. ` +
+        `The lookup emits classic relationship arrays under its \`prefix:\` and Smartscape's ` +
+        `\`references[…]\` only works on entity records, so this chain can't be auto-translated ` +
+        `without producing invalid DQL. Leaving the entire query in classic form — manual redesign ` +
+        `required (typically: replace the lookup with a direct \`smartscapeNodes <TYPE>\` join, ` +
+        `then re-run the rewriter).`,
+      reference: SKILL_REFS.specialCases,
+    });
+    return { original: input, rewritten: input, transforms, warnings };
+  }
+
   // Pass 1: replace metric keys inside aggregation calls + apply recipe.
   let rewritten = input.replace(
     CLASSIC_KEY_PATTERN,
     (full, userAgg: string, classicKey: string, trailing: string) => {
+      // The bare-`cloud.aws.*` branch of the pattern can also match
+      // new-connection keys; disambiguate by rejecting any key whose shape
+      // is `cloud.aws.<Service>.<PascalCase>.By.<Dim>`.
+      if (isNewConnectionShape(classicKey)) return full;
+
+      // EOL check: if the metric's service has been announced end-of-life,
+      // surface that prominently. Two sources, in order:
+      //   1. Slug-based lookup against end-of-life-services.json — gives the
+      //      precise EOL date + announcement URL.
+      //   2. DAC entry's `endOfLife` flag — broader catch (4,168 entries) but
+      //      only a boolean. Use it as a fallback when (1) misses.
+      // Don't block the rewrite — the user may still want the translation,
+      // but they should know they may be migrating away from a retiring
+      // service.
+      const eol = lookupEolForClassicKey(classicKey);
+      if (eol) {
+        warnings.push({
+          kind: 'end-of-life-service',
+          text:
+            `Metric ${classicKey} references ${eol.resourceType}, which is end-of-life as of ${eol.endOfLifeDate}. ` +
+            `Consider whether migrating this metric is worth the effort. Announcement: ${eol.announcementUrl}`,
+          reference: 'dt-migration/references/end-of-life-services.json',
+          match: classicKey,
+        });
+      } else if (index.dac) {
+        const dacHit = lookupInDac(index.dac, classicKey);
+        if (dacHit?.endOfLife) {
+          warnings.push({
+            kind: 'end-of-life-service',
+            text:
+              `Metric ${classicKey} (${dacHit.cloudwatchNamespace} ${dacHit.cloudwatchMetricName}) is marked ` +
+              `end-of-life by the DAC mapping. Confirm the EOL date with AWS and consider whether migrating is worth the effort.`,
+            reference: 'dt-migration/references/dac-aws-to-2ndgen-metrics.json',
+            match: classicKey,
+          });
+        }
+      }
+
       const lookup: LookupResult = lookupClassicKey(index, classicKey);
       if (lookup.kind === 'unknown') {
         warnings.push({
@@ -201,14 +306,38 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
         return full;
       }
       if (lookup.kind === 'mapped-no-recipe') {
+        const newKey = lookup.entry.newDtMetricKey;
+        // We know the new key (the DAC or our enriched mapping told us) but
+        // have no verified recipe. Swap the metric key, preserve the user's
+        // aggregation, and warn so they can spot-check.
+        if (!newKey) {
+          warnings.push({
+            kind: 'mapped-no-recipe',
+            text:
+              `Classic metric ${classicKey} is mapped but has no new key — leaving unchanged.` +
+              (lookup.entry.notes ? ` (${lookup.entry.notes})` : ''),
+            match: classicKey,
+          });
+          return full;
+        }
         warnings.push({
           kind: 'mapped-no-recipe',
           text:
-            `Classic metric ${classicKey} maps to ${lookup.entry.newDtMetricKey ?? '(no new key)'} ` +
-            `but no recipe is available — couldn't determine the right aggregation/scale.`,
+            `Classic metric ${classicKey} → ${newKey}. Swapped the metric key only; the ` +
+            `aggregation/scale wasn't verified by a detected recipe — spot-check values vs the classic side.` +
+            (lookup.entry.notes ? ` (${lookup.entry.notes})` : ''),
           match: classicKey,
         });
-        return full;
+        const swapOnly = trailing === ','
+          ? `${userAgg}(\`${newKey}\`,`
+          : `${userAgg}(\`${newKey}\`)`;
+        transforms.push({
+          kind: 'metric-key',
+          before: `${userAgg}(${classicKey}${trailing === ',' ? ',' : ')'}`,
+          after: swapOnly,
+          detail: 'metric-only swap (no verified recipe — agg preserved as user wrote it)',
+        });
+        return swapOnly;
       }
       // Recipe path
       const { entry, recipe } = lookup;
@@ -254,6 +383,26 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     }
   );
 
+  // Pass 1.4: warn about backtick-quoted column references that look like
+  // an `agg(metric)` shape. These reference a column emitted earlier by a
+  // `timeseries agg(metric)` clause; after Pass 1 swaps the metric key the
+  // column name no longer matches, so the reference goes stale. The fix is
+  // to alias the timeseries output (e.g. `timeseries val = avg(...)`) and
+  // reference `val` downstream; the rewriter can't do that safely on its own.
+  BACKTICK_COLUMN_REF_PATTERN.lastIndex = 0;
+  let bm: RegExpExecArray | null;
+  while ((bm = BACKTICK_COLUMN_REF_PATTERN.exec(input)) !== null) {
+    warnings.push({
+      kind: 'recipe-aggregation-mismatch',
+      text:
+        `Backtick column reference \`${bm[1]}(${bm[2]})\` references a column emitted by an earlier ` +
+        `timeseries call. After the metric-key swap that column's name changes, so this reference will ` +
+        `return null. Fix: alias the timeseries output (e.g. \`val = avg(...)\`) and rename the reference.`,
+      reference: SKILL_REFS.dqlFunctions,
+      match: bm[0],
+    });
+  }
+
   // Pass 1.5: rewrite `in(<classic_or_new_dim>, classicEntitySelector("..."))`
   // into a translated filter clause. Run before the dt.entity.* sweep so we
   // can use the original classic dim to determine which smartscape dim
@@ -261,10 +410,17 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // already-renamed form (`dt.smartscape.X`).
   rewritten = rewriteClassicSelectorIns(rewritten, transforms, warnings);
 
+  // Pass 1.55: `fetch dt.entity.custom_device | filter entity.type == "cloud:aws:X"`
+  // → `smartscapeNodes <TYPE>`. Custom_device is "not planned" in Smartscape,
+  // but in practice classic AWS dashboards use it as a generic wrapper around
+  // services like Lambda, DynamoDB, etc. that DO have Smartscape replacements.
+  // Match the fetch + entity.type filter pair before the general fetch pass.
+  const fetchContext: FetchContext = { sourceSmartscapeType: null, didRewriteFetch: false };
+  rewritten = rewriteCustomDeviceFetch(rewritten, transforms, warnings, fetchContext);
+
   // Pass 1.6: `fetch dt.entity.X` → `smartscapeNodes <TYPE>`. Must come
   // before the relationship-bracket pass so we know the source type for
   // edge validation.
-  const fetchContext: FetchContext = { sourceSmartscapeType: null, didRewriteFetch: false };
   rewritten = rewriteFetchEntity(rewritten, transforms, warnings, fetchContext);
 
   // Pass 1.7: rewrite classic relationship-bracket projections like
@@ -274,8 +430,13 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // classic name doesn't match the actual edge for the source-target pair.
   rewritten = rewriteRelationshipBrackets(rewritten, transforms, warnings, fetchContext);
 
-  // Pass 2: replace dt.entity.<type> with dt.smartscape.<...>
-  rewritten = rewritten.replace(ENTITY_DIM_PATTERN, (full, entityType: string) => {
+  // Pass 2: replace dt.entity.<type> with dt.smartscape.<...>.
+  // Skip dim swaps inside `lookup [fetch dt.entity.<not-planned-type>]`
+  // subqueries — the entire subquery is classic-only and a partial rewrite
+  // (smartscape dim inside a classic-fetch subquery) produces invalid DQL.
+  const pass2NonSmartscapeRegions = findNonSmartscapeLookupRegions(rewritten);
+  rewritten = rewritten.replace(ENTITY_DIM_PATTERN, (full, entityType: string, offset: number) => {
+    if (isInsideRegion(offset, pass2NonSmartscapeRegions)) return full;
     const mapping = lookupByDimRef(full);
     if (!mapping) {
       warnings.push({
@@ -298,6 +459,20 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
         match: full,
       });
       return full;
+    }
+    if (mapping.status === 'ambiguous') {
+      // Multi-target mapping (e.g. cloud_application → 7 k8s workload kinds).
+      // Apply the default but warn so the user can substitute the right type.
+      warnings.push({
+        kind: 'unmapped-entity-type',
+        text:
+          `dt.entity.${entityType} is ambiguous in Smartscape. ` +
+          `Using default ${mapping.smartscapeNodeType}; alternatives: ` +
+          `${(mapping.altSmartscapeNodeTypes ?? []).join(', ')}. ` +
+          `${mapping.notes ?? ''}`,
+        reference: SKILL_REFS.typeMappings,
+        match: full,
+      });
     }
     transforms.push({
       kind: 'entity-dim',
@@ -325,6 +500,123 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
       });
       return 'name';
     });
+  }
+
+  // Pass 2.7: when fetch was restructured to a known Smartscape node type,
+  // translate classic-only field identifiers (`awsAccountId`, `rdsEngine`)
+  // to their Smartscape equivalents.
+  //
+  // Rules:
+  //   - Skip identifiers preceded by `$` — those are dashboard variable
+  //     refs, not field refs. Variables retain their declaration-time name.
+  //     A warning surfaces these for the user to consider renaming by hand.
+  //   - Wrap dotted Smartscape field names (e.g. `db.system`) in backticks
+  //     so DQL parses them as a single identifier rather than a member-of-
+  //     member access. Otherwise `lookup.db.system` becomes ambiguous.
+  if (fetchContext.didRewriteFetch && fetchContext.sourceSmartscapeType) {
+    const table = ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE[fetchContext.sourceSmartscapeType];
+    if (table) {
+      for (const m of table) {
+        const replacement = m.smartscapeField.includes('.')
+          ? `\`${m.smartscapeField}\``
+          : m.smartscapeField;
+        // Negative lookbehind `(?<![$\w.])` skips `$rdsEngine` (variable ref)
+        // and `lookup.rdsEngine`-style accesses where the leading char is a
+        // dot — those would produce an ambiguous parse after rename.
+        const re = new RegExp(`(?<![$\\w.])${m.classicField}\\b`, 'g');
+        let changed = false;
+        rewritten = rewritten.replace(re, () => {
+          changed = true;
+          return replacement;
+        });
+        if (changed) {
+          transforms.push({
+            kind: 'entity-dim',
+            before: m.classicField,
+            after: replacement,
+            detail: `${fetchContext.sourceSmartscapeType} field rename` +
+              (m.notes ? ` (${m.notes})` : ''),
+          });
+        }
+        // Detect surviving `$classicField` refs — the variable name didn't
+        // change. Warn the user since the visual link "variable named X
+        // filters field X" is now broken.
+        const varRe = new RegExp(`\\$${m.classicField}\\b`, 'g');
+        if (varRe.test(rewritten)) {
+          warnings.push({
+            kind: 'unmapped-entity-type',
+            text:
+              `Dashboard variable \`$${m.classicField}\` still references the classic name; the underlying ` +
+              `field has been renamed to \`${m.smartscapeField}\` on ${fetchContext.sourceSmartscapeType}. ` +
+              `Consider renaming the variable for clarity.`,
+            reference: SKILL_REFS.typeMappings,
+          });
+        }
+        // Also: a `lookup.<classic>` accessor would have been left alone by
+        // the negative lookbehind above. Detect and warn — that field
+        // probably came from a subquery that ALSO needs the new field name.
+        const lookupRe = new RegExp(`lookup\\.${m.classicField}\\b`, 'g');
+        if (lookupRe.test(rewritten)) {
+          rewritten = rewritten.replace(lookupRe, () => `lookup.${replacement}`);
+          transforms.push({
+            kind: 'entity-dim',
+            before: `lookup.${m.classicField}`,
+            after: `lookup.${replacement}`,
+            detail: `Renamed lookup accessor for ${fetchContext.sourceSmartscapeType} field`,
+          });
+        }
+      }
+    }
+  }
+
+  // Pass 2.8: by-clause / non-carrier dim alignment.
+  //
+  // When a `dt.entity.X` dim gets swapped to `dt.smartscape.X` and used in a
+  // `by:{...}` clause, that dim must actually be carried on the new metric
+  // series — otherwise the grouping collapses to a single null-keyed row.
+  // Most AWS Smartscape types (Lambda, EC2, RDS, etc.) ARE carriers per the
+  // tenant probe (2026-05-12); ~14 are NOT (ECS, EFS, NAT Gateway, etc.).
+  //
+  // For each non-carrier dim used in a by-clause AFTER a metric was
+  // rewritten, surface a warning telling the user what to substitute (the
+  // CloudWatch dim implied by the metric's `.By.<Dim>` suffix, or `aws.arn`
+  // as a universal fallback).
+  if (transforms.some((t) => t.kind === 'metric-key')) {
+    // Find every `dt.smartscape.<type>` reference inside a by-clause. Cheap
+    // proxy: scan for `by:` followed by a `dt.smartscape.X` token.
+    const BY_DIM_RE = /\bby\s*:\s*\{[^}]*?\bdt\.smartscape\.([a-z0-9_]+)/g;
+    BY_DIM_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    const seen = new Set<string>();
+    while ((m = BY_DIM_RE.exec(rewritten)) !== null) {
+      const dimSlug = m[1]!;
+      const nodeType = dimSlug.toUpperCase();
+      if (seen.has(nodeType)) continue;
+      seen.add(nodeType);
+      // Only warn for types we KNOW are not carriers. Unknown types stay
+      // silent (a noisy "we don't know" warning has no actionable signal).
+      if (isMetricCarrier(nodeType)) continue;
+      if (!isKnownNonCarrier(nodeType)) continue;
+
+      // Best-effort: find a CloudWatch dim from a nearby `.By.<Dim>` segment.
+      const byDimMatch = /\bcloud\.aws\.[a-z0-9_]+\.[A-Za-z0-9]+\.By\.([A-Za-z0-9.]+)/.exec(
+        rewritten
+      );
+      const suggestion = byDimMatch
+        ? `by:{ ${byDimMatch[1]!.split('.').join(', ')} }`
+        : 'by:{ aws.arn }';
+
+      warnings.push({
+        kind: 'unmapped-entity-type',
+        text:
+          `by:{ dt.smartscape.${dimSlug} } — the ${nodeType} Smartscape dim isn't carried on ` +
+          `the new metric series, so this grouping collapses all rows to a single null-keyed ` +
+          `bucket. Substitute: ${suggestion} (derived from the metric's CloudWatch dim suffix), ` +
+          `or use 'by:{ aws.arn }' as a universal fallback.`,
+        reference: SKILL_REFS.typeMappings,
+        match: `dt.smartscape.${dimSlug}`,
+      });
+    }
   }
 
   // Pass 3: detect constructs we don't auto-rewrite — flag them.
@@ -460,6 +752,79 @@ interface FetchContext {
 
 const FETCH_ENTITY_PATTERN = /\bfetch\s+`?dt\.entity\.([\w:]+)`?/g;
 
+/**
+ * Custom_device entity.type values observed in real dashboards, mapped to the
+ * Smartscape node type that replaces them in the new model. Types missing here
+ * still have classic-only data; the rewriter emits a more targeted warning
+ * instead of a generic "not-planned" one.
+ *
+ * Sources: dt-migration/references/type-mappings.md (lambda, ec2_instance,
+ * ebs_volume, etc.), reference/docs/dac-aws-to-2ndgen-entities.json (for the
+ * cloud:aws:* keys), plus entries discovered on the tenant.
+ */
+const CUSTOM_DEVICE_AWS_TYPE_MAP: Record<string, string> = {
+  // Originally surfaced via the dac-aws-to-2ndgen-entities.json mapping.
+  'cloud:aws:autoscaling': 'AWS_AUTOSCALING_AUTOSCALINGGROUP',
+  'cloud:aws:dynamodb': 'AWS_DYNAMODB_TABLE',
+  'cloud:aws:ec2': 'AWS_EC2_INSTANCE',
+  'cloud:aws:ebs': 'AWS_EC2_VOLUME',
+  'cloud:aws:lambda': 'AWS_LAMBDA_FUNCTION',
+  'cloud:aws:rds': 'AWS_RDS_DBINSTANCE',
+  'cloud:aws:applicationelb': 'AWS_ELASTICLOADBALANCINGV2_LOADBALANCER',
+  // Added from dt-migration/references/entity-type-mapping.md §1 custom-device table.
+  'cloud:aws:s3': 'AWS_S3_BUCKET',
+  'cloud:aws:aurora': 'AWS_RDS_DBCLUSTER',
+  'cloud:aws:elasticachecustom': 'AWS_ELASTICACHE_CACHECLUSTER',
+  'cloud:aws:sqs': 'AWS_SQS_QUEUE',
+  'cloud:aws:sns': 'AWS_SNS_TOPIC',
+  'cloud:aws:cloud_front': 'AWS_CLOUDFRONT_DISTRIBUTION',
+  'cloud:aws:nat_gateway': 'AWS_EC2_NATGATEWAY',
+  'cloud:aws:eks:cluster': 'AWS_EKS_CLUSTER',
+  'cloud:aws:redshift': 'AWS_REDSHIFT_CLUSTER',
+};
+
+/**
+ * Match `fetch dt.entity.custom_device\s*|\s*filter\s+entity.type == "cloud:aws:X"`
+ * — common shape in classic AWS dashboards that wrap services through the
+ * custom_device generic entity. If X has a Smartscape mapping, collapse the
+ * two clauses into `smartscapeNodes <TYPE>`. If not, emit a targeted warning
+ * (more useful than the bare "not-planned" the general fetch pass produces).
+ */
+const CUSTOM_DEVICE_FETCH_FILTER_RE =
+  /\bfetch\s+`?dt\.entity\.custom_device`?\s*(?:\r?\n)?\s*\|\s*filter\s+`?entity\.type`?\s*==\s*"([^"]+)"/g;
+
+function rewriteCustomDeviceFetch(
+  input: string,
+  transforms: Transform[],
+  warnings: Warning[],
+  ctx: FetchContext
+): string {
+  return input.replace(CUSTOM_DEVICE_FETCH_FILTER_RE, (full, entityType: string) => {
+    const smartscapeType = CUSTOM_DEVICE_AWS_TYPE_MAP[entityType];
+    if (!smartscapeType) {
+      warnings.push({
+        kind: 'unmapped-entity-type',
+        text:
+          `fetch dt.entity.custom_device | filter entity.type == "${entityType}" — ` +
+          `this AWS service has no known Smartscape node type (still classic-only). ` +
+          `Use the matching cloud.aws.* metric directly or wait for the entity to be migrated.`,
+        reference: SKILL_REFS.typeMappings,
+        match: full,
+      });
+      return full;
+    }
+    ctx.sourceSmartscapeType = smartscapeType;
+    ctx.didRewriteFetch = true;
+    transforms.push({
+      kind: 'entity-dim',
+      before: full,
+      after: `smartscapeNodes ${smartscapeType}`,
+      detail: `custom_device entity.type "${entityType}" → ${smartscapeType}`,
+    });
+    return `smartscapeNodes ${smartscapeType}`;
+  });
+}
+
 function rewriteFetchEntity(
   input: string,
   transforms: Transform[],
@@ -487,6 +852,17 @@ function rewriteFetchEntity(
         });
       }
       return full;
+    }
+    if (mapping.status === 'ambiguous') {
+      warnings.push({
+        kind: 'unmapped-entity-type',
+        text:
+          `fetch dt.entity.${entityType} → smartscapeNodes ${mapping.smartscapeNodeType} ` +
+          `(ambiguous; alternatives: ${(mapping.altSmartscapeNodeTypes ?? []).join(', ')}). ` +
+          `${mapping.notes ?? ''}`,
+        reference: SKILL_REFS.typeMappings,
+        match: full,
+      });
     }
     ctx.sourceSmartscapeType = mapping.smartscapeNodeType;
     ctx.didRewriteFetch = true;
@@ -533,13 +909,109 @@ const RELATIONSHIP_BRACKET_PROJECTION_RE = new RegExp(
   'g'
 );
 
+/**
+ * Returns the classic entity type of the first `lookup [fetch dt.entity.<X>]`
+ * subquery whose X is NOT Smartscape-mapped, or `null` if none. Used by the
+ * top-level rewriter to detect classic-only lookup chains it can't safely
+ * translate (see `rewriteDql` pre-pass for the full rationale).
+ */
+function findNotPlannedLookupSource(input: string): string | null {
+  const re = /\blookup\s*\[\s*fetch\s+`?dt\.entity\.([\w:]+)`?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(input)) !== null) {
+    const entityType = m[1]!;
+    const mapping = classicEntityToSmartscape(entityType);
+    if (!mapping || mapping.status === 'not-planned' || !mapping.smartscapeNodeType) {
+      return entityType;
+    }
+  }
+  return null;
+}
+
+/**
+ * Find text regions corresponding to `lookup [ fetch dt.entity.<X> ... ]`
+ * subqueries whose source X is NOT Smartscape-mapped (e.g. `custom_device`,
+ * `host_group`, `process_group` — all `not-planned`). Inside such a region,
+ * the surrounding context is still classic, so rewriting a relationship
+ * bracket to `references[...]` produces invalid DQL — `references[...]` is a
+ * Smartscape-only construct.
+ *
+ * Returns the half-open `[start, end)` byte spans of those regions so callers
+ * can skip rewrites whose match falls inside any of them.
+ *
+ * NOTE: with the top-level pre-pass in `rewriteDql` now bailing out of any
+ * query containing a not-planned-lookup chain, this function's per-pass
+ * region check is technically dead code. Keeping it as a defense-in-depth
+ * guard in case the pre-pass misses an edge case (e.g. lookup syntax that
+ * doesn't match `findNotPlannedLookupSource`'s regex).
+ */
+function findNonSmartscapeLookupRegions(input: string): Array<{ start: number; end: number }> {
+  const regions: Array<{ start: number; end: number }> = [];
+  const re = /\blookup\s*\[\s*fetch\s+`?dt\.entity\.([\w:]+)`?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(input)) !== null) {
+    const entityType = m[1]!;
+    const mapping = classicEntityToSmartscape(entityType);
+    // Skip if the inner fetch type IS Smartscape-mapped — bracket rewrites
+    // inside that subquery are fine (its own context is Smartscape).
+    if (mapping && mapping.status !== 'not-planned' && mapping.smartscapeNodeType) {
+      continue;
+    }
+    // Walk square brackets to find the matching `]` for this `lookup [`.
+    let depth = 1;
+    let i = re.lastIndex;
+    while (i < input.length && depth > 0) {
+      const c = input[i]!;
+      if (c === '[') depth++;
+      else if (c === ']') depth--;
+      i++;
+    }
+    regions.push({ start: m.index, end: i });
+  }
+  return regions;
+}
+
+function isInsideRegion(
+  pos: number,
+  regions: Array<{ start: number; end: number }>
+): boolean {
+  for (const r of regions) {
+    if (pos >= r.start && pos < r.end) return true;
+  }
+  return false;
+}
+
 function rewriteRelationshipBrackets(
   input: string,
   transforms: Transform[],
   warnings: Warning[],
   ctx: FetchContext
 ): string {
-  return input.replace(RELATIONSHIP_BRACKET_PROJECTION_RE, (full, classicEdge: string, targetClassicType: string) => {
+  const nonSmartscapeRegions = findNonSmartscapeLookupRegions(input);
+  return input.replace(
+    RELATIONSHIP_BRACKET_PROJECTION_RE,
+    (full, classicEdge: string, targetClassicType: string, offset: number) => {
+      // Bug fix (2026-05-14): if this bracket is INSIDE a `lookup [fetch
+      // dt.entity.<not-planned-type> ...]` subquery, the surrounding fetch
+      // is still classic, so emitting `references[...]` produces a runtime
+      // error (`FIELD_DOES_NOT_EXIST: references`). Leave the bracket alone
+      // and emit a targeted warning for the user to translate by hand.
+      if (isInsideRegion(offset, nonSmartscapeRegions)) {
+        warnings.push({
+          kind: 'entity-relationship-traversal',
+          text:
+            `${full} appears inside a \`lookup [fetch dt.entity.<not-planned-type>]\` subquery. ` +
+            `references[…] only works on Smartscape sources, so leaving the bracket alone. ` +
+            `NOTE: this whole lookup chain (and any downstream \`<prefix>.<field>\` accesses in the ` +
+            `outer pipeline) is a classic-only pattern that cannot be auto-translated — it needs ` +
+            `manual redesign, typically by replacing the lookup with a direct \`smartscapeNodes ` +
+            `<TYPE>\` join.`,
+          reference: SKILL_REFS.relationships,
+          match: full,
+        });
+        return full;
+      }
+
     const targetMapping = classicEntityToSmartscape(targetClassicType);
     if (!targetMapping || !targetMapping.smartscapeNodeType) {
       warnings.push({
@@ -606,7 +1078,8 @@ function rewriteRelationshipBrackets(
       });
     }
     return replacement;
-  });
+  }
+  );
 }
 
 // ─── Pass 2.5: entityName / entityAttr → getNodeName / getNodeField ───────

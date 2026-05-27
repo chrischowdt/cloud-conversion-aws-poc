@@ -213,7 +213,7 @@ describe('rewriteDql — flags constructs needing manual migration', () => {
     );
     assert.match(
       r.rewritten,
-      /getNodeField\(dt\.smartscape\.aws\.lambda_function, "tags"\)/
+      /getNodeField\(dt\.smartscape\.aws_lambda_function, "tags"\)/
     );
     assert.doesNotMatch(r.rewritten, /entityAttr/);
   });
@@ -309,6 +309,411 @@ describe('rewriteDql — fetch restructure (Situation 3)', () => {
     assert.ok(
       r.warnings.some((w) => /no Smartscape replacement/i.test(w.text))
     );
+  });
+
+  it('translates fetch dt.entity.custom_device | filter entity.type == "cloud:aws:lambda" to smartscapeNodes AWS_LAMBDA_FUNCTION', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.custom_device\n| filter entity.type == "cloud:aws:lambda"\n| fields id',
+      idx
+    );
+    assert.match(r.rewritten, /smartscapeNodes AWS_LAMBDA_FUNCTION/);
+    assert.doesNotMatch(r.rewritten, /custom_device/);
+    assert.doesNotMatch(r.rewritten, /entity\.type\s*==\s*"cloud:aws:lambda"/);
+  });
+
+  it('flags custom_device fetch when entity.type has no Smartscape replacement', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.custom_device | filter entity.type == "cloud:aws:efs"',
+      idx
+    );
+    // No Smartscape node for EFS yet — leave alone with a targeted warning.
+    assert.match(r.rewritten, /custom_device/);
+    assert.ok(
+      r.warnings.some((w) => /cloud:aws:efs/.test(w.text) && /no known Smartscape/i.test(w.text))
+    );
+  });
+
+  it('flags ambiguous cloud_application mapping with alternatives listed', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries avg(x), by:{dt.entity.cloud_application}',
+      idx
+    );
+    // Default to K8S_DEPLOYMENT, but warn the user about alternatives.
+    assert.match(r.rewritten, /dt\.smartscape\.k8s_deployment/);
+    assert.ok(
+      r.warnings.some((w) => /ambiguous/i.test(w.text) && /K8S_DAEMONSET/.test(w.text))
+    );
+  });
+
+  it('translates kubernetes_cluster, cloud_application_instance, container_group_instance', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries avg(x), by:{dt.entity.kubernetes_cluster, dt.entity.cloud_application_instance, dt.entity.container_group_instance}',
+      idx
+    );
+    assert.match(r.rewritten, /dt\.smartscape\.k8s_cluster/);
+    assert.match(r.rewritten, /dt\.smartscape\.k8s_pod/);
+    assert.match(r.rewritten, /dt\.smartscape\.container/);
+  });
+
+  it('renames classic AWS_ACCOUNT field awsAccountId to aws.account.id when fetch was restructured', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.aws_credentials\n| fields account = entity.name, awsAccountId, id',
+      idx
+    );
+    assert.match(r.rewritten, /smartscapeNodes AWS_ACCOUNT/);
+    assert.match(r.rewritten, /aws\.account\.id/);
+    assert.doesNotMatch(r.rewritten, /\bawsAccountId\b/);
+  });
+
+  it('renames classic AWS_RDS_DBINSTANCE field rdsEngine to `db.system` with backticks', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.relational_database_service | fields rdsEngine | dedup rdsEngine',
+      idx
+    );
+    assert.match(r.rewritten, /smartscapeNodes AWS_RDS_DBINSTANCE/);
+    // Dotted Smartscape names must be backtick-quoted — otherwise DQL parses
+    // `lookup.db.system` as nested member access.
+    assert.match(r.rewritten, /`db\.system`/);
+    assert.doesNotMatch(r.rewritten, /\brdsEngine\b/);
+  });
+
+  it('does not rename dashboard variable references like $rdsEngine, but warns', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.relational_database_service | fields rdsEngine | filter in($rdsEngine, rdsEngine)',
+      idx
+    );
+    // $rdsEngine left alone (variable refs keep their declared name).
+    assert.match(r.rewritten, /\$rdsEngine/);
+    // bare rdsEngine swapped.
+    assert.match(r.rewritten, /`db\.system`/);
+    // a warning surfaces about the variable name now diverging from the field.
+    assert.ok(
+      r.warnings.some((w) => /\$rdsEngine/.test(w.text) && /variable/i.test(w.text))
+    );
+  });
+
+  it('renames lookup.<classic> accessor to lookup.<smartscape> when subquery exposed the field', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.relational_database_service | lookup [fetch dt.entity.relational_database_service | fieldsAdd rdsEngine], sourceField:id, lookupField:id | fields engine = lookup.rdsEngine',
+      idx
+    );
+    assert.match(r.rewritten, /lookup\.`db\.system`/);
+    assert.doesNotMatch(r.rewritten, /lookup\.rdsEngine/);
+  });
+
+  it('leaves field identifiers alone when fetch was not restructured', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('timeseries avg(x) | fields awsAccountId, rdsEngine', idx);
+    // No fetch dt.entity.X → no source type known → don't rename.
+    assert.match(r.rewritten, /awsAccountId/);
+    assert.match(r.rewritten, /rdsEngine/);
+  });
+});
+
+describe('rewriteDql — extended prefix coverage', () => {
+  it('rewrites ext:cloud.aws.<service>.<snake_case> keys', () => {
+    const idx = buildIndex([
+      {
+        service: 'Lambda',
+        classicMetricId: 'ext:cloud.aws.lambda.invocations_sum',
+        newDtMetricKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+        detectedRecipe: {
+          classicAggregation: 'sum', newAggregation: 'sum', newAggregationMode: 'raw',
+          scale: 1, verdict: 'exact-fit', pearsonR: 0.99, residualSmape: 0.01,
+        } as any,
+      },
+    ]);
+    const r = rewriteDql('timeseries sum(ext:cloud.aws.lambda.invocations_sum)', idx);
+    assert.match(r.rewritten, /cloud\.aws\.lambda\.Invocations\.By\.FunctionName/);
+    assert.doesNotMatch(r.rewritten, /ext:cloud\.aws/);
+  });
+
+  it('rewrites bare cloud.aws.<service>.<snake_case> classic keys', () => {
+    const idx = buildIndex([
+      {
+        service: 'Lambda',
+        classicMetricId: 'cloud.aws.lambda.concurrent_executions_sum',
+        newDtMetricKey: 'cloud.aws.lambda.ConcurrentExecutions.By.FunctionName',
+        detectedRecipe: {
+          classicAggregation: 'sum', newAggregation: 'sum', newAggregationMode: 'raw',
+          scale: 1, verdict: 'exact-fit', pearsonR: 0.99, residualSmape: 0.01,
+        } as any,
+      },
+    ]);
+    const r = rewriteDql('timeseries sum(cloud.aws.lambda.concurrent_executions_sum)', idx);
+    assert.match(r.rewritten, /cloud\.aws\.lambda\.ConcurrentExecutions\.By\.FunctionName/);
+  });
+
+  it('leaves new-form cloud.aws.<Service>.<PascalCase>.By.<Dim> keys untouched', () => {
+    const idx = buildIndex([]);
+    const input = 'timeseries avg(cloud.aws.ec2.CPUUtilization.By.InstanceId)';
+    const r = rewriteDql(input, idx);
+    // New-form key is already correct — nothing to rewrite, no unknown-metric flag.
+    assert.equal(r.rewritten, input);
+    assert.ok(!r.warnings.some((w) => w.kind === 'unknown-metric'));
+  });
+});
+
+describe('rewriteDql — relationship-bracket subquery scope', () => {
+  it('leaves accessible_by[dt.entity.aws_credentials] alone when inside lookup [fetch dt.entity.custom_device …]', () => {
+    const idx = buildIndex([]);
+    const input =
+      'timeseries avg(x), by:{dt.entity.custom_device}\n' +
+      '| lookup [fetch dt.entity.custom_device\n' +
+      '| fieldsAdd creds = accessible_by[dt.entity.aws_credentials][0]], sourceField:dt.entity.custom_device, lookupField:id';
+    const r = rewriteDql(input, idx);
+    // Bracket inside the lookup subquery should NOT have been rewritten
+    // to `references[accessible_by.aws_account]` — the surrounding fetch is
+    // dt.entity.custom_device (not-planned), so references[…] would error.
+    assert.match(r.rewritten, /accessible_by\[dt\.entity\.aws_credentials\]/);
+    assert.doesNotMatch(r.rewritten, /references\[accessible_by\.aws_account\]/);
+    // …and a targeted warning explains why.
+    assert.ok(
+      r.warnings.some((w) => /not-planned-type.*subquery/i.test(w.text))
+    );
+  });
+
+  it('still rewrites brackets that are NOT inside a non-smartscape lookup', () => {
+    const idx = buildIndex([]);
+    // EC2 instance → AWS_EC2_INSTANCE (smartscape). belongs_to inside its
+    // OWN top-level fetch should be rewritten to references[…].
+    const input =
+      'fetch dt.entity.ec2_instance\n' +
+      '| fieldsAdd zone = belongs_to[dt.entity.aws_availability_zone][0]';
+    const r = rewriteDql(input, idx);
+    assert.match(r.rewritten, /references\[runs_on\.aws_availability_zone\]|references\[belongs_to\.aws_availability_zone\]/);
+  });
+
+  it('leaves the whole query classic when a downstream step references a lookup-output prefix from a not-planned lookup', () => {
+    // Reduced from AAP_JET_Dynamo_DB_Metrics dashboard tile (2026-05-14 compare:
+    // 6/6 tiles errored with `FIELD_DOES_NOT_EXIST: device.references`). The
+    // chain is: lookup over `custom_device` with prefix:"device." emits
+    // classic relationship arrays as `device.accessible_by`; downstream
+    // fieldsAdd reads `device.accessible_by[dt.entity.aws_credentials][0]`.
+    // Pass 1.7's previous behavior translated that to `device.references[
+    // accessible_by.aws_account]`, but `device.references` doesn't exist —
+    // `references[…]` only works on entity records, not on prefixed lookup
+    // output. Pass 2 also swaps the LHS `dt.entity.X` and inside-bracket
+    // `dt.entity.X`, producing further invalid shapes downstream.
+    //
+    // The right behavior: when ANY `lookup [fetch dt.entity.<not-planned>]`
+    // chain exists in the query, none of the rewriter passes can produce
+    // valid DQL — leave the whole query classic and emit a clear warning.
+    // Classic DQL still runs on the new platform.
+    const idx = buildIndex([]);
+    const input =
+      'timeseries avg(x), by:{dt.entity.custom_device}\n' +
+      '| lookup [fetch dt.entity.custom_device\n' +
+      '| fieldsAdd dt.entity.aws_credentials = accessible_by[dt.entity.aws_credentials][0]], sourceField:dt.entity.custom_device, lookupField:id, prefix:"device."\n' +
+      '| fieldsAdd dt.entity.aws_credentials = device.accessible_by[dt.entity.aws_credentials][0]\n' +
+      '| lookup [fetch dt.entity.aws_credentials | fields name = entity.name, id], sourceField:dt.entity.aws_credentials, lookupField:id, prefix:"account."\n' +
+      '| filter account.name == "STG-AirportOps"';
+    const r = rewriteDql(input, idx);
+    // None of the invalid shapes the old rewriter produced.
+    assert.doesNotMatch(r.rewritten, /device\.references\[/);
+    assert.doesNotMatch(r.rewritten, /\baccessible_by\[dt\.smartscape\./);
+    assert.doesNotMatch(r.rewritten, /\bdt\.smartscape\.aws_account\s*=\s*device\./);
+    // Whole query preserved verbatim — original DQL still runs on the new
+    // platform, just without auto-translation.
+    assert.equal(r.rewritten, input);
+    assert.equal(r.transforms.length, 0);
+    // One clear warning explaining why nothing was translated.
+    assert.ok(
+      r.warnings.some((w) => /not-planned-type.*subquery/i.test(w.text)),
+      `expected a not-planned-type subquery warning; got: ${r.warnings.map((w) => w.text).join(' | ')}`
+    );
+  });
+});
+
+describe('rewriteDql — by-clause non-carrier alignment', () => {
+  it('warns when a non-carrier smartscape dim is used in by:{...} after a metric rewrite', () => {
+    const idx = buildIndex([
+      {
+        service: 'ECS',
+        classicMetricId: 'dt.cloud.aws.ecs.cpu.utilization',
+        newDtMetricKey: 'cloud.aws.ecs.CPUUtilization.By.ClusterName',
+        detectedRecipe: {
+          classicAggregation: 'avg', newAggregation: 'avg', newAggregationMode: 'raw',
+          scale: 1, verdict: 'exact-fit', pearsonR: 0.99, residualSmape: 0.01,
+        } as any,
+      },
+    ]);
+    // ECS_CLUSTER is in our entity-mappings as a custom_device sub-type alias
+    // — the rewriter swaps `dt.entity.cloud:aws:ecs:cluster` → `dt.smartscape.aws_eks_cluster`?
+    // Actually we map cloud:aws:eks:cluster, not ecs:cluster. Use a generic input
+    // that produces dt.smartscape.aws_ecs_cluster via the by-clause directly.
+    const input =
+      'timeseries avg(dt.cloud.aws.ecs.cpu.utilization), by:{dt.smartscape.aws_ecs_cluster}';
+    const r = rewriteDql(input, idx);
+    assert.ok(
+      r.warnings.some((w) =>
+        /dt\.smartscape\.aws_ecs_cluster/.test(w.text) &&
+        /isn't carried/i.test(w.text) &&
+        /ClusterName/.test(w.text)
+      ),
+      'expected non-carrier warning with concrete substitution'
+    );
+  });
+
+  it('does not warn for carrier smartscape dims (AWS_LAMBDA_FUNCTION)', () => {
+    const idx = buildIndex([
+      {
+        service: 'Lambda',
+        classicMetricId: 'dt.cloud.aws.lambda.invocations',
+        newDtMetricKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+        detectedRecipe: {
+          classicAggregation: 'sum', newAggregation: 'sum', newAggregationMode: 'raw',
+          scale: 1, verdict: 'exact-fit', pearsonR: 0.99, residualSmape: 0.01,
+        } as any,
+      },
+    ]);
+    const r = rewriteDql(
+      'timeseries sum(dt.cloud.aws.lambda.invocations), by:{dt.entity.aws_lambda_function}',
+      idx
+    );
+    assert.ok(
+      !r.warnings.some((w) => /isn't carried/i.test(w.text)),
+      'should not warn — AWS_LAMBDA_FUNCTION IS a carrier'
+    );
+  });
+});
+
+describe('rewriteDql — DAC fallback for keys missing from recipe mapping', () => {
+  it('resolves an unmapped classic key via DAC and emits a metric-key swap warning', () => {
+    const baseIdx = buildIndex([]);
+    // Manually inject a DAC index so we don't depend on the JSON file path
+    // (kept tiny for the test).
+    const dac = new Map();
+    const dacEntry = {
+      cloudwatchNamespace: 'AWS/Lambda',
+      cloudwatchMetricName: 'Invocations',
+      cloudwatchDimensions: ['FunctionName'],
+      secondGenMetricKey: 'ext:cloud.aws.lambda.invocationsSum',
+      dacRecommendedMetricKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+      dacAutodiscoveredMetricKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+      builtInMetricKey: 'not-matched',
+      endOfLife: false,
+    };
+    dac.set('ext:cloud.aws.lambda.invocationsSum', dacEntry);
+    dac.set('cloud.aws.lambda.invocations_sum', dacEntry);
+    const idx = { ...baseIdx, dac: { byClassicKey: dac } };
+
+    const r = rewriteDql('timeseries sum(cloud.aws.lambda.invocations_sum)', idx);
+    assert.match(r.rewritten, /cloud\.aws\.lambda\.Invocations\.By\.FunctionName/);
+    // DAC results are exposed as `mapped-no-recipe` warnings — we still want
+    // the user to know aggregation/scale was NOT verified by our recipe path.
+    assert.ok(r.warnings.some((w) => w.kind === 'mapped-no-recipe'));
+  });
+
+  it('emits an end-of-life-service warning when the DAC entry is EOL', () => {
+    const baseIdx = buildIndex([]);
+    const dac = new Map();
+    dac.set('ext:cloud.aws.opsworks.cpuIdleSum', {
+      cloudwatchNamespace: 'AWS/OpsWorks',
+      cloudwatchMetricName: 'cpu_idle',
+      cloudwatchDimensions: ['StackId'],
+      secondGenMetricKey: 'ext:cloud.aws.opsworks.cpuIdleSum',
+      dacRecommendedMetricKey: 'not-matched',
+      dacAutodiscoveredMetricKey: 'cloud.aws.opsworks.CpuIdle.By.StackId',
+      builtInMetricKey: 'not-matched',
+      endOfLife: true,
+    });
+    const idx = { ...baseIdx, dac: { byClassicKey: dac } };
+
+    const r = rewriteDql('timeseries sum(ext:cloud.aws.opsworks.cpuIdleSum)', idx);
+    // Pre-baked slug lookup already covers OpsWorks; either way an EOL warning fires.
+    assert.ok(r.warnings.some((w) => w.kind === 'end-of-life-service'));
+  });
+});
+
+describe('rewriteDql — EOL service warnings', () => {
+  it('emits an end-of-life-service warning when the metric maps to a retiring service', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('timeseries avg(dt.cloud.aws.opsworks.stacks)', idx);
+    const eol = r.warnings.find((w) => w.kind === 'end-of-life-service');
+    assert.ok(eol, 'expected an EOL warning');
+    assert.match(eol!.text, /OpsWorks/);
+    assert.match(eol!.text, /2024-05-26/);
+  });
+
+  it('does not emit EOL warnings for healthy services', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('timeseries avg(dt.cloud.aws.ec2.cpu.usage)', idx);
+    assert.ok(!r.warnings.some((w) => w.kind === 'end-of-life-service'));
+  });
+});
+
+describe('rewriteDql — additional custom_device sub-types', () => {
+  it('rewrites fetch custom_device + entity.type == "cloud:aws:s3" to smartscapeNodes AWS_S3_BUCKET', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.custom_device | filter entity.type == "cloud:aws:s3"',
+      idx
+    );
+    assert.match(r.rewritten, /smartscapeNodes AWS_S3_BUCKET/);
+    assert.doesNotMatch(r.rewritten, /custom_device/);
+  });
+
+  it('rewrites cloud:aws:eks:cluster to AWS_EKS_CLUSTER', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.custom_device | filter entity.type == "cloud:aws:eks:cluster"',
+      idx
+    );
+    assert.match(r.rewritten, /smartscapeNodes AWS_EKS_CLUSTER/);
+  });
+
+  it('rewrites cloud:aws:aurora to AWS_RDS_DBCLUSTER', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.entity.custom_device | filter entity.type == "cloud:aws:aurora"',
+      idx
+    );
+    assert.match(r.rewritten, /smartscapeNodes AWS_RDS_DBCLUSTER/);
+  });
+
+  it('flags elastic_load_balancer as not-planned (Classic ELB has no new equivalent)', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('fetch dt.entity.elastic_load_balancer | fields id', idx);
+    assert.match(r.rewritten, /fetch dt\.entity\.elastic_load_balancer/);
+    assert.ok(
+      r.warnings.some((w) => /no Smartscape replacement/i.test(w.text) || /not in the new connection/i.test(w.text))
+    );
+  });
+});
+
+describe('rewriteDql — metric-key rewrite resilience', () => {
+  it('does not rewrite metric keys inside backtick-quoted column references', () => {
+    const idx = buildIndex([cpuEntry]);
+    const input =
+      'timeseries avg(builtin:cloud.aws.ec2.cpu.usage)\n' +
+      '| fieldsAdd ratio = `avg(builtin:cloud.aws.ec2.cpu.usage)` * 2';
+    const r = rewriteDql(input, idx);
+    // The agg-call form gets rewritten.
+    assert.match(r.rewritten, /avg\(`cloud\.aws\.ec2\.CPUUtilization\.By\.InstanceId`\)/);
+    // The backtick column ref is left alone (no nested backticks).
+    assert.match(r.rewritten, /`avg\(builtin:cloud\.aws\.ec2\.cpu\.usage\)`/);
+    assert.doesNotMatch(r.rewritten, /`avg\(`/);
+    // …and a warning surfaces explaining the column-rename problem.
+    assert.ok(
+      r.warnings.some((w) => /column reference/i.test(w.text) && /timeseries/i.test(w.text))
+    );
+  });
+
+  it('preserves count() instead of swapping to recipe newAggregation', () => {
+    const idx = buildIndex([cpuEntry]);
+    const r = rewriteDql('timeseries count(builtin:cloud.aws.ec2.cpu.usage)', idx);
+    // count() stays count(), not avg() — even though cpuEntry's newAgg is avg.
+    assert.match(r.rewritten, /count\(`cloud\.aws\.ec2\.CPUUtilization\.By\.InstanceId`\)/);
+    assert.doesNotMatch(r.rewritten, /avg\(`cloud\.aws\.ec2/);
   });
 });
 
