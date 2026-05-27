@@ -103,6 +103,17 @@ export interface DetectPerResourceArgs {
   resourceSample?: number;
   /** r threshold for "fit". Default 0.85. */
   minR?: number;
+  /**
+   * Scope sampling to a set of AWS account IDs (e.g. the parallel-state
+   * accounts discovered by `tools/out/parallel-accounts.json`). For each
+   * account, top-K resources are sampled by data volume, then unioned across
+   * accounts. Multiplies the candidate pool by N accounts, dramatically
+   * improving the per-resource bridge's hit rate vs single-tenant sampling.
+   *
+   * When omitted, sampling is global (current behavior). When set to
+   * `["auto"]`, the command loads `tools/out/parallel-accounts.json`.
+   */
+  accountIds?: string[];
 }
 
 interface PythonMapping {
@@ -218,19 +229,70 @@ function loadPairs(mapping: PythonMapping, service?: string): Pair[] {
   return pairs;
 }
 
+/**
+ * For each AWS account ID, look up the set of classic credential entity
+ * NAMES (e.g. "DEV-AirportOps", "STG-Baggage-Cargo") owned by that account.
+ * Used to scope per-account metric sampling, since classic metric.series
+ * carries `aws.credentials` (a list of credential names) but not raw account
+ * IDs.
+ *
+ * Returns `Map<accountId, credentialNames[]>`. Accounts with no credentials
+ * (i.e. accounts that don't appear on the classic side) are omitted.
+ */
+async function loadCredentialsByAccount(
+  client: DqlClient,
+  accountIds: string[]
+): Promise<Map<string, string[]>> {
+  if (accountIds.length === 0) return new Map();
+  const accountArray = 'array(' + accountIds.map(dqlString).join(', ') + ')';
+  const query = `
+    fetch dt.entity.aws_credentials, from:now()-12h
+    | filter in(awsAccountId, ${accountArray})
+    | fields awsAccountId, entity.name
+  `.trim();
+  const out = new Map<string, string[]>();
+  try {
+    const result = await client.query({ query, maxResultRecords: 10_000, fetchTimeoutSeconds: 60 });
+    for (const r of result.records) {
+      const acct = r['awsAccountId'];
+      const name = r['entity.name'];
+      if (typeof acct === 'string' && typeof name === 'string') {
+        if (!out.has(acct)) out.set(acct, []);
+        out.get(acct)!.push(name);
+      }
+    }
+  } catch {
+    return new Map();
+  }
+  return out;
+}
+
 async function discoverTopResources(
   client: DqlClient,
   pair: Pair,
   entityType: string,
   k: number,
   from: string,
-  to: string
+  to: string,
+  credentialNames?: string[]
 ): Promise<string[]> {
   const dim = '`dt.entity.' + entityType + '`';
+  // When `credentialNames` is set, scope the classic metric.series scan to
+  // series owned by those credentials. `aws.credentials` is a multi-valued
+  // list (the same metric can be reported by multiple credentials), so we
+  // match via contains() over the stringified array. The OR chain unions
+  // the credential set.
+  let credFilter = '';
+  if (credentialNames && credentialNames.length > 0) {
+    const clauses = credentialNames.map(
+      (n) => `contains(toString(aws.credentials), ${dqlString(n)})`
+    );
+    credFilter = `\n    | filter ${clauses.join(' OR ')}`;
+  }
   const query = `
     fetch metric.series, from: ${from}, to: ${to}
     | filter metric.key == ${dqlString(pair.classicDqlKey)}
-    | filter isNotNull(${dim})
+    | filter isNotNull(${dim})${credFilter}
     | summarize samples = count(), by: { eid = ${dim} }
     | sort samples desc
     | limit ${k}
@@ -247,6 +309,30 @@ async function discoverTopResources(
   } catch {
     return [];
   }
+}
+
+/**
+ * Multi-account top-K sampling: for each account, ask `discoverTopResources`
+ * for its own top-K, then union the entity IDs. The union typically has more
+ * candidate IDs than K (depending on overlap between accounts), giving the
+ * downstream bridge a larger pool to find aligned classic↔new pairs in.
+ */
+async function discoverTopResourcesPerAccount(
+  client: DqlClient,
+  pair: Pair,
+  entityType: string,
+  k: number,
+  from: string,
+  to: string,
+  credsByAccount: Map<string, string[]>
+): Promise<string[]> {
+  const union = new Set<string>();
+  for (const [, credentials] of credsByAccount) {
+    if (credentials.length === 0) continue;
+    const ids = await discoverTopResources(client, pair, entityType, k, from, to, credentials);
+    for (const id of ids) union.add(id);
+  }
+  return [...union];
 }
 
 async function lookupArns(
@@ -521,6 +607,23 @@ export async function runDetectPerResource(args: DetectPerResourceArgs): Promise
       console.log(`  retry ${info.attempt}: ${info.reason} (${info.delayMs.toFixed(0)}ms)`),
   });
 
+  // Resolve account → credential names once. Used to scope per-pair
+  // sampling to a parallel-account set when `accountIds` is provided.
+  let credsByAccount: Map<string, string[]> | null = null;
+  if (args.accountIds && args.accountIds.length > 0) {
+    credsByAccount = await loadCredentialsByAccount(client, args.accountIds);
+    const accountsWithCreds = [...credsByAccount.entries()].filter(([, c]) => c.length > 0);
+    const totalCreds = accountsWithCreds.reduce((sum, [, c]) => sum + c.length, 0);
+    console.log(
+      `Account-scoped sampling: ${accountsWithCreds.length}/${args.accountIds.length} accounts ` +
+        `have classic credentials (${totalCreds} credentials total). K=${k} per account.`
+    );
+    if (accountsWithCreds.length === 0) {
+      console.log('  ⚠ no credentials found for any requested account — falling back to global sampling.');
+      credsByAccount = null;
+    }
+  }
+
   const entityTypeCache = new Map<string, string | null>();
   const results: AggregatedPair[] = [];
   let i = 0;
@@ -544,7 +647,9 @@ export async function runDetectPerResource(args: DetectPerResourceArgs): Promise
     pair.classicEntityType = entityType;
     process.stdout.write(`(${entityType}) `);
 
-    const eids = await discoverTopResources(client, pair, entityType, k, from, to);
+    const eids = credsByAccount
+      ? await discoverTopResourcesPerAccount(client, pair, entityType, k, from, to, credsByAccount)
+      : await discoverTopResources(client, pair, entityType, k, from, to);
     if (eids.length === 0) {
       console.log('no candidate resources');
       results.push({
@@ -577,43 +682,72 @@ export async function runDetectPerResource(args: DetectPerResourceArgs): Promise
       to
     );
 
-    const perResource: ResourceResult[] = [];
+    // Build the worklist: which eids need a per-resource fit, which are
+    // pre-classified as no-data. The no-data buckets can be filled in
+    // synchronously; the actual fits run with bounded concurrency so a
+    // wide candidate pool (e.g. 30+ resources × 19 accounts) doesn't take
+    // forever.
+    type Job =
+      | { kind: 'noinfo'; eid: string }
+      | { kind: 'noarn'; eid: string; arn: string; name?: string }
+      | { kind: 'fit'; eid: string; arn: string; name?: string };
+    const jobs: Job[] = [];
     for (const eid of eids) {
       const info = arnMap.get(eid);
       if (!info) {
-        perResource.push({
-          classicEntityId: eid,
-          arn: '',
-          combos: [],
-          bestCombo: null,
-          verdict: 'no-data',
-        });
+        jobs.push({ kind: 'noinfo', eid });
         continue;
       }
       if (!arnsWithNew.has(info.arn)) {
-        perResource.push({
-          classicEntityId: eid,
-          arn: info.arn,
-          entityName: info.name,
-          combos: [],
-          bestCombo: null,
-          verdict: 'no-data',
-        });
+        jobs.push({ kind: 'noarn', eid, arn: info.arn, name: info.name });
         continue;
       }
-      const result = await detectForOneResource(
-        client,
-        pair,
-        entityType,
-        eid,
-        info.arn,
-        info.name,
-        from,
-        to,
-        interval
-      );
-      perResource.push(result);
+      jobs.push({ kind: 'fit', eid, arn: info.arn, name: info.name });
     }
+    const perResource: ResourceResult[] = new Array(jobs.length);
+    const FIT_CONCURRENCY = 4; // bounded — tenant API has rate limits
+    // entityType was null-checked above; capture as non-null for the closure
+    // (TS can't narrow `string | null` across worker functions).
+    const entityTypeNN: string = entityType;
+    let next = 0;
+    async function worker(): Promise<void> {
+      while (true) {
+        const idx = next++;
+        if (idx >= jobs.length) return;
+        const job = jobs[idx]!;
+        if (job.kind === 'noinfo') {
+          perResource[idx] = {
+            classicEntityId: job.eid,
+            arn: '',
+            combos: [],
+            bestCombo: null,
+            verdict: 'no-data',
+          };
+        } else if (job.kind === 'noarn') {
+          perResource[idx] = {
+            classicEntityId: job.eid,
+            arn: job.arn,
+            entityName: job.name,
+            combos: [],
+            bestCombo: null,
+            verdict: 'no-data',
+          };
+        } else {
+          perResource[idx] = await detectForOneResource(
+            client,
+            pair,
+            entityTypeNN,
+            job.eid,
+            job.arn,
+            job.name,
+            from,
+            to,
+            interval
+          );
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: FIT_CONCURRENCY }, () => worker()));
 
     const verdictCounts: Record<PerPairVerdict, number> = {
       'exact-fit': 0,

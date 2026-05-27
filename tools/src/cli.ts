@@ -22,7 +22,11 @@ import { runDiscover } from './commands/discover.ts';
 import { runDql } from './commands/dql.ts';
 import { runEquivalence } from './commands/equivalence.ts';
 import { runMergeRecipes } from './commands/merge-recipes.ts';
+import { runCompareDashboard } from './commands/compare-dashboard.ts';
+import { runDiscoverFields } from './commands/discover-fields.ts';
+import { runRewriteDashboard } from './commands/rewrite-dashboard.ts';
 import { runRewriteDql } from './commands/rewrite-dql.ts';
+import { runScanDashboards } from './commands/scan-dashboards.ts';
 import type { CloudProvider } from './lib/types.ts';
 
 interface Args {
@@ -122,6 +126,15 @@ COMMANDS
                     Pull every dashboard from the tenant for offline
                     analysis: new dashboards via Document Service, classic
                     dashboards via Config API v1.
+  scan-dashboards   Run the DQL rewriter against every downloaded new
+                    dashboard, filtered to AWS-using ones. Emits a coverage
+                    summary + per-dashboard JSONL.
+  rewrite-dashboard Apply the rewriter to every query in one dashboard JSON,
+                    emitting a new dashboard ready for upload + a markdown
+                    transform/warning report.
+  compare-dashboard Run each tile's ORIGINAL and REWRITTEN query against the
+                    tenant; emit a side-by-side parity report. Confidence
+                    check before piling on more translation patterns.
   dql               Run a raw DQL query and dump records (for iteration).
 
 CREDENTIALS
@@ -273,6 +286,24 @@ async function main(): Promise<void> {
     }
     case 'detect-per-resource': {
       const { baseUrl, token } = requireBaseAndToken(args.flags);
+      // --accounts <id,id,...>  OR  --accounts auto  (load tools/out/parallel-accounts.json)
+      const accountsFlag = getString(args.flags, 'accounts');
+      let accountIds: string[] | undefined;
+      if (accountsFlag === 'auto') {
+        const { OUT_DIR: outDirConst } = await import('./lib/paths.ts');
+        const { readFile } = await import('node:fs/promises');
+        const { join } = await import('node:path');
+        const parallelPath = join(outDirConst, 'parallel-accounts.json');
+        try {
+          const raw = JSON.parse(await readFile(parallelPath, 'utf8'));
+          accountIds = (raw.parallel ?? []).map((p: { awsAccountId: string }) => p.awsAccountId);
+          console.log(`Loaded ${accountIds!.length} parallel accounts from ${parallelPath}`);
+        } catch (e) {
+          throw new Error(`--accounts auto: failed to load ${parallelPath}: ${(e as Error).message}`);
+        }
+      } else if (accountsFlag) {
+        accountIds = accountsFlag.split(',').map((s) => s.trim()).filter(Boolean);
+      }
       await runDetectPerResource({
         baseUrl,
         token,
@@ -284,6 +315,7 @@ async function main(): Promise<void> {
         interval: getString(args.flags, 'interval'),
         resourceSample: getNumber(args.flags, 'resource-sample'),
         minR: getNumber(args.flags, 'min-r'),
+        accountIds,
         outDir,
       });
       return;
@@ -322,6 +354,80 @@ async function main(): Promise<void> {
         file: getString(args.flags, 'file'),
         mappingPath: getString(args.flags, 'mapping'),
         outDir,
+      });
+      return;
+    }
+    case 'scan-dashboards': {
+      await runScanDashboards({
+        inputDir: getString(args.flags, 'input-dir'),
+        mappingPath: getString(args.flags, 'mapping'),
+        outDir,
+        limit: getNumber(args.flags, 'limit'),
+        all: args.flags.get('all') === true,
+      });
+      return;
+    }
+    case 'rewrite-dashboard': {
+      const input = getString(args.flags, 'in') ?? getString(args.flags, 'input');
+      if (!input) throw new Error('rewrite-dashboard: pass --in <dashboard.json>.');
+      await runRewriteDashboard({
+        input,
+        mappingPath: getString(args.flags, 'mapping'),
+        outDir,
+      });
+      return;
+    }
+    case 'discover-fields': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDiscoverFields({
+        baseUrl,
+        token,
+        outDir,
+        filter: getString(args.flags, 'filter'),
+      });
+      return;
+    }
+    case 'compare-dashboard': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      const input = getString(args.flags, 'in') ?? getString(args.flags, 'input');
+      if (!input) throw new Error('compare-dashboard: pass --in <dashboard.json>.');
+      // --vars Name=v1,v2;Other=x — multi-value with semicolons between vars.
+      // --account-id <id1,id2,...> — shorthand for the common AWS account vars
+      //   (AccountID, AccountId, awsAccountId, account, Account). Substitutes
+      //   them all to the same list, so a dashboard's `in(awsAccountId,
+      //   $AccountID)` filter resolves cleanly against either side.
+      const injectedVars = new Map<string, string[]>();
+      const varsFlag = getString(args.flags, 'vars');
+      if (varsFlag) {
+        for (const pair of varsFlag.split(';')) {
+          const eq = pair.indexOf('=');
+          if (eq <= 0) continue;
+          const name = pair.slice(0, eq).trim();
+          const vals = pair.slice(eq + 1).split(',').map((s) => s.trim()).filter(Boolean);
+          if (name && vals.length > 0) injectedVars.set(name, vals);
+        }
+      }
+      const accountIdFlag = getString(args.flags, 'account-id');
+      if (accountIdFlag) {
+        const accountIds = accountIdFlag.split(',').map((s) => s.trim()).filter(Boolean);
+        // Only inject onto variables that clearly hold AWS account *IDs*.
+        // `$Account` / `$account` typically hold the human-readable account
+        // *name* and would be incorrectly filtered out by numeric IDs.
+        for (const name of ['AccountID', 'AccountId', 'accountId', 'AccountID_', 'awsAccountId']) {
+          injectedVars.set(name, accountIds);
+        }
+      }
+      await runCompareDashboard({
+        baseUrl,
+        token,
+        input,
+        mappingPath: getString(args.flags, 'mapping'),
+        outDir,
+        from: getString(args.flags, 'from'),
+        to: getString(args.flags, 'to'),
+        limit: getNumber(args.flags, 'limit'),
+        includeVariables: args.flags.get('no-variables') !== true,
+        injectedVars: injectedVars.size > 0 ? injectedVars : undefined,
       });
       return;
     }
