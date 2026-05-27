@@ -11,6 +11,7 @@
 
 import { readFile } from 'node:fs/promises';
 
+import { loadDacIndex, lookupInDac, type DacIndex } from './dac-lookup.ts';
 import { builtinToDqlClassic } from './schema-transforms.ts';
 
 export type Aggregation = 'avg' | 'sum' | 'max' | 'min' | 'count';
@@ -75,9 +76,18 @@ export interface RecipeIndex {
    * metrics in the DQL form, so the rewriter needs to look them up by it.
    */
   byDqlClassicKey: Map<string, MappingEntry>;
+  /**
+   * Authoritative DAC mapping (~4,168 entries) from the dt-migration skill,
+   * loaded as a fallback for keys our recipe mapping doesn't cover. Optional
+   * — older callers can omit it and the rewriter still works.
+   */
+  dac?: DacIndex;
 }
 
-export async function loadRecipeIndex(path: string): Promise<RecipeIndex> {
+export async function loadRecipeIndex(
+  path: string,
+  options: { dacPath?: string } = {}
+): Promise<RecipeIndex> {
   const file = JSON.parse(await readFile(path, 'utf8')) as MergedMappingFile;
   const byClassicId = new Map<string, MappingEntry>();
   const byDqlClassicKey = new Map<string, MappingEntry>();
@@ -89,7 +99,11 @@ export async function loadRecipeIndex(path: string): Promise<RecipeIndex> {
       if (dqlKey) byDqlClassicKey.set(dqlKey, entry);
     }
   }
-  return { byClassicId, byDqlClassicKey };
+  const result: RecipeIndex = { byClassicId, byDqlClassicKey };
+  if (options.dacPath) {
+    result.dac = await loadDacIndex(options.dacPath);
+  }
+  return result;
 }
 
 export type LookupResult =
@@ -102,14 +116,44 @@ export type LookupResult =
  * Look up a classic metric reference by EITHER form:
  *   - v2-API:  builtin:cloud.aws.X.camelCase
  *   - DQL:     dt.cloud.aws.X.snake_case
+ *
+ * Falls back to the DAC mapping (4,168 entries) when our recipe mapping
+ * misses. DAC fallback returns a synthetic `mapped-no-recipe` entry — the
+ * new key swap happens, but no aggregation/scale recipe is applied (so the
+ * user keeps their original aggregation; the rewriter warns about the gap).
  */
 export function lookupClassicKey(index: RecipeIndex, classicMetricId: string): LookupResult {
   let entry = index.byClassicId.get(classicMetricId);
   if (!entry) entry = index.byDqlClassicKey.get(classicMetricId);
-  if (!entry) return { kind: 'unknown' };
-  if (entry.compositeFormula) return { kind: 'composite', entry, formula: entry.compositeFormula };
-  if (entry.detectedRecipe && entry.newDtMetricKey) {
-    return { kind: 'recipe', entry, recipe: entry.detectedRecipe };
+  if (entry) {
+    if (entry.compositeFormula) return { kind: 'composite', entry, formula: entry.compositeFormula };
+    if (entry.detectedRecipe && entry.newDtMetricKey) {
+      return { kind: 'recipe', entry, recipe: entry.detectedRecipe };
+    }
+    return { kind: 'mapped-no-recipe', entry };
   }
-  return { kind: 'mapped-no-recipe', entry };
+
+  // Recipe miss — try DAC.
+  if (index.dac) {
+    const dac = lookupInDac(index.dac, classicMetricId);
+    if (dac) {
+      const eolNote = dac.endOfLife
+        ? ' END-OF-LIFE service per DAC.'
+        : '';
+      const synthetic: MappingEntry = {
+        service: dac.cloudwatchNamespace.replace(/^AWS\//, ''),
+        classicMetricId,
+        cloudwatchName: dac.cloudwatchMetricName,
+        newDtMetricKey: dac.newDtMetricKey,
+        newDimensions: dac.cloudwatchDimensions,
+        notes:
+          `Resolved via DAC (${dac.availability}).${eolNote} ` +
+          (dac.availability === 'autodiscovered'
+            ? `New connection must be configured with "recommended + custom" and this metric added explicitly.`
+            : 'In the recommended set — no extra configuration needed.'),
+      };
+      return { kind: 'mapped-no-recipe', entry: synthetic };
+    }
+  }
+  return { kind: 'unknown' };
 }

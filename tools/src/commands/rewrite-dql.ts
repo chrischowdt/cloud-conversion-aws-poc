@@ -12,7 +12,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { rewriteDql } from '../lib/dql-rewriter.ts';
-import { OUT_DIR, REPO_ROOT } from '../lib/paths.ts';
+import { OUT_DIR, REPO_ROOT, SKILL_DAC_AWS_METRICS } from '../lib/paths.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 
 export interface RewriteDqlArgs {
@@ -34,7 +34,7 @@ export async function runRewriteDql(args: RewriteDqlArgs): Promise<void> {
   if (!dql && args.file) dql = await readFile(args.file, 'utf8');
   if (!dql) throw new Error('Provide --query or --file.');
 
-  const index = await loadRecipeIndex(mappingPath);
+  const index = await loadRecipeIndex(mappingPath, { dacPath: SKILL_DAC_AWS_METRICS });
   const result = rewriteDql(dql, index);
 
   if (!args.quiet) {

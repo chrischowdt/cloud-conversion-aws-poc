@@ -38,18 +38,18 @@
           "notes": "",
           "source": "override",
           "detectedRecipe": {
-            "classicAggregation": "sum",
-            "newAggregation": "max",
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
             "newAggregationMode": "raw",
-            "scale": 0.8725490196078431,
-            "verdict": "good-fit",
-            "pearsonR": 0.9892567855288639,
-            "residualSmape": 0.1460674157303371,
-            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "scale": 1.1678087572362617,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9999999999999954,
+            "residualSmape": 1.6653345369377353e-16,
+            "detectedAt": "2026-05-15T17:05:06.114Z",
             "detectedFromWindow": "-25h → -1h",
             "source": "detect-per-resource",
-            "perResourceQualifying": 1,
-            "perResourceTested": 25
+            "perResourceQualifying": 3,
+            "perResourceTested": 34
           }
         },
         {
@@ -66,18 +66,18 @@
           "notes": "",
           "source": "override",
           "detectedRecipe": {
-            "classicAggregation": "sum",
-            "newAggregation": "max",
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
             "newAggregationMode": "raw",
-            "scale": 1.8823529411764708,
+            "scale": 1.070109193037989,
             "verdict": "exact-fit",
-            "pearsonR": 0.9999999999999952,
-            "residualSmape": 0,
-            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "pearsonR": 0.9231920076786909,
+            "residualSmape": 0.004808046333429237,
+            "detectedAt": "2026-05-15T17:05:06.114Z",
             "detectedFromWindow": "-25h → -1h",
             "source": "detect-per-resource",
-            "perResourceQualifying": 1,
-            "perResourceTested": 25
+            "perResourceQualifying": 2,
+            "perResourceTested": 34
           }
         },
         {
@@ -98,14 +98,14 @@
             "newAggregation": "avg",
             "newAggregationMode": "raw",
             "scale": 1,
-            "verdict": "scale-only",
+            "verdict": "exact-fit",
             "pearsonR": null,
             "residualSmape": 0,
-            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedAt": "2026-05-15T17:05:06.114Z",
             "detectedFromWindow": "-25h → -1h",
             "source": "detect-per-resource",
-            "perResourceQualifying": 6,
-            "perResourceTested": 25
+            "perResourceQualifying": 14,
+            "perResourceTested": 27
           }
         },
         {
@@ -126,14 +126,14 @@
             "newAggregation": "avg",
             "newAggregationMode": "raw",
             "scale": 1,
-            "verdict": "scale-only",
-            "pearsonR": 0.7543002551314258,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9996574959849764,
             "residualSmape": 0,
-            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedAt": "2026-05-15T17:05:06.114Z",
             "detectedFromWindow": "-25h → -1h",
             "source": "detect-per-resource",
-            "perResourceQualifying": 7,
-            "perResourceTested": 25
+            "perResourceQualifying": 15,
+            "perResourceTested": 27
           }
         },
         {
@@ -301,11 +301,11 @@
             "verdict": "exact-fit",
             "pearsonR": 1,
             "residualSmape": 0,
-            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedAt": "2026-05-15T17:05:06.114Z",
             "detectedFromWindow": "-25h → -1h",
             "source": "detect-per-resource",
             "perResourceQualifying": 3,
-            "perResourceTested": 25
+            "perResourceTested": 8
           }
         },
         {
@@ -329,11 +329,11 @@
             "verdict": "exact-fit",
             "pearsonR": 1,
             "residualSmape": 0,
-            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "detectedAt": "2026-05-15T17:05:06.114Z",
             "detectedFromWindow": "-25h → -1h",
             "source": "detect-per-resource",
-            "perResourceQualifying": 1,
-            "perResourceTested": 25
+            "perResourceQualifying": 5,
+            "perResourceTested": 12
           }
         },
         {
@@ -387,15 +387,15 @@
             "classicAggregation": "avg",
             "newAggregation": "avg",
             "newAggregationMode": "raw",
-            "scale": 1.0008484831543556,
+            "scale": 1,
             "verdict": "exact-fit",
-            "pearsonR": 0.9910453463771678,
-            "residualSmape": 0.021157311136090907,
-            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "pearsonR": 0.9760864397744534,
+            "residualSmape": 0.01242228896863987,
+            "detectedAt": "2026-05-15T21:11:08.271Z",
             "detectedFromWindow": "-25h → -1h",
             "source": "detect-per-resource",
-            "perResourceQualifying": 5,
-            "perResourceTested": 25
+            "perResourceQualifying": 33,
+            "perResourceTested": 62
           }
         },
         {
@@ -471,15 +471,15 @@
             "classicAggregation": "avg",
             "newAggregation": "sum",
             "newAggregationMode": "per_second",
-            "scale": 0.9750963071683834,
+            "scale": 0.9335255549922212,
             "verdict": "exact-fit",
-            "pearsonR": 0.9989986628827603,
-            "residualSmape": 0.03645446818511093,
-            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "pearsonR": 0.99944502588405,
+            "residualSmape": 0.013980549359810959,
+            "detectedAt": "2026-05-15T21:11:08.271Z",
             "detectedFromWindow": "-25h → -1h",
             "source": "detect-per-resource",
-            "perResourceQualifying": 4,
-            "perResourceTested": 25
+            "perResourceQualifying": 23,
+            "perResourceTested": 62
           }
         },
         {
@@ -499,15 +499,15 @@
             "classicAggregation": "avg",
             "newAggregation": "sum",
             "newAggregationMode": "per_second",
-            "scale": 0.9746516401067744,
+            "scale": 0.8716362722346417,
             "verdict": "exact-fit",
-            "pearsonR": 0.9995970132628976,
-            "residualSmape": 0.0098116172682829,
-            "detectedAt": "2026-05-06T20:38:23.778Z",
+            "pearsonR": 0.9861738674919329,
+            "residualSmape": 0.020973866937425947,
+            "detectedAt": "2026-05-15T21:11:08.271Z",
             "detectedFromWindow": "-25h → -1h",
             "source": "detect-per-resource",
-            "perResourceQualifying": 3,
-            "perResourceTested": 25
+            "perResourceQualifying": 27,
+            "perResourceTested": 62
           }
         },
         {
@@ -629,7 +629,21 @@
           "newSourceCfType": "AWS::Lambda::Function",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9430452987579317,
+            "residualSmape": 0,
+            "detectedAt": "2026-05-15T21:15:37.268Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 8,
+            "perResourceTested": 23
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.lambda.duration",
@@ -643,7 +657,21 @@
           "newSourceCfType": "AWS::Lambda::Function",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "avg",
+            "newAggregation": "avg",
+            "newAggregationMode": "raw",
+            "scale": 1,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9999928105656697,
+            "residualSmape": 0.0004502621854939137,
+            "detectedAt": "2026-05-15T21:15:37.268Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 11,
+            "perResourceTested": 23
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.lambda.errors",
@@ -683,7 +711,21 @@
           "newSourceCfType": "AWS::Lambda::Function",
           "category": "direct",
           "notes": "",
-          "source": "override"
+          "source": "override",
+          "detectedRecipe": {
+            "classicAggregation": "sum",
+            "newAggregation": "sum",
+            "newAggregationMode": "raw",
+            "scale": 0.991937457557707,
+            "verdict": "exact-fit",
+            "pearsonR": 0.9998090916326768,
+            "residualSmape": 0.0014700958458207646,
+            "detectedAt": "2026-05-15T21:15:37.268Z",
+            "detectedFromWindow": "-25h → -1h",
+            "source": "detect-per-resource",
+            "perResourceQualifying": 7,
+            "perResourceTested": 23
+          }
         },
         {
           "classicMetricId": "builtin:cloud.aws.lambda.provConcExecutions",

@@ -13,6 +13,18 @@ export const REFERENCE_AWS_METRICS = resolve(
   'dac-aws-to-2ndgen-metrics.json'
 );
 
+/**
+ * Fresh DAC AWS metrics mapping shipped with the dt-migration skill. This
+ * is the same shape as REFERENCE_AWS_METRICS but refreshed alongside the
+ * skill — prefer it as the primary mapping source when present.
+ */
+export const SKILL_DAC_AWS_METRICS = resolve(
+  REPO_ROOT,
+  'dt-migration',
+  'references',
+  'dac-aws-to-2ndgen-metrics.json'
+);
+
 export const REFERENCE_AZURE_METRICS = resolve(
   REPO_ROOT,
   'reference',

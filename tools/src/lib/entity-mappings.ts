@@ -10,7 +10,7 @@
  * them here. The `source` field tracks provenance so we can spot drift.
  */
 
-export type EntityMappingStatus = 'available' | 'planned' | 'unclear' | 'not-planned';
+export type EntityMappingStatus = 'available' | 'planned' | 'unclear' | 'not-planned' | 'ambiguous';
 export type EntityMappingSource = 'dt-migration' | 'discovered';
 
 export interface EntityMapping {
@@ -22,6 +22,13 @@ export interface EntityMapping {
   smartscapeNodeType: string;
   status: EntityMappingStatus;
   source: EntityMappingSource;
+  /**
+   * When a single classic type maps to multiple Smartscape types (e.g.
+   * cloud_application → 7 k8s workload kinds), `smartscapeDimension` and
+   * `smartscapeNodeType` hold the default; this lists every candidate so
+   * downstream code can warn that the user may need to pick a different one.
+   */
+  altSmartscapeNodeTypes?: string[];
   /** Free-form note. */
   notes?: string;
 }
@@ -36,8 +43,32 @@ export const AWS_ENTITY_MAPPINGS: EntityMapping[] = [
   { classicEntityType: 'auto_scaling_group',          smartscapeDimension: 'dt.smartscape.aws_autoscaling_autoscalinggroup', smartscapeNodeType: 'AWS_AUTOSCALING_AUTOSCALINGGROUP',  status: 'available', source: 'dt-migration' },
   { classicEntityType: 'aws_availability_zone',       smartscapeDimension: 'dt.smartscape.aws_availability_zone',    smartscapeNodeType: 'AWS_AVAILABILITY_ZONE',                     status: 'available', source: 'dt-migration' },
   { classicEntityType: 'aws_credentials',             smartscapeDimension: 'dt.smartscape.aws_account',              smartscapeNodeType: 'AWS_ACCOUNT',                               status: 'available', source: 'dt-migration' },
-  { classicEntityType: 'aws_lambda_function',         smartscapeDimension: 'dt.smartscape.aws.lambda_function',      smartscapeNodeType: 'AWS_LAMBDA_FUNCTION',                       status: 'available', source: 'dt-migration' },
-  { classicEntityType: 'cloud:aws:lambda',            smartscapeDimension: 'dt.smartscape.aws.lambda_function',      smartscapeNodeType: 'AWS_LAMBDA_FUNCTION',                       status: 'available', source: 'dt-migration', notes: 'alias of aws_lambda_function' },
+  { classicEntityType: 'aws_lambda_function',         smartscapeDimension: 'dt.smartscape.aws_lambda_function',      smartscapeNodeType: 'AWS_LAMBDA_FUNCTION',                       status: 'available', source: 'dt-migration', notes: 'Verified on tenant 2026-05-12: actual dim uses underscore, not dot (dt-migration/references/type-mappings.md had the dotted form as a typo).' },
+  { classicEntityType: 'cloud:aws:lambda',            smartscapeDimension: 'dt.smartscape.aws_lambda_function',      smartscapeNodeType: 'AWS_LAMBDA_FUNCTION',                       status: 'available', source: 'dt-migration', notes: 'alias of aws_lambda_function' },
+  // Kubernetes / cloud-application family — all from dt-migration type-mappings.md
+  { classicEntityType: 'cloud_application',           smartscapeDimension: 'dt.smartscape.k8s_deployment',           smartscapeNodeType: 'K8S_DEPLOYMENT',                            status: 'ambiguous', source: 'dt-migration',
+    altSmartscapeNodeTypes: ['K8S_DAEMONSET', 'K8S_STATEFULSET', 'K8S_REPLICASET', 'K8S_REPLICATIONCONTROLLER', 'K8S_JOB', 'K8S_DEPLOYMENTCONFIG'],
+    notes: 'cloud_application maps to one of K8S_DEPLOYMENT/DAEMONSET/STATEFULSET/REPLICASET/REPLICATIONCONTROLLER/JOB/DEPLOYMENTCONFIG. Defaulting to K8S_DEPLOYMENT — verify against the workload kind.' },
+  { classicEntityType: 'cloud_application_instance',  smartscapeDimension: 'dt.smartscape.k8s_pod',                  smartscapeNodeType: 'K8S_POD',                                   status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'cloud_application_namespace', smartscapeDimension: 'dt.smartscape.k8s_namespace',            smartscapeNodeType: 'K8S_NAMESPACE',                             status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'container_group_instance',    smartscapeDimension: 'dt.smartscape.container',                smartscapeNodeType: 'CONTAINER',                                 status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'custom_application',          smartscapeDimension: 'dt.smartscape.frontend',                 smartscapeNodeType: 'FRONTEND',                                  status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'kubernetes_cluster',          smartscapeDimension: 'dt.smartscape.k8s_cluster',              smartscapeNodeType: 'K8S_CLUSTER',                               status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'kubernetes_node',             smartscapeDimension: 'dt.smartscape.k8s_node',                 smartscapeNodeType: 'K8S_NODE',                                  status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'kubernetes_service',          smartscapeDimension: 'dt.smartscape.k8s_service',              smartscapeNodeType: 'K8S_SERVICE',                               status: 'available', source: 'dt-migration' },
+  // Azure (commonly co-appear with AWS in multi-cloud dashboards)
+  { classicEntityType: 'azure_region',                smartscapeDimension: 'dt.smartscape.azure_microsoft_resources_locations',         smartscapeNodeType: 'AZURE_MICROSOFT_RESOURCES_LOCATIONS',         status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'azure_subscription',          smartscapeDimension: 'dt.smartscape.azure_microsoft_resources_subscriptions',     smartscapeNodeType: 'AZURE_MICROSOFT_RESOURCES_SUBSCRIPTIONS',     status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'azure_vm',                    smartscapeDimension: 'dt.smartscape.azure_microsoft_compute_virtualmachines',     smartscapeNodeType: 'AZURE_MICROSOFT_COMPUTE_VIRTUALMACHINES',     status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'azure_vm_scale_set',          smartscapeDimension: 'dt.smartscape.azure_microsoft_compute_virtualmachinescalesets', smartscapeNodeType: 'AZURE_MICROSOFT_COMPUTE_VIRTUALMACHINESCALESETS', status: 'available', source: 'dt-migration' },
+  // Synthetic + checks (planned)
+  { classicEntityType: 'http_check',                  smartscapeDimension: 'dt.smartscape.http_check',               smartscapeNodeType: 'HTTP_CHECK',                                status: 'planned',   source: 'dt-migration' },
+  { classicEntityType: 'http_check_step',             smartscapeDimension: 'dt.smartscape.http_check_step',          smartscapeNodeType: 'HTTP_CHECK_STEP',                           status: 'planned',   source: 'dt-migration' },
+  { classicEntityType: 'os:service',                  smartscapeDimension: 'dt.smartscape.os_service',               smartscapeNodeType: 'OS_SERVICE',                                status: 'planned',   source: 'dt-migration' },
+  { classicEntityType: 'service_instance',            smartscapeDimension: 'dt.smartscape.service_deployment',       smartscapeNodeType: 'SERVICE_DEPLOYMENT',                        status: 'planned',   source: 'dt-migration' },
+  { classicEntityType: 'synthetic_location',          smartscapeDimension: 'dt.smartscape.synthetic_location',       smartscapeNodeType: 'SYNTHETIC_LOCATION',                        status: 'planned',   source: 'dt-migration' },
+  { classicEntityType: 'synthetic_test',              smartscapeDimension: 'dt.smartscape.synthetic_test',           smartscapeNodeType: 'SYNTHETIC_TEST',                            status: 'planned',   source: 'dt-migration' },
+  { classicEntityType: 'synthetic_test_step',         smartscapeDimension: 'dt.smartscape.synthetic_test_step',      smartscapeNodeType: 'SYNTHETIC_TEST_STEP',                       status: 'planned',   source: 'dt-migration' },
   { classicEntityType: 'disk',                        smartscapeDimension: 'dt.smartscape.disk',                     smartscapeNodeType: 'DISK',                                      status: 'available', source: 'dt-migration' },
   { classicEntityType: 'ebs_volume',                  smartscapeDimension: 'dt.smartscape.aws_ec2_volume',           smartscapeNodeType: 'AWS_EC2_VOLUME',                            status: 'available', source: 'dt-migration' },
   { classicEntityType: 'ec2_instance',                smartscapeDimension: 'dt.smartscape.aws_ec2_instance',         smartscapeNodeType: 'AWS_EC2_INSTANCE',                          status: 'available', source: 'dt-migration' },
@@ -60,6 +91,24 @@ export const AWS_ENTITY_MAPPINGS: EntityMapping[] = [
   { classicEntityType: 'aws_application_load_balancer',   smartscapeDimension: 'dt.smartscape.aws_elasticloadbalancingv2_loadbalancer', smartscapeNodeType: 'AWS_ELASTICLOADBALANCINGV2_LOADBALANCER',     status: 'available', source: 'discovered' },
   { classicEntityType: 'aws_network_load_balancer',       smartscapeDimension: 'dt.smartscape.aws_elasticloadbalancingv2_loadbalancer', smartscapeNodeType: 'AWS_ELASTICLOADBALANCINGV2_LOADBALANCER',     status: 'available', source: 'discovered', notes: 'Both ALB and NLB map to the v2 load balancer node type.' },
   { classicEntityType: 'cloud:aws:applicationelb',        smartscapeDimension: 'dt.smartscape.aws_elasticloadbalancingv2_loadbalancer', smartscapeNodeType: 'AWS_ELASTICLOADBALANCINGV2_LOADBALANCER',     status: 'available', source: 'discovered', notes: 'alias of aws_application_load_balancer' },
+
+  // From dt-migration/references/entity-type-mapping.md §1 (May 2026 refresh).
+  // Classic ELB has no new-connection equivalent.
+  { classicEntityType: 'elastic_load_balancer',           smartscapeDimension: '',                                                       smartscapeNodeType: '',                                            status: 'not-planned', source: 'dt-migration', notes: 'Classic ELB is not in the new connection. Re-architect onto AWS_ELASTICLOADBALANCINGV2_LOADBALANCER (ALB/NLB) before migrating.' },
+  // Custom-device cloud:aws:* sub-types — same Smartscape targets as
+  // CUSTOM_DEVICE_AWS_TYPE_MAP in dql-rewriter.ts. Listed here so the generic
+  // dim-swap and relationship-bracket passes recognize bare references like
+  // `dt.entity.cloud:aws:s3` outside of a fetch+filter shape.
+  { classicEntityType: 'cloud:aws:s3',                    smartscapeDimension: 'dt.smartscape.aws_s3_bucket',                            smartscapeNodeType: 'AWS_S3_BUCKET',                               status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'cloud:aws:aurora',                smartscapeDimension: 'dt.smartscape.aws_rds_dbcluster',                        smartscapeNodeType: 'AWS_RDS_DBCLUSTER',                           status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'cloud:aws:elasticachecustom',     smartscapeDimension: 'dt.smartscape.aws_elasticache_cachecluster',             smartscapeNodeType: 'AWS_ELASTICACHE_CACHECLUSTER',                status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'cloud:aws:sqs',                   smartscapeDimension: 'dt.smartscape.aws_sqs_queue',                            smartscapeNodeType: 'AWS_SQS_QUEUE',                               status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'cloud:aws:sns',                   smartscapeDimension: 'dt.smartscape.aws_sns_topic',                            smartscapeNodeType: 'AWS_SNS_TOPIC',                               status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'cloud:aws:cloud_front',           smartscapeDimension: 'dt.smartscape.aws_cloudfront_distribution',              smartscapeNodeType: 'AWS_CLOUDFRONT_DISTRIBUTION',                 status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'cloud:aws:nat_gateway',           smartscapeDimension: 'dt.smartscape.aws_ec2_natgateway',                       smartscapeNodeType: 'AWS_EC2_NATGATEWAY',                          status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'cloud:aws:eks:cluster',           smartscapeDimension: 'dt.smartscape.aws_eks_cluster',                          smartscapeNodeType: 'AWS_EKS_CLUSTER',                             status: 'available', source: 'dt-migration' },
+  { classicEntityType: 'cloud:aws:dynamodb',              smartscapeDimension: 'dt.smartscape.aws_dynamodb_table',                       smartscapeNodeType: 'AWS_DYNAMODB_TABLE',                          status: 'available', source: 'dt-migration', notes: 'alias of dynamo_db_table' },
+  { classicEntityType: 'cloud:aws:redshift',              smartscapeDimension: 'dt.smartscape.aws_redshift_cluster',                     smartscapeNodeType: 'AWS_REDSHIFT_CLUSTER',                        status: 'available', source: 'dt-migration' },
 ];
 
 const BY_CLASSIC_TYPE = new Map(
