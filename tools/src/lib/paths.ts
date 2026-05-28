@@ -25,6 +25,33 @@ export const SKILL_DAC_AWS_METRICS = resolve(
   'dac-aws-to-2ndgen-metrics.json'
 );
 
+/**
+ * ~117 hand-curated AWS metric abbreviations from the dt-migration skill
+ * (`cloud.aws.alb.bytes`, `cloud.aws.aurora.*_by_role`, `cloud.aws.eccustom.*`,
+ * etc.). Dynatrace shorthands that don't algorithmically derive from
+ * CloudWatch; the DAC normalization chain will never resolve them.
+ */
+export const SKILL_MANUAL_AWS_METRICS = resolve(
+  REPO_ROOT,
+  'dt-migration',
+  'references',
+  'manual-metric-mappings.json'
+);
+
+/**
+ * ~5,709 pre-resolved AWS metric mappings shipped with the dt-migration skill —
+ * output of the skill team's own normalization chain (selector-strip,
+ * dt.cloud→builtin:cloud, dimension-suffix strip, service-segment scan).
+ * Catches keys our local DAC normalization misses, especially lowercased
+ * ext: keys and Cassandra-shape `builtin:aws.X` shapes.
+ */
+export const SKILL_PER_KEY_AWS_METRICS = resolve(
+  REPO_ROOT,
+  'dt-migration',
+  'references',
+  'per-key-mappings.json'
+);
+
 export const REFERENCE_AZURE_METRICS = resolve(
   REPO_ROOT,
   'reference',

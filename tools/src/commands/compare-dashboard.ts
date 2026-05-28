@@ -25,7 +25,12 @@ import { basename, join, resolve } from 'node:path';
 
 import { DqlClient, DqlError, type DqlResult } from '../dynatrace/dql.ts';
 import { rewriteDql } from '../lib/dql-rewriter.ts';
-import { REPO_ROOT, SKILL_DAC_AWS_METRICS } from '../lib/paths.ts';
+import {
+  REPO_ROOT,
+  SKILL_DAC_AWS_METRICS,
+  SKILL_MANUAL_AWS_METRICS,
+  SKILL_PER_KEY_AWS_METRICS,
+} from '../lib/paths.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 
 export interface CompareDashboardArgs {
@@ -300,7 +305,11 @@ function renderRow(row: ComparisonRow): string {
 export async function runCompareDashboard(args: CompareDashboardArgs): Promise<void> {
   const mappingPath =
     args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
-  const index = await loadRecipeIndex(mappingPath, { dacPath: SKILL_DAC_AWS_METRICS });
+  const index = await loadRecipeIndex(mappingPath, {
+    dacPath: SKILL_DAC_AWS_METRICS,
+    manualPath: SKILL_MANUAL_AWS_METRICS,
+    perKeyPath: SKILL_PER_KEY_AWS_METRICS,
+  });
 
   const inputPath = resolve(args.input);
   const wrapper = JSON.parse(await readFile(inputPath, 'utf8')) as {

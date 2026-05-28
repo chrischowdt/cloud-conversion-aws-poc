@@ -12,6 +12,12 @@
 import { readFile } from 'node:fs/promises';
 
 import { loadDacIndex, lookupInDac, type DacIndex } from './dac-lookup.ts';
+import {
+  loadExtraMappings,
+  lookupInExtra,
+  serviceFromNewKey,
+  type ExtraMappingsIndex,
+} from './extra-mappings.ts';
 import { builtinToDqlClassic } from './schema-transforms.ts';
 
 export type Aggregation = 'avg' | 'sum' | 'max' | 'min' | 'count';
@@ -77,16 +83,26 @@ export interface RecipeIndex {
    */
   byDqlClassicKey: Map<string, MappingEntry>;
   /**
+   * Supplemental mappings from the dt-migration skill: a ~117-entry
+   * hand-curated abbreviation map (`manual-metric-mappings.json`) and a
+   * ~5,709-entry pre-resolved per-key map (`per-key-mappings.json`). Loaded
+   * as the second-tier fallback after the recipe table — covers abbreviated
+   * shapes like `cloud.aws.alb.bytes` and lowercased ext: keys the DAC
+   * normalization chain can't reconstruct.
+   */
+  extra?: ExtraMappingsIndex;
+  /**
    * Authoritative DAC mapping (~4,168 entries) from the dt-migration skill,
-   * loaded as a fallback for keys our recipe mapping doesn't cover. Optional
-   * — older callers can omit it and the rewriter still works.
+   * loaded as a third-tier fallback for keys neither our recipe table nor
+   * the extra mappings cover. Optional — older callers can omit it and the
+   * rewriter still works.
    */
   dac?: DacIndex;
 }
 
 export async function loadRecipeIndex(
   path: string,
-  options: { dacPath?: string } = {}
+  options: { dacPath?: string; manualPath?: string; perKeyPath?: string } = {}
 ): Promise<RecipeIndex> {
   const file = JSON.parse(await readFile(path, 'utf8')) as MergedMappingFile;
   const byClassicId = new Map<string, MappingEntry>();
@@ -100,6 +116,12 @@ export async function loadRecipeIndex(
     }
   }
   const result: RecipeIndex = { byClassicId, byDqlClassicKey };
+  if (options.manualPath || options.perKeyPath) {
+    result.extra = await loadExtraMappings({
+      manualPath: options.manualPath,
+      perKeyPath: options.perKeyPath,
+    });
+  }
   if (options.dacPath) {
     result.dac = await loadDacIndex(options.dacPath);
   }
@@ -117,10 +139,15 @@ export type LookupResult =
  *   - v2-API:  builtin:cloud.aws.X.camelCase
  *   - DQL:     dt.cloud.aws.X.snake_case
  *
- * Falls back to the DAC mapping (4,168 entries) when our recipe mapping
- * misses. DAC fallback returns a synthetic `mapped-no-recipe` entry — the
- * new key swap happens, but no aggregation/scale recipe is applied (so the
- * user keeps their original aggregation; the rewriter warns about the gap).
+ * Three-tier lookup chain:
+ *   1. Recipe table — our enriched mapping with verified aggregations.
+ *   2. Extra mappings — manual abbreviations (`cloud.aws.alb.bytes` etc.) +
+ *      the skill's pre-resolved per-key index (catches lowercased ext: keys
+ *      and Cassandra-shape keys our DAC normalization chain misses).
+ *   3. DAC mapping (4,168 entries) — last resort, broadest coverage.
+ *
+ * Tiers 2 and 3 return synthetic `mapped-no-recipe` entries (no aggregation/
+ * scale recipe, user's original aggregation preserved, warning surfaced).
  */
 export function lookupClassicKey(index: RecipeIndex, classicMetricId: string): LookupResult {
   let entry = index.byClassicId.get(classicMetricId);
@@ -133,7 +160,26 @@ export function lookupClassicKey(index: RecipeIndex, classicMetricId: string): L
     return { kind: 'mapped-no-recipe', entry };
   }
 
-  // Recipe miss — try DAC.
+  // Tier 2 — extra mappings (manual + per-key).
+  if (index.extra) {
+    const extra = lookupInExtra(index.extra, classicMetricId);
+    if (extra) {
+      const synthetic: MappingEntry = {
+        service: serviceFromNewKey(extra.newKey),
+        classicMetricId,
+        newDtMetricKey: extra.newKey,
+        notes:
+          `Resolved via ${extra.source === 'manual' ? 'manual-metric-mappings' : 'per-key-mappings'} ` +
+          `(${extra.availability}). ` +
+          (extra.availability === 'autodiscovered'
+            ? `New connection must be configured with "recommended + custom" and this metric added explicitly.`
+            : 'In the recommended set — no extra configuration needed.'),
+      };
+      return { kind: 'mapped-no-recipe', entry: synthetic };
+    }
+  }
+
+  // Tier 3 — DAC fallback.
   if (index.dac) {
     const dac = lookupInDac(index.dac, classicMetricId);
     if (dac) {

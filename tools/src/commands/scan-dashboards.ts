@@ -26,7 +26,13 @@ import { createWriteStream } from 'node:fs';
 import { join } from 'node:path';
 
 import { rewriteDql, type Transform, type Warning } from '../lib/dql-rewriter.ts';
-import { OUT_DIR, REPO_ROOT, SKILL_DAC_AWS_METRICS } from '../lib/paths.ts';
+import {
+  OUT_DIR,
+  REPO_ROOT,
+  SKILL_DAC_AWS_METRICS,
+  SKILL_MANUAL_AWS_METRICS,
+  SKILL_PER_KEY_AWS_METRICS,
+} from '../lib/paths.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 
 export interface ScanDashboardsArgs {
@@ -182,7 +188,11 @@ export async function runScanDashboards(args: ScanDashboardsArgs): Promise<void>
   const mappingPath =
     args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
 
-  const index = await loadRecipeIndex(mappingPath, { dacPath: SKILL_DAC_AWS_METRICS });
+  const index = await loadRecipeIndex(mappingPath, {
+    dacPath: SKILL_DAC_AWS_METRICS,
+    manualPath: SKILL_MANUAL_AWS_METRICS,
+    perKeyPath: SKILL_PER_KEY_AWS_METRICS,
+  });
   const files = (await readdir(inputDir)).filter((f) => f.endsWith('.json'));
   console.log(`Scanning ${files.length} dashboards in ${inputDir}`);
 

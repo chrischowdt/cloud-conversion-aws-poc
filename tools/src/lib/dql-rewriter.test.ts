@@ -634,6 +634,77 @@ describe('rewriteDql — DAC fallback for keys missing from recipe mapping', () 
   });
 });
 
+describe('rewriteDql — extra-mappings (manual + per-key) fallback', () => {
+  it('resolves an abbreviated manual mapping (cloud.aws.alb.bytes) and applies the metric-key swap', () => {
+    const baseIdx = buildIndex([]);
+    const manualEntry = {
+      classicKey: 'cloud.aws.alb.bytes',
+      newKey: 'cloud.aws.applicationelb.ProcessedBytes.By.LoadBalancer',
+      availability: 'autodiscovered' as const,
+      source: 'manual' as const,
+    };
+    const idx = {
+      ...baseIdx,
+      extra: {
+        byKey: new Map([['cloud.aws.alb.bytes', manualEntry]]),
+        byLowerKey: new Map([['cloud.aws.alb.bytes', manualEntry]]),
+      },
+    };
+    const r = rewriteDql('timeseries avg(cloud.aws.alb.bytes)', idx);
+    assert.match(r.rewritten, /cloud\.aws\.applicationelb\.ProcessedBytes\.By\.LoadBalancer/);
+    const note = r.warnings.find((w) => w.kind === 'mapped-no-recipe');
+    assert.ok(note);
+    assert.match(note!.text, /manual-metric-mappings/);
+  });
+
+  it('resolves a per-key lookup with case-insensitive match (CamelCase v2 key vs lowercased per-key store)', () => {
+    const baseIdx = buildIndex([]);
+    const perKeyEntry = {
+      classicKey: 'ext:cloud.aws.lambda.invocationssum',
+      newKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+      availability: 'recommended' as const,
+      source: 'per-key' as const,
+    };
+    const idx = {
+      ...baseIdx,
+      extra: {
+        // Only the lowercased index has the key — exact-match miss simulates
+        // a dashboard that preserved CamelCase from the v2 API era.
+        byKey: new Map(),
+        byLowerKey: new Map([['ext:cloud.aws.lambda.invocationssum', perKeyEntry]]),
+      },
+    };
+    const r = rewriteDql('timeseries sum(ext:cloud.aws.lambda.InvocationsSum)', idx);
+    assert.match(r.rewritten, /cloud\.aws\.lambda\.Invocations\.By\.FunctionName/);
+    const note = r.warnings.find((w) => w.kind === 'mapped-no-recipe');
+    assert.ok(note);
+    assert.match(note!.text, /per-key-mappings/);
+  });
+
+  it('prefers the recipe table over extra-mappings when both have the key', () => {
+    const idx = buildIndex([cpuEntry]);
+    // Add an extra-mapping entry for the same key — recipe should still win.
+    const extra = {
+      byKey: new Map([
+        [
+          'builtin:cloud.aws.ec2.cpu.usage',
+          {
+            classicKey: 'builtin:cloud.aws.ec2.cpu.usage',
+            newKey: 'cloud.aws.SHOULD_NOT_USE_THIS.By.Whatever',
+            availability: 'recommended' as const,
+            source: 'manual' as const,
+          },
+        ],
+      ]),
+      byLowerKey: new Map(),
+    };
+    const r = rewriteDql('timeseries avg(builtin:cloud.aws.ec2.cpu.usage)', { ...idx, extra });
+    // Recipe target wins; extra-mapping ignored.
+    assert.match(r.rewritten, /cloud\.aws\.ec2\.CPUUtilization\.By\.InstanceId/);
+    assert.doesNotMatch(r.rewritten, /SHOULD_NOT_USE_THIS/);
+  });
+});
+
 describe('rewriteDql — EOL service warnings', () => {
   it('emits an end-of-life-service warning when the metric maps to a retiring service', () => {
     const idx = buildIndex([]);

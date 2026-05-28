@@ -17,7 +17,12 @@ import { basename, dirname, join, resolve } from 'node:path';
 
 import { rewriteDql, type Transform, type Warning } from '../lib/dql-rewriter.ts';
 import { classicEntityToSmartscape } from '../lib/entity-mappings.ts';
-import { REPO_ROOT, SKILL_DAC_AWS_METRICS } from '../lib/paths.ts';
+import {
+  REPO_ROOT,
+  SKILL_DAC_AWS_METRICS,
+  SKILL_MANUAL_AWS_METRICS,
+  SKILL_PER_KEY_AWS_METRICS,
+} from '../lib/paths.ts';
 import { loadRecipeIndex, lookupClassicKey, type RecipeIndex } from '../lib/recipe-lookup.ts';
 
 export interface RewriteDashboardArgs {
@@ -274,7 +279,11 @@ export async function runRewriteDashboard(args: RewriteDashboardArgs): Promise<{
 }> {
   const mappingPath =
     args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
-  const index = await loadRecipeIndex(mappingPath, { dacPath: SKILL_DAC_AWS_METRICS });
+  const index = await loadRecipeIndex(mappingPath, {
+    dacPath: SKILL_DAC_AWS_METRICS,
+    manualPath: SKILL_MANUAL_AWS_METRICS,
+    perKeyPath: SKILL_PER_KEY_AWS_METRICS,
+  });
 
   const inputPath = resolve(args.input);
   const raw = await readFile(inputPath, 'utf8');
