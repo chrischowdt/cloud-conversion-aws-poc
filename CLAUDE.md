@@ -34,7 +34,7 @@ npm run typecheck
 
 # 2. For everything with a --flag arg, invoke node directly:
 node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings=ExperimentalWarning \
-  tools/src/cli.ts rewrite-dashboard --in tools/out/dashboards/new/<id>__<name>.json
+  tools/src/cli.ts rewrite-dashboard --in tools/out/<env-id>/dashboards/new/<id>__<name>.json
 ```
 
 If you use `npm run cli -- subcommand --flag value`, npm will warn about unknown CLI config and strip `--flag`. **Always invoke `node ... src/cli.ts <subcommand>` directly when passing args.** `cct --help` lists subcommands.
@@ -43,7 +43,7 @@ If you use `npm run cli -- subcommand --flag value`, npm will warn about unknown
 
 - `DT_BASE_URL` must be `https://<env-id>.apps.dynatrace.com` — the Grail Storage Query API (`/platform/storage/query/v1/...`) is NOT served from `live.dynatrace.com`.
 - `DT_TOKEN` is a Platform Token; minimum scopes per command are documented in each command's source.
-- Outputs always land in `tools/out/`.
+- **Outputs are namespaced by tenant.** Every tenant-touching command writes under `tools/out/<env-id>/`, where `<env-id>` is derived from `DT_BASE_URL` (`https://nic55601.apps…` → `tools/out/nic55601/`). Tenant-independent artifacts (`build-mapping`) go to `tools/out/shared/`. Override the namespace with `--env <label>` or the whole path with `--out-dir <path>`. This is what lets a second tenant be analyzed without clobbering the first. `envIdFromBaseUrl` / `tenantOutDir` in `tools/src/lib/paths.ts` own the derivation; offline commands that consume tenant data (`scan-dashboards`) resolve the env from `--env`/`--base-url`/`DT_BASE_URL`.
 
 ## Architecture
 

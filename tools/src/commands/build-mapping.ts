@@ -11,11 +11,11 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
-  OUT_DIR,
   PYTHON_AWS_MAPPING,
   REFERENCE_AWS_METRICS,
   REFERENCE_AZURE_METRICS,
   REFERENCE_EOL_SERVICES,
+  SHARED_OUT_DIR,
 } from '../lib/paths.ts';
 import type {
   CloudProvider,
@@ -136,7 +136,7 @@ export interface BuildMappingArgs {
 
 export async function runBuildMapping(args: BuildMappingArgs = {}): Promise<void> {
   const provider = args.provider ?? 'all';
-  const outDir = args.outDir ?? OUT_DIR;
+  const outDir = args.outDir ?? SHARED_OUT_DIR;
   await mkdir(outDir, { recursive: true });
 
   const generated = new Date().toISOString().slice(0, 10);

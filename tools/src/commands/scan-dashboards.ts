@@ -23,7 +23,7 @@
 
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { rewriteDql, type Transform, type Warning } from '../lib/dql-rewriter.ts';
 import {
@@ -181,10 +181,13 @@ function anyQueryIsAws(queries: QueryRef[]): boolean {
 }
 
 export async function runScanDashboards(args: ScanDashboardsArgs): Promise<void> {
-  const outDir = args.outDir ?? OUT_DIR;
-  const scanDir = join(outDir, 'dashboard-scan');
+  // Base = the tenant output dir. When only --input-dir was given, derive the
+  // tenant root as its grandparent (…/<env>/dashboards/new → …/<env>).
+  const base =
+    args.outDir ?? (args.inputDir ? resolve(args.inputDir, '..', '..') : OUT_DIR);
+  const scanDir = join(base, 'dashboard-scan');
   await mkdir(scanDir, { recursive: true });
-  const inputDir = args.inputDir ?? join(OUT_DIR, 'dashboards', 'new');
+  const inputDir = args.inputDir ?? join(base, 'dashboards', 'new');
   const mappingPath =
     args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
 

@@ -27,6 +27,7 @@ import { runDiscoverFields } from './commands/discover-fields.ts';
 import { runRewriteDashboard } from './commands/rewrite-dashboard.ts';
 import { runRewriteDql } from './commands/rewrite-dql.ts';
 import { runScanDashboards } from './commands/scan-dashboards.ts';
+import { SHARED_OUT_DIR, tenantOutDir } from './lib/paths.ts';
 import type { CloudProvider } from './lib/types.ts';
 
 interface Args {
@@ -99,6 +100,35 @@ function requireBaseAndToken(flags: Map<string, string | boolean>): {
   return { baseUrl, token };
 }
 
+/**
+ * Tenant-scoped output dir for an API-touching command. Honors `--out-dir`
+ * (verbatim) and `--env` (label), otherwise derives `tools/out/<env-id>` from
+ * the tenant URL. Two tenants can never write to the same directory.
+ */
+function tenantOut(flags: Map<string, string | boolean>, baseUrl: string): string {
+  const dir = tenantOutDir({
+    baseUrl,
+    env: getString(flags, 'env'),
+    override: getString(flags, 'out-dir'),
+  });
+  return dir;
+}
+
+/**
+ * Output dir for an offline command that consumes tenant-scoped data (e.g.
+ * `scan-dashboards` reads downloaded dashboards) but does NOT call the API.
+ * Resolves the env from `--out-dir`, `--env`, `--base-url`, or DT_BASE_URL —
+ * returns `undefined` when none is available so the caller can error with a
+ * helpful message instead of silently writing to the wrong place.
+ */
+function offlineTenantOut(flags: Map<string, string | boolean>): string | undefined {
+  const override = getString(flags, 'out-dir');
+  const env = getString(flags, 'env');
+  const baseUrl = getString(flags, 'base-url') ?? process.env.DT_BASE_URL;
+  if (!override && !env && !baseUrl) return undefined;
+  return tenantOutDir({ baseUrl, env, override });
+}
+
 const HELP = `cct — cloud-conversion tooling
 
 USAGE
@@ -149,7 +179,16 @@ CREDENTIALS
 GLOBAL FLAGS
   --base-url        Tenant URL (overrides DT_BASE_URL)
   --token           Platform Token (overrides DT_TOKEN)
-  --out-dir <path>  Where to write JSON outputs (default: tools/out)
+  --env <label>     Output namespace (default: env-id derived from the tenant
+                    URL, e.g. https://nic55601.apps… → tools/out/nic55601).
+                    Tenant-touching commands write under tools/out/<env>/ so
+                    two tenants never overwrite each other's analysis.
+  --out-dir <path>  Explicit output dir; overrides the per-tenant default.
+
+OUTPUT LAYOUT
+  tools/out/<env-id>/   per-tenant: dashboards/, dashboard-scan/,
+                        dashboard-compare/, discover_*, detect_*, dql_*…
+  tools/out/shared/     tenant-independent: build-mapping unified outputs.
 
 build-mapping
   --provider AWS|Azure|all   default: all
@@ -225,12 +264,13 @@ async function main(): Promise<void> {
     return;
   }
 
-  const outDir = getString(args.flags, 'out-dir');
+  const outDirOverride = getString(args.flags, 'out-dir');
 
   switch (cmd) {
     case 'build-mapping': {
       const provider = (getString(args.flags, 'provider') as CloudProvider | 'all' | undefined) ?? 'all';
-      await runBuildMapping({ provider, outDir });
+      // Tenant-independent — reads DAC reference files, not a live tenant.
+      await runBuildMapping({ provider, outDir: outDirOverride ?? SHARED_OUT_DIR });
       return;
     }
     case 'discover': {
@@ -240,7 +280,7 @@ async function main(): Promise<void> {
         token,
         from: getString(args.flags, 'from'),
         to: getString(args.flags, 'to'),
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
       });
       return;
     }
@@ -263,7 +303,7 @@ async function main(): Promise<void> {
         interval: getString(args.flags, 'interval'),
         skipMissing: args.flags.get('skip-missing') === true,
         skipBothMissing: args.flags.get('no-skip-both-missing') !== true,
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
       });
       return;
     }
@@ -280,20 +320,21 @@ async function main(): Promise<void> {
         interval: getString(args.flags, 'interval'),
         minR: getNumber(args.flags, 'min-r'),
         filter: getString(args.flags, 'filter'),
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
       });
       return;
     }
     case 'detect-per-resource': {
       const { baseUrl, token } = requireBaseAndToken(args.flags);
-      // --accounts <id,id,...>  OR  --accounts auto  (load tools/out/parallel-accounts.json)
+      const outDir = tenantOut(args.flags, baseUrl);
+      // --accounts <id,id,...>  OR  --accounts auto  (load parallel-accounts.json
+      // from this tenant's output dir)
       const accountsFlag = getString(args.flags, 'accounts');
       let accountIds: string[] | undefined;
       if (accountsFlag === 'auto') {
-        const { OUT_DIR: outDirConst } = await import('./lib/paths.ts');
         const { readFile } = await import('node:fs/promises');
         const { join } = await import('node:path');
-        const parallelPath = join(outDirConst, 'parallel-accounts.json');
+        const parallelPath = join(outDir, 'parallel-accounts.json');
         try {
           const raw = JSON.parse(await readFile(parallelPath, 'utf8'));
           accountIds = (raw.parallel ?? []).map((p: { awsAccountId: string }) => p.awsAccountId);
@@ -332,7 +373,7 @@ async function main(): Promise<void> {
         minSeries: getNumber(args.flags, 'min-series'),
         maxRatio: getNumber(args.flags, 'max-ratio'),
         maxClusters: getNumber(args.flags, 'max-clusters'),
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
       });
       return;
     }
@@ -344,20 +385,31 @@ async function main(): Promise<void> {
         limit: getNumber(args.flags, 'limit'),
         skipNew: args.flags.get('skip-new') === true,
         skipClassic: args.flags.get('skip-classic') === true,
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
       });
       return;
     }
     case 'rewrite-dql': {
+      // Offline single-query rewrite — not tenant-specific. Lands in shared/
+      // unless --out-dir overrides.
       await runRewriteDql({
         query: getString(args.flags, 'query'),
         file: getString(args.flags, 'file'),
         mappingPath: getString(args.flags, 'mapping'),
-        outDir,
+        outDir: outDirOverride ?? SHARED_OUT_DIR,
       });
       return;
     }
     case 'scan-dashboards': {
+      // Offline, but consumes a tenant's downloaded dashboards. Resolve the
+      // env from --out-dir / --env / --base-url / DT_BASE_URL.
+      const outDir = offlineTenantOut(args.flags);
+      if (!outDir && !getString(args.flags, 'input-dir')) {
+        throw new Error(
+          'scan-dashboards: cannot tell which tenant to scan. Pass --env <id>, ' +
+            '--base-url <url>, set DT_BASE_URL, or pass --input-dir <dir> explicitly.'
+        );
+      }
       await runScanDashboards({
         inputDir: getString(args.flags, 'input-dir'),
         mappingPath: getString(args.flags, 'mapping'),
@@ -370,10 +422,11 @@ async function main(): Promise<void> {
     case 'rewrite-dashboard': {
       const input = getString(args.flags, 'in') ?? getString(args.flags, 'input');
       if (!input) throw new Error('rewrite-dashboard: pass --in <dashboard.json>.');
+      // Writes next to the input dashboard by default; --out-dir overrides.
       await runRewriteDashboard({
         input,
         mappingPath: getString(args.flags, 'mapping'),
-        outDir,
+        outDir: outDirOverride,
       });
       return;
     }
@@ -382,7 +435,7 @@ async function main(): Promise<void> {
       await runDiscoverFields({
         baseUrl,
         token,
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
         filter: getString(args.flags, 'filter'),
       });
       return;
@@ -422,7 +475,7 @@ async function main(): Promise<void> {
         token,
         input,
         mappingPath: getString(args.flags, 'mapping'),
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
         from: getString(args.flags, 'from'),
         to: getString(args.flags, 'to'),
         limit: getNumber(args.flags, 'limit'),
@@ -452,7 +505,7 @@ async function main(): Promise<void> {
         from: getString(args.flags, 'from'),
         to: getString(args.flags, 'to'),
         preview: getNumber(args.flags, 'preview'),
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
       });
       return;
     }

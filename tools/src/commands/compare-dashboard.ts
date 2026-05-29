@@ -368,7 +368,10 @@ export async function runCompareDashboard(args: CompareDashboardArgs): Promise<v
   }, {});
 
   const baseName = basename(inputPath, '.json').replace(/\.rewritten$/, '');
-  const outDir = args.outDir ?? join(REPO_ROOT, 'tools', 'out', 'dashboard-compare');
+  // args.outDir is the tenant root (tools/out/<env>); nest reports under it.
+  const outDir = args.outDir
+    ? join(args.outDir, 'dashboard-compare')
+    : join(REPO_ROOT, 'tools', 'out', 'dashboard-compare');
   await mkdir(outDir, { recursive: true });
   const outPath = join(outDir, `${baseName}.compare.md`);
 
