@@ -53,6 +53,7 @@ Multi-pass regex pipeline that translates a classic DQL string into its Smartsca
 
 | # | Pass | Source |
 |---|---|---|
+| 0 | **Pre-pass bailout**: if the query contains a `lookup [fetch dt.entity.<not-planned>]` chain (e.g. `custom_device`), return the query verbatim with one warning — partial translation produces invalid DQL (`device.references[…]` doesn't exist). | inline (`findNotPlannedLookupSource`) |
 | 1 | Metric-key swap + recipe application (`agg(classic) → agg(new)`) | `recipe-lookup.ts` |
 | 1.4 | Warn on orphan backtick column refs (`\`agg(classic)\``) | inline |
 | 1.5 | `in(<dim>, classicEntitySelector("..."))` → translated filter | `classic-selector-parser.ts` + `classic-selector-translator.ts` |
@@ -70,12 +71,19 @@ Each pass writes to `transforms[]` (what changed) and `warnings[]` (what the use
 
 ### Lookup chain (`tools/src/lib/recipe-lookup.ts`)
 
-`lookupClassicKey(index, key)` consults sources in order, returning the first hit:
+`lookupClassicKey(index, key)` consults sources in order, returning the first hit. Three tiers, each broader and less precise than the last:
 
-1. **Recipe index** — our enriched `mappings/aws_mapping.with_recipes.json`. Carries `detectedRecipe` (verified aggregation + scale) and `compositeFormula`.
-2. **DAC index** — the authoritative `dt-migration/references/dac-aws-to-2ndgen-metrics.json` (~4,168 entries). Used as fallback when our recipe is missing. Returns a synthetic `mapped-no-recipe` entry — metric-key swap only, no scaling, with `availability: recommended | autodiscovered`.
+1. **Recipe index** — our enriched `mappings/aws_mapping.with_recipes.json`. Carries `detectedRecipe` (verified aggregation + scale) and `compositeFormula`. The only tier that applies a *verified* aggregation/scale.
+2. **Extra-mappings** (`extra-mappings.ts`) — two dt-migration files loaded together:
+   - `manual-metric-mappings.json` (~117) — hand-curated abbreviations that don't algorithmically derive from CloudWatch (`cloud.aws.alb.bytes`, `cloud.aws.aurora.*_by_role`, `cloud.aws.eccustom.*`, `cloud.aws.rds.free`). The DAC will never resolve these.
+   - `per-key-mappings.json` (~5,709) — the skill team's own pre-resolved normalization output. `lookupInExtra` tries exact-match then a lowercased fallback (per-key keys are fully lowercased; dashboards often preserve CamelCase from the v2 API). Manual wins when both have a key.
+3. **DAC index** (`dac-lookup.ts`) — the authoritative `dt-migration/references/dac-aws-to-2ndgen-metrics.json` (~4,168 entries). Last resort, broadest coverage.
 
-The DAC index (`dac-lookup.ts`) is built with **four indexes** keyed by every classic-key shape a dashboard might use: `builtin:cloud.aws.*`, `ext:cloud.aws.*`, the derived `dt.cloud.aws.*` form, and the camelCase→snake_case-derived bare `cloud.aws.<svc>.<snake>` form. New-form keys (with `.By.<PascalCase>` suffix) are rejected here.
+Tiers 2 and 3 return synthetic `mapped-no-recipe` entries — metric-key swap only, user's aggregation preserved, `availability: recommended | autodiscovered`, with a note saying which file resolved it.
+
+The DAC index is built with **four indexes** keyed by every classic-key shape a dashboard might use: `builtin:cloud.aws.*`, `ext:cloud.aws.*`, the derived `dt.cloud.aws.*` form, and the camelCase→snake_case-derived bare `cloud.aws.<svc>.<snake>` form. New-form keys (with `.By.<PascalCase>` suffix) are rejected here.
+
+**Known gap (next iteration):** many tail unknown-metric keys (`kafka.*`, `containerinsights.*`, `ecs.*_by_service_name`) exist in `per-key-mappings.json` under a heavier-normalized shape (prepend `ext:`, lowercase, strip underscores + aggregation infixes) that the current exact+lowercase lookup misses. The skill's `dt-migration/scripts/migration-lookup.ts` implements the full multi-attempt normalization chain — porting it is the highest-leverage way to convert more metric keys.
 
 ### Lookup tables (the data the rewriter depends on)
 
