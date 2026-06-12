@@ -58,7 +58,7 @@ Multi-pass regex pipeline that translates a classic DQL string into its Smartsca
 | 1 | Metric-key swap + recipe application (`agg(classic) → agg(new)`) | `recipe-lookup.ts` |
 | 1.4 | Realign backtick-quoted column refs to the swapped key (`` `agg(classic)` `` → `` `agg(new)` ``) so the renderer doesn't raise `FIELD_DOES_NOT_EXIST`; warn on refs that can't be matched | inline |
 | 1.5 | `in(<dim>, classicEntitySelector("..."))` → translated filter | `classic-selector-parser.ts` + `classic-selector-translator.ts` |
-| 1.55 | `fetch dt.entity.custom_device \| filter entity.type == "cloud:aws:X"` → `smartscapeNodes <TYPE>` | inline (CUSTOM_DEVICE_AWS_TYPE_MAP) |
+| 1.55 | Disambiguate `dt.entity.custom_device` → real node type via the query's **metric service** (`cloud.aws.<svc>.…`) or an `entity.type == "cloud:aws:X"` filter: `fetch` → `smartscapeNodes <TYPE>`, bare refs (e.g. `by:{dt.entity.custom_device}`) → `dt.smartscape.<type>`. Warns only on multi-node grain (rds/docdb/neptune) or a leftover credential traversal. | `aws-service-node-types.ts` (baked from `discover-entity-types`) |
 | 1.6 | `fetch dt.entity.X` → `smartscapeNodes <TYPE>` | `entity-mappings.ts` |
 | 1.7 | `<edge>[dt.entity.X]` → `references[<edge>.<x>]`, with edge validation | `smartscape-edges.ts` |
 | 2 | `dt.entity.X` → `dt.smartscape.X` (in any context) | `entity-mappings.ts` |
@@ -94,6 +94,7 @@ The DAC index is built with **four indexes** keyed by every classic-key shape a 
 | File | What it indexes | Source of truth |
 |---|---|---|
 | `entity-mappings.ts` | classic entity type → Smartscape node type + dim | `dt-migration/references/entity-type-mapping.md` |
+| `aws-service-node-types.ts` | AWS metric-service (`cloud.aws.<svc>`) → Smartscape node type, for custom_device disambiguation | empirical: `discover-entity-types` reads `dt.smartscape_source.type` (the entities JSON's `dacResourceType` has wrong granularity) |
 | `entity-field-mappings.ts` | per-node-type field renames (`awsAccountId`, `rdsEngine`, …) | empirical tenant probing |
 | `metric-dim-carriers.ts` | which Smartscape types carry their dim on metric series | empirical tenant probing |
 | `smartscape-edges.ts` | valid `<edge>` names per (source, target) Smartscape pair | `dt-migration/references/relationship-mappings.md` |

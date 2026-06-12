@@ -322,17 +322,16 @@ describe('rewriteDql — fetch restructure (Situation 3)', () => {
     assert.doesNotMatch(r.rewritten, /entity\.type\s*==\s*"cloud:aws:lambda"/);
   });
 
-  it('flags custom_device fetch when entity.type has no Smartscape replacement', () => {
+  it('flags custom_device fetch when the entity.type service has no node type', () => {
     const idx = buildIndex([]);
+    // cloud:aws:athena is genuinely not in the bridge (no live metrics / not planned).
     const r = rewriteDql(
-      'fetch dt.entity.custom_device | filter entity.type == "cloud:aws:efs"',
+      'fetch dt.entity.custom_device | filter entity.type == "cloud:aws:athena"',
       idx
     );
-    // No Smartscape node for EFS yet — leave alone with a targeted warning.
+    // Unresolvable → left for the downstream not-planned warning.
     assert.match(r.rewritten, /custom_device/);
-    assert.ok(
-      r.warnings.some((w) => /cloud:aws:efs/.test(w.text) && /no known Smartscape/i.test(w.text))
-    );
+    assert.ok(r.warnings.some((w) => w.kind === 'unmapped-entity-type'));
   });
 
   it('flags ambiguous cloud_application mapping with alternatives listed', () => {
@@ -626,14 +625,14 @@ describe('rewriteDql — credential-lookup-chain (Pass 0.5)', () => {
 
   it('leaves the chain (bails) when the metric service has no node-type mapping', () => {
     const idx = buildIndex([]);
-    // cloud.aws.kafka.* has no entry in CUSTOM_DEVICE_AWS_TYPE_MAP.
-    const kafka = canonical
-      .replace(/dynamodb/g, 'kafka')
-      .replace(/successful_request_latency_by_operation/g, 'estimated_time_lag');
-    const r = rewriteDql(kafka, idx);
+    // cloud.aws.athena.* is genuinely not in the bridge (no live metrics / not planned).
+    const athena = canonical
+      .replace(/dynamodb/g, 'athena')
+      .replace(/successful_request_latency_by_operation/g, 'query_execution_time');
+    const r = rewriteDql(athena, idx);
     // Not converted → still has the classic custom_device lookup → bails.
     assert.match(r.rewritten, /lookup \[fetch dt\.entity\.custom_device/);
-    assert.ok(r.warnings.some((w) => /no Smartscape node type is mapped for `cloud:aws:kafka`/.test(w.text)));
+    assert.ok(r.warnings.some((w) => /no Smartscape node type is mapped for it/.test(w.text)));
   });
 
   it('does not touch queries without the credential-lookup idiom', () => {
@@ -869,6 +868,51 @@ describe('rewriteDql — additional custom_device sub-types', () => {
     assert.ok(
       r.warnings.some((w) => /no Smartscape replacement/i.test(w.text) || /not in the new connection/i.test(w.text))
     );
+  });
+
+  it('disambiguates by:{dt.entity.custom_device} via the metric service (no entity.type filter)', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries avg(cloud.aws.lambda.invocations_sum), by:{dt.entity.custom_device}',
+      idx
+    );
+    // entity wall cleared: custom_device → the typed Smartscape dim
+    assert.match(r.rewritten, /by:\{dt\.smartscape\.aws_lambda_function\}/);
+    assert.doesNotMatch(r.rewritten, /dt\.entity\.custom_device/);
+    assert.ok(!r.warnings.some((w) => w.kind === 'unmapped-entity-type'));
+    // single-node, high-confidence → no verify-me warning, so the panel can go clean
+    assert.ok(!r.warnings.some((w) => w.kind === 'custom-device-disambiguated'));
+    assert.ok(r.transforms.some((t) => /custom_device disambiguated/.test(t.detail ?? '')));
+  });
+
+  it('warns and defaults to the populated grain for a multi-node service (rds)', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries avg(cloud.aws.rds.cpu_utilization), by:{dt.entity.custom_device}',
+      idx
+    );
+    assert.match(r.rewritten, /dt\.smartscape\.aws_rds_dbinstance/);
+    const w = r.warnings.find((x) => x.kind === 'custom-device-disambiguated');
+    assert.ok(w && /multiple node types/.test(w.text));
+  });
+
+  it('flags the remaining credential/account traversal after disambiguating', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries avg(cloud.aws.lambda.invocations_sum), by:{dt.entity.custom_device}\n' +
+        '| fieldsAdd cred = entityAttr(dt.entity.custom_device, "accessible_by")[dt.entity.aws_credentials][0]',
+      idx
+    );
+    assert.match(r.rewritten, /dt\.smartscape\.aws_lambda_function/);
+    const w = r.warnings.find((x) => x.kind === 'custom-device-disambiguated');
+    assert.ok(w && /credential\/account relationship/.test(w.text));
+  });
+
+  it('leaves custom_device untouched (not-planned) when the service is unresolvable', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('fetch dt.entity.custom_device | fields id, entity.name', idx);
+    assert.match(r.rewritten, /dt\.entity\.custom_device/);
+    assert.ok(r.warnings.some((w) => w.kind === 'unmapped-entity-type'));
   });
 });
 

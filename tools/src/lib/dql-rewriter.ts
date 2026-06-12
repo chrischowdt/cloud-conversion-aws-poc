@@ -15,6 +15,13 @@
  * edge cases the output flags a warning rather than producing wrong DQL.
  */
 
+import {
+  MULTI_NODE_SERVICES,
+  isMultiNodeService,
+  nodeTypeForCustomDeviceType,
+  nodeTypeForMetricService,
+  smartscapeDimForNodeType,
+} from './aws-service-node-types.ts';
 import { parseSelector } from './classic-selector-parser.ts';
 import { translateSelector } from './classic-selector-translator.ts';
 import { lookupInDac } from './dac-lookup.ts';
@@ -51,6 +58,7 @@ export interface Warning {
     | 'recipe-aggregation-mismatch'
     | 'verdict-not-exact'
     | 'dim-variant-override'
+    | 'custom-device-disambiguated'
     | 'end-of-life-service';
   text: string;
   /** Pointer to the relevant dt-migration reference (if any). */
@@ -466,13 +474,16 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // already-renamed form (`dt.smartscape.X`).
   rewritten = rewriteClassicSelectorIns(rewritten, transforms, warnings);
 
-  // Pass 1.55: `fetch dt.entity.custom_device | filter entity.type == "cloud:aws:X"`
-  // → `smartscapeNodes <TYPE>`. Custom_device is "not planned" in Smartscape,
-  // but in practice classic AWS dashboards use it as a generic wrapper around
-  // services like Lambda, DynamoDB, etc. that DO have Smartscape replacements.
-  // Match the fetch + entity.type filter pair before the general fetch pass.
+  // Pass 1.55: disambiguate classic `dt.entity.custom_device` to a real
+  // Smartscape node type. Custom_device is "not planned" in Smartscape, but in
+  // practice classic AWS dashboards use it as a generic wrapper around services
+  // (Lambda, DynamoDB, ECS, …) that DO have node types. The query's metric key
+  // (`cloud.aws.<service>.…`) — or an explicit `entity.type == "cloud:aws:X"`
+  // filter — names the service, which the empirical bridge
+  // (aws-service-node-types.ts) maps to the node type. `fetch` becomes
+  // `smartscapeNodes <TYPE>`; bare references become `dt.smartscape.<type>`.
   const fetchContext: FetchContext = { sourceSmartscapeType: null, didRewriteFetch: false };
-  rewritten = rewriteCustomDeviceFetch(rewritten, transforms, warnings, fetchContext);
+  rewritten = rewriteCustomDeviceViaService(rewritten, transforms, warnings, fetchContext);
 
   // Pass 1.6: `fetch dt.entity.X` → `smartscapeNodes <TYPE>`. Must come
   // before the relationship-bracket pass so we know the source type for
@@ -849,36 +860,10 @@ interface FetchContext {
 
 const FETCH_ENTITY_PATTERN = /\bfetch\s+`?dt\.entity\.([\w:]+)`?/g;
 
-/**
- * Custom_device entity.type values observed in real dashboards, mapped to the
- * Smartscape node type that replaces them in the new model. Types missing here
- * still have classic-only data; the rewriter emits a more targeted warning
- * instead of a generic "not-planned" one.
- *
- * Sources: dt-migration/references/type-mappings.md (lambda, ec2_instance,
- * ebs_volume, etc.), reference/docs/dac-aws-to-2ndgen-entities.json (for the
- * cloud:aws:* keys), plus entries discovered on the tenant.
- */
-const CUSTOM_DEVICE_AWS_TYPE_MAP: Record<string, string> = {
-  // Originally surfaced via the dac-aws-to-2ndgen-entities.json mapping.
-  'cloud:aws:autoscaling': 'AWS_AUTOSCALING_AUTOSCALINGGROUP',
-  'cloud:aws:dynamodb': 'AWS_DYNAMODB_TABLE',
-  'cloud:aws:ec2': 'AWS_EC2_INSTANCE',
-  'cloud:aws:ebs': 'AWS_EC2_VOLUME',
-  'cloud:aws:lambda': 'AWS_LAMBDA_FUNCTION',
-  'cloud:aws:rds': 'AWS_RDS_DBINSTANCE',
-  'cloud:aws:applicationelb': 'AWS_ELASTICLOADBALANCINGV2_LOADBALANCER',
-  // Added from dt-migration/references/entity-type-mapping.md §1 custom-device table.
-  'cloud:aws:s3': 'AWS_S3_BUCKET',
-  'cloud:aws:aurora': 'AWS_RDS_DBCLUSTER',
-  'cloud:aws:elasticachecustom': 'AWS_ELASTICACHE_CACHECLUSTER',
-  'cloud:aws:sqs': 'AWS_SQS_QUEUE',
-  'cloud:aws:sns': 'AWS_SNS_TOPIC',
-  'cloud:aws:cloud_front': 'AWS_CLOUDFRONT_DISTRIBUTION',
-  'cloud:aws:nat_gateway': 'AWS_EC2_NATGATEWAY',
-  'cloud:aws:eks:cluster': 'AWS_EKS_CLUSTER',
-  'cloud:aws:redshift': 'AWS_REDSHIFT_CLUSTER',
-};
+// The classic custom_device entity.type → Smartscape node-type map now lives in
+// `aws-service-node-types.ts` (SERVICE_NODE_TYPE_MAP + CUSTOM_DEVICE_TYPE_ALIASES),
+// derived empirically by `discover-entity-types`. Resolve via
+// nodeTypeForMetricService / nodeTypeForCustomDeviceType.
 
 // ─── Pass 0.5: credential-lookup-chain → smartscapeNodes ──────────────────
 //
@@ -939,7 +924,7 @@ function rewriteCredentialLookupChain(
   // Disambiguate custom_device via the metric's service segment.
   const service = serviceFromClassicKeyInQuery(input);
   if (!service) return input;
-  const nodeType = CUSTOM_DEVICE_AWS_TYPE_MAP[`cloud:aws:${service}`];
+  const nodeType = nodeTypeForMetricService(service);
   if (!nodeType) {
     // Recognized the idiom but can't resolve the service to a node type —
     // leave it for the bailout, but leave a breadcrumb for table expansion.
@@ -947,13 +932,13 @@ function rewriteCredentialLookupChain(
       kind: 'entity-relationship-traversal',
       text:
         `Recognized a custom_device credential-lookup chain for service "${service}", but no ` +
-        `Smartscape node type is mapped for \`cloud:aws:${service}\` in CUSTOM_DEVICE_AWS_TYPE_MAP. ` +
-        `Add it there to auto-convert this shape.`,
+        `Smartscape node type is mapped for it in SERVICE_NODE_TYPE_MAP (aws-service-node-types.ts). ` +
+        `Run \`cct discover-entity-types\` and add it to auto-convert this shape.`,
       reference: SKILL_REFS.specialCases,
     });
     return input;
   }
-  const dim = `dt.smartscape.${nodeType.toLowerCase()}`;
+  const dim = smartscapeDimForNodeType(nodeType);
 
   // 1. Replace the two-lookup credential block with the Smartscape form.
   CREDENTIAL_LOOKUP_CHAIN_RE.lastIndex = 0;
@@ -993,46 +978,101 @@ function rewriteCredentialLookupChain(
   return out;
 }
 
-/**
- * Match `fetch dt.entity.custom_device\s*|\s*filter\s+entity.type == "cloud:aws:X"`
- * — common shape in classic AWS dashboards that wrap services through the
- * custom_device generic entity. If X has a Smartscape mapping, collapse the
- * two clauses into `smartscapeNodes <TYPE>`. If not, emit a targeted warning
- * (more useful than the bare "not-planned" the general fetch pass produces).
- */
+// `fetch dt.entity.custom_device | filter entity.type == "cloud:aws:X"` — the
+// adjacent fetch+filter pair. Collapsed to `smartscapeNodes <TYPE>` (the filter
+// is redundant once the node type is fixed).
 const CUSTOM_DEVICE_FETCH_FILTER_RE =
   /\bfetch\s+`?dt\.entity\.custom_device`?\s*(?:\r?\n)?\s*\|\s*filter\s+`?entity\.type`?\s*==\s*"([^"]+)"/g;
+const BARE_FETCH_CUSTOM_DEVICE_RE = /\bfetch\s+`?dt\.entity\.custom_device`?/g;
+const CUSTOM_DEVICE_REF_RE = /`?dt\.entity\.custom_device`?/g;
+const CUSTOM_DEVICE_ENTITY_TYPE_RE = /\bentity\.type\b\s*==\s*"(cloud:aws:[a-z0-9_:]+)"/;
 
-function rewriteCustomDeviceFetch(
+/**
+ * Pass 1.55 — disambiguate `dt.entity.custom_device` to a real Smartscape node
+ * type. Custom_device is "not planned" in Smartscape and would otherwise bail,
+ * but classic AWS dashboards use it as a generic wrapper around services that
+ * DO have node types. The service is named by the query's metric key
+ * (`cloud.aws.<service>.…`) or an explicit `entity.type == "cloud:aws:X"`
+ * filter; the empirical bridge (aws-service-node-types.ts) maps it to the node
+ * type. `fetch` → `smartscapeNodes <TYPE>`; bare references → `dt.smartscape.<type>`.
+ *
+ * Leaves the query untouched when the service can't be resolved (so the
+ * downstream not-planned warning still fires). Warns ONLY when the result needs
+ * human review — a multi-node grain default (rds/docdb/neptune) or a remaining
+ * classic credential/account traversal — so high-confidence conversions (e.g. a
+ * Lambda `by:{dt.entity.custom_device}`) can reach clean.
+ */
+function rewriteCustomDeviceViaService(
   input: string,
   transforms: Transform[],
   warnings: Warning[],
   ctx: FetchContext
 ): string {
-  return input.replace(CUSTOM_DEVICE_FETCH_FILTER_RE, (full, entityType: string) => {
-    const smartscapeType = CUSTOM_DEVICE_AWS_TYPE_MAP[entityType];
-    if (!smartscapeType) {
-      warnings.push({
-        kind: 'unmapped-entity-type',
-        text:
-          `fetch dt.entity.custom_device | filter entity.type == "${entityType}" — ` +
-          `this AWS service has no known Smartscape node type (still classic-only). ` +
-          `Use the matching cloud.aws.* metric directly or wait for the entity to be migrated.`,
-        reference: SKILL_REFS.typeMappings,
-        match: full,
-      });
-      return full;
+  if (!/\bdt\.entity\.custom_device\b/.test(input)) return input;
+
+  // Resolve the node type: an explicit entity.type filter wins (most specific),
+  // else the service segment of the query's metric key.
+  let nodeType: string | undefined;
+  let service: string | undefined;
+  let how = '';
+  const typeFilter = CUSTOM_DEVICE_ENTITY_TYPE_RE.exec(input);
+  if (typeFilter) {
+    const resolved = nodeTypeForCustomDeviceType(typeFilter[1]!);
+    if (resolved) {
+      nodeType = resolved;
+      how = `entity.type "${typeFilter[1]}"`;
+      service = /^cloud:aws:([a-z0-9_]+)/.exec(typeFilter[1]!)?.[1];
     }
-    ctx.sourceSmartscapeType = smartscapeType;
-    ctx.didRewriteFetch = true;
-    transforms.push({
-      kind: 'entity-dim',
-      before: full,
-      after: `smartscapeNodes ${smartscapeType}`,
-      detail: `custom_device entity.type "${entityType}" → ${smartscapeType}`,
-    });
-    return `smartscapeNodes ${smartscapeType}`;
+  }
+  if (!nodeType) {
+    const svc = serviceFromClassicKeyInQuery(input);
+    const resolved = svc ? nodeTypeForMetricService(svc) : undefined;
+    if (svc && resolved) {
+      nodeType = resolved;
+      service = svc;
+      how = `metric service "${svc}"`;
+    }
+  }
+  if (!nodeType) return input; // unresolved → downstream emits the not-planned warning
+
+  const dim = smartscapeDimForNodeType(nodeType);
+  CUSTOM_DEVICE_FETCH_FILTER_RE.lastIndex = 0;
+  let out = input.replace(CUSTOM_DEVICE_FETCH_FILTER_RE, () => `smartscapeNodes ${nodeType}`);
+  out = out.replace(BARE_FETCH_CUSTOM_DEVICE_RE, () => `smartscapeNodes ${nodeType}`);
+  out = out.replace(CUSTOM_DEVICE_REF_RE, (m) => (m.startsWith('`') ? '`' + dim + '`' : dim));
+  if (out === input) return input;
+
+  ctx.sourceSmartscapeType = nodeType;
+  if (/\bsmartscapeNodes\b/.test(out) && !/\bsmartscapeNodes\b/.test(input)) ctx.didRewriteFetch = true;
+  transforms.push({
+    kind: 'entity-dim',
+    before: 'dt.entity.custom_device',
+    after: dim,
+    detail: `custom_device disambiguated via ${how} → ${nodeType}`,
   });
+
+  const caveats: string[] = [];
+  if (service && isMultiNodeService(service)) {
+    caveats.push(
+      `${service} emits metrics under multiple node types ` +
+        `(${MULTI_NODE_SERVICES[service]!.join(', ')}); defaulted to ${nodeType} ` +
+        `(most-populated grain) — confirm it's the intended one`
+    );
+  }
+  if (/accessible_by|aws_credentials/.test(out)) {
+    caveats.push(
+      `the query still traverses the classic credential/account relationship ` +
+        `(accessible_by / aws_credentials); the Smartscape account join differs — review separately`
+    );
+  }
+  if (caveats.length > 0) {
+    warnings.push({
+      kind: 'custom-device-disambiguated',
+      text: `Classic dt.entity.custom_device disambiguated to ${nodeType} via ${how}. ` + caveats.join('; ') + '.',
+      match: 'dt.entity.custom_device',
+    });
+  }
+  return out;
 }
 
 function rewriteFetchEntity(

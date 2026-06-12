@@ -73,6 +73,25 @@ now **169 passing**, typecheck clean.
   collected* metrics). Corpus impact at default threshold: **13 keys / 55 tile
   warnings** (the ≥2 guard correctly dropped 6 single-series swaps incl. the
   183-ref Step Functions family). See CLAUDE.md "Dim-variant validation."
+- **Lever #1: custom_device disambiguation** (this session). `discover-entity-types`
+  derives the AWS-service → Smartscape node-type bridge from each metric's
+  `dt.smartscape_source.type` (`entity-source-types.json`, 40 services), baked into
+  `aws-service-node-types.ts`. Pass 1.55 now disambiguates `dt.entity.custom_device`
+  to the real node type via the query's **metric key** (or `entity.type` filter):
+  `fetch` → `smartscapeNodes <TYPE>`, `by:{dt.entity.custom_device}` →
+  `by:{dt.smartscape.<type>}`. **Result: the entity wall fell 51.2% → 22.0% of
+  panels (−3,377), but clean only moved 20.8% → 21.0%** — those panels are
+  multiply-blocked (also `mapped-no-recipe` and/or a credential/account traversal).
+  Lever #1 is structural groundwork that **unblocks Lever #2**: 961 panels are now
+  blocked *solely* by `mapped-no-recipe` (verifying recipes → ~29.3%), and the
+  combined soft-ceiling is ~51.3%. The remaining ~2,543 wall panels are
+  non-bridge exotics (athena, appsync, …) or have no metric key.
+
+**Newly-surfaced third lever:** ~2,457 disambiguated panels use the classic
+credential/account traversal `entityAttr(custom_device, "accessible_by")[aws_credentials]`
+(the fieldsAdd form, distinct from the Pass 0.5 lookup-chain). That account-name
+resolution is flagged (`custom-device-disambiguated`) but not yet auto-converted —
+it's the gating co-blocker alongside Lever #2 for the heavily-replicated dashboards.
 
 **Open follow-up surfaced this session:** the DAC's `.By.<Dim>` pick isn't
 data-validated in general — dim-validation repairs it per-tenant at lookup time,
