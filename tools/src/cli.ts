@@ -24,6 +24,8 @@ import { runEquivalence } from './commands/equivalence.ts';
 import { runMergeRecipes } from './commands/merge-recipes.ts';
 import { runCompareDashboard } from './commands/compare-dashboard.ts';
 import { runDiscoverFields } from './commands/discover-fields.ts';
+import { runDiscoverMetrics } from './commands/discover-metrics.ts';
+import { runDiscoverTags } from './commands/discover-tags.ts';
 import { runRewriteDashboard } from './commands/rewrite-dashboard.ts';
 import { runRewriteDql } from './commands/rewrite-dql.ts';
 import { runScanDashboards } from './commands/scan-dashboards.ts';
@@ -137,6 +139,16 @@ USAGE
 COMMANDS
   build-mapping     Transform reference DAC metric JSON into unified mappings.
   discover          Enumerate cloud metric keys on a tenant via DQL.
+  discover-tags     Find which AWS tags the new connection enriches onto
+                    metrics (writes enriched-tags.json). Enriched tags become
+                    cheap aws.tags.<key> dim filters; others need a
+                    smartscapeNodes lookup. Flags: --from, --da-source,
+                    --sample-size.
+  discover-metrics  Inventory live new-connection metric keys + series counts
+                    (writes live-metrics.json). The rewriter uses it to repair
+                    empty .By.<Dim> variants: if a DAC-mapped key has no data
+                    but a sibling dim does, it prefers the populated one.
+                    Flags: --from, --da-source.
   equivalence       Test whether classic↔new metric pairs return same data.
   detect            Per pair, search aggregations + scale to find the
                     recipe that reproduces classic from new.
@@ -416,6 +428,8 @@ async function main(): Promise<void> {
         outDir,
         limit: getNumber(args.flags, 'limit'),
         all: args.flags.get('all') === true,
+        liveMetricsPath: getString(args.flags, 'live-metrics'),
+        minOverrideSeries: getNumber(args.flags, 'min-override-series'),
       });
       return;
     }
@@ -427,6 +441,8 @@ async function main(): Promise<void> {
         input,
         mappingPath: getString(args.flags, 'mapping'),
         outDir: outDirOverride,
+        liveMetricsPath: getString(args.flags, 'live-metrics'),
+        minOverrideSeries: getNumber(args.flags, 'min-override-series'),
       });
       return;
     }
@@ -437,6 +453,29 @@ async function main(): Promise<void> {
         token,
         outDir: tenantOut(args.flags, baseUrl),
         filter: getString(args.flags, 'filter'),
+      });
+      return;
+    }
+    case 'discover-tags': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDiscoverTags({
+        baseUrl,
+        token,
+        outDir: tenantOut(args.flags, baseUrl),
+        from: getString(args.flags, 'from'),
+        daSource: getString(args.flags, 'da-source'),
+        sampleSize: getNumber(args.flags, 'sample-size'),
+      });
+      return;
+    }
+    case 'discover-metrics': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDiscoverMetrics({
+        baseUrl,
+        token,
+        outDir: tenantOut(args.flags, baseUrl),
+        from: getString(args.flags, 'from'),
+        daSource: getString(args.flags, 'da-source'),
       });
       return;
     }
@@ -481,6 +520,8 @@ async function main(): Promise<void> {
         limit: getNumber(args.flags, 'limit'),
         includeVariables: args.flags.get('no-variables') !== true,
         injectedVars: injectedVars.size > 0 ? injectedVars : undefined,
+        liveMetricsPath: getString(args.flags, 'live-metrics'),
+        minOverrideSeries: getNumber(args.flags, 'min-override-series'),
       });
       return;
     }

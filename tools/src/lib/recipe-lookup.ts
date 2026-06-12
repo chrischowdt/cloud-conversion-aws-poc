@@ -14,10 +14,16 @@ import { readFile } from 'node:fs/promises';
 import { loadDacIndex, lookupInDac, type DacIndex } from './dac-lookup.ts';
 import {
   loadExtraMappings,
-  lookupInExtra,
+  lookupInExtraWithNormalization,
   serviceFromNewKey,
   type ExtraMappingsIndex,
 } from './extra-mappings.ts';
+import {
+  DEFAULT_MIN_OVERRIDE_SERIES,
+  loadLiveMetrics,
+  preferPopulatedVariant,
+  type LiveMetricsIndex,
+} from './live-metrics.ts';
 import { builtinToDqlClassic } from './schema-transforms.ts';
 
 export type Aggregation = 'avg' | 'sum' | 'max' | 'min' | 'count';
@@ -98,11 +104,37 @@ export interface RecipeIndex {
    * rewriter still works.
    */
   dac?: DacIndex;
+  /**
+   * Per-tenant inventory of live new-connection metric keys + series counts
+   * (`live-metrics.json`, from `discover-metrics`). When present, the lookup
+   * repairs the empty-dim-variant case: if a DAC/extra-resolved key has no
+   * series on this tenant but a sibling variant (same metric, different
+   * `.By.<Dim>`) does, it prefers the populated sibling.
+   *
+   * SCOPE: applied ONLY to the unverified mapped-no-recipe tier — verified
+   * recipe-tier keys carry agg/scale calibrated for a specific dim and are
+   * never second-guessed. CAVEAT: the inventory reflects only metrics
+   * currently flowing on this tenant, so an absent key may be valid-but-not-
+   * collected, not wrong; every override is surfaced as a warning to verify.
+   */
+  liveMetrics?: LiveMetricsIndex;
+  /**
+   * Minimum target-series count required before a dim-override fires (see
+   * `DEFAULT_MIN_OVERRIDE_SERIES`). Guards against swapping to a barely-
+   * populated variant when the inventory is incomplete.
+   */
+  minOverrideSeries?: number;
 }
 
 export async function loadRecipeIndex(
   path: string,
-  options: { dacPath?: string; manualPath?: string; perKeyPath?: string } = {}
+  options: {
+    dacPath?: string;
+    manualPath?: string;
+    perKeyPath?: string;
+    liveMetricsPath?: string;
+    minOverrideSeries?: number;
+  } = {}
 ): Promise<RecipeIndex> {
   const file = JSON.parse(await readFile(path, 'utf8')) as MergedMappingFile;
   const byClassicId = new Map<string, MappingEntry>();
@@ -125,14 +157,56 @@ export async function loadRecipeIndex(
   if (options.dacPath) {
     result.dac = await loadDacIndex(options.dacPath);
   }
+  if (options.liveMetricsPath) {
+    result.liveMetrics = await loadLiveMetrics(options.liveMetricsPath);
+    result.minOverrideSeries = options.minOverrideSeries ?? DEFAULT_MIN_OVERRIDE_SERIES;
+  }
   return result;
+}
+
+/**
+ * Set when the live-metric inventory repaired an empty dim variant: the DAC/
+ * extra key (`from`) had no series on this tenant, so the lookup swapped to a
+ * populated sibling (`to`, `count` series). Surfaced as a warning so the user
+ * can confirm the grain — the inventory only sees currently-collected metrics.
+ */
+export interface DimOverride {
+  from: string;
+  to: string;
+  count: number;
 }
 
 export type LookupResult =
   | { kind: 'recipe'; entry: MappingEntry; recipe: DetectedRecipe }
   | { kind: 'composite'; entry: MappingEntry; formula: CompositeFormula }
-  | { kind: 'mapped-no-recipe'; entry: MappingEntry }
+  | { kind: 'mapped-no-recipe'; entry: MappingEntry; dimOverride?: DimOverride }
   | { kind: 'unknown' };
+
+/**
+ * If the tenant's live-metric inventory is loaded and `synthetic.newDtMetricKey`
+ * has no series there, swap to the most-populated sibling variant (same metric,
+ * different `.By.<Dim>`). Mutates `synthetic` in place and returns the override
+ * record, or null when nothing changed. Conservative: only fires on positive
+ * evidence (a populated sibling), never drops or guesses.
+ */
+function applyDimOverride(index: RecipeIndex, synthetic: MappingEntry): DimOverride | undefined {
+  if (!index.liveMetrics || !synthetic.newDtMetricKey) return undefined;
+  const pref = preferPopulatedVariant(
+    index.liveMetrics,
+    synthetic.newDtMetricKey,
+    index.minOverrideSeries ?? DEFAULT_MIN_OVERRIDE_SERIES
+  );
+  if (!pref.overrode) return undefined;
+  const override: DimOverride = { from: pref.from!, to: pref.key, count: pref.count };
+  synthetic.newDtMetricKey = pref.key;
+  synthetic.notes =
+    (synthetic.notes ? synthetic.notes + ' ' : '') +
+    `DIM-VARIANT OVERRIDE: the mapped key ${override.from} has no live series on this tenant; ` +
+    `using the populated sibling ${override.to} (${override.count} series). ` +
+    `NOTE: the inventory only sees currently-collected metrics, so ${override.from} may be valid ` +
+    `but not collected here — verify the dimension grain matches intent.`;
+  return override;
+}
 
 /**
  * Look up a classic metric reference by EITHER form:
@@ -162,7 +236,7 @@ export function lookupClassicKey(index: RecipeIndex, classicMetricId: string): L
 
   // Tier 2 — extra mappings (manual + per-key).
   if (index.extra) {
-    const extra = lookupInExtra(index.extra, classicMetricId);
+    const extra = lookupInExtraWithNormalization(index.extra, classicMetricId);
     if (extra) {
       const synthetic: MappingEntry = {
         service: serviceFromNewKey(extra.newKey),
@@ -175,7 +249,8 @@ export function lookupClassicKey(index: RecipeIndex, classicMetricId: string): L
             ? `New connection must be configured with "recommended + custom" and this metric added explicitly.`
             : 'In the recommended set — no extra configuration needed.'),
       };
-      return { kind: 'mapped-no-recipe', entry: synthetic };
+      const dimOverride = applyDimOverride(index, synthetic);
+      return { kind: 'mapped-no-recipe', entry: synthetic, dimOverride };
     }
   }
 
@@ -198,7 +273,8 @@ export function lookupClassicKey(index: RecipeIndex, classicMetricId: string): L
             ? `New connection must be configured with "recommended + custom" and this metric added explicitly.`
             : 'In the recommended set — no extra configuration needed.'),
       };
-      return { kind: 'mapped-no-recipe', entry: synthetic };
+      const dimOverride = applyDimOverride(index, synthetic);
+      return { kind: 'mapped-no-recipe', entry: synthetic, dimOverride };
     }
   }
   return { kind: 'unknown' };

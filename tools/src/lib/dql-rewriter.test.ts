@@ -533,6 +533,117 @@ describe('rewriteDql — relationship-bracket subquery scope', () => {
   });
 });
 
+describe('rewriteDql — source-entity field migration (Pass 2.65)', () => {
+  it('migrates dt.source_entity.type → dt.smartscape_source.type', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries avg(x), by:{dt.source_entity.type}',
+      idx
+    );
+    assert.match(r.rewritten, /by:\{dt\.smartscape_source\.type\}/);
+    assert.doesNotMatch(r.rewritten, /dt\.source_entity\.type/);
+  });
+
+  it('migrates bare dt.source_entity → dt.smartscape_source.id', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries avg(x), by:{grp = dt.source_entity, dt.source_entity.type}',
+      idx
+    );
+    // Both forms migrate; the bare one becomes .id, the .type one becomes .type.
+    assert.match(r.rewritten, /grp = dt\.smartscape_source\.id/);
+    assert.match(r.rewritten, /dt\.smartscape_source\.type/);
+    assert.doesNotMatch(r.rewritten, /dt\.source_entity/);
+  });
+
+  it('leaves queries without source-entity fields untouched', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('timeseries avg(x), by:{aws.region}', idx);
+    assert.doesNotMatch(r.rewritten, /smartscape_source/);
+  });
+});
+
+describe('rewriteDql — credential-lookup-chain (Pass 0.5)', () => {
+  // DynamoDB latency mapping so Pass 1 swaps the metric key (mapped-no-recipe).
+  const dynamoLatencyEntry: MappingEntry = {
+    classicMetricId: 'cloud.aws.dynamodb.successful_request_latency_by_operation',
+    newDtMetricKey: 'cloud.aws.dynamodb.SuccessfulRequestLatency.By.Operation.TableName',
+  } as MappingEntry;
+  const dynamoIdx = () => buildIndex([dynamoLatencyEntry]);
+
+  // The canonical DynamoDB bailout idiom — 97 of 106 corpus panels match this.
+  const canonical =
+    'timeseries avg(cloud.aws.dynamodb.successful_request_latency_by_operation), by:{dt.entity.custom_device}\n' +
+    ' | lookup [fetch dt.entity.custom_device\n' +
+    ' | fieldsAdd dt.entity.aws_credentials = accessible_by[dt.entity.aws_credentials][0]], sourceField:dt.entity.custom_device, lookupField:id, prefix:"device."\n' +
+    ' | fieldsAdd dt.entity.aws_credentials = device.accessible_by[dt.entity.aws_credentials][0]\n' +
+    ' | lookup [fetch dt.entity.aws_credentials | fields name = entity.name, id], sourceField:dt.entity.aws_credentials, lookupField:id, prefix:"account."\n' +
+    ' | filter account.name == "DEV-CustomerTechnology"\n' +
+    ' | filter like(device.entity.name, "%bym%")\n' +
+    ' | summarize Latency = avg(arrayAvg(`avg(cloud.aws.dynamodb.successful_request_latency_by_operation)`))';
+
+  it('converts the canonical chain instead of bailing out', () => {
+    const idx = dynamoIdx();
+    const r = rewriteDql(canonical, idx);
+    // No bailout: the not-planned warning must NOT be present.
+    assert.ok(
+      !r.warnings.some((w) => /Leaving the entire query in classic form/.test(w.text)),
+      'should not bail out'
+    );
+    // Both lookups rewritten to smartscapeNodes form.
+    assert.match(r.rewritten, /lookup \[smartscapeNodes AWS_DYNAMODB_TABLE \| fields name, id, aws\.account\.id\]/);
+    assert.match(r.rewritten, /lookup \[smartscapeNodes AWS_ACCOUNT \| fields name, aws\.account\.id\]/);
+    assert.match(r.rewritten, /sourceField:device\.aws\.account\.id, lookupField:aws\.account\.id/);
+    // custom_device dim swapped everywhere (by-clause + sourceField).
+    assert.doesNotMatch(r.rewritten, /dt\.entity\.custom_device/);
+    assert.match(r.rewritten, /by:\{dt\.smartscape\.aws_dynamodb_table\}/);
+    // device.entity.name → device.name
+    assert.match(r.rewritten, /like\(device\.name, "%bym%"\)/);
+    assert.doesNotMatch(r.rewritten, /device\.entity\.name/);
+  });
+
+  it('realigns the summarize backtick column ref to the swapped metric key', () => {
+    const idx = dynamoIdx();
+    const r = rewriteDql(canonical, idx);
+    // The stale classic backtick ref must be gone; the new one present.
+    assert.doesNotMatch(
+      r.rewritten,
+      /`avg\(cloud\.aws\.dynamodb\.successful_request_latency_by_operation\)`/
+    );
+    assert.match(
+      r.rewritten,
+      /arrayAvg\(`avg\(cloud\.aws\.dynamodb\.SuccessfulRequestLatency\.By\.Operation\.TableName\)`\)/
+    );
+  });
+
+  it('emits the credential-collapse (multi-credential broadening) warning', () => {
+    const idx = dynamoIdx();
+    const r = rewriteDql(canonical, idx);
+    assert.ok(
+      r.warnings.some((w) => /multiple classic credentials/.test(w.text) && /BROADER/.test(w.text))
+    );
+  });
+
+  it('leaves the chain (bails) when the metric service has no node-type mapping', () => {
+    const idx = buildIndex([]);
+    // cloud.aws.kafka.* has no entry in CUSTOM_DEVICE_AWS_TYPE_MAP.
+    const kafka = canonical
+      .replace(/dynamodb/g, 'kafka')
+      .replace(/successful_request_latency_by_operation/g, 'estimated_time_lag');
+    const r = rewriteDql(kafka, idx);
+    // Not converted → still has the classic custom_device lookup → bails.
+    assert.match(r.rewritten, /lookup \[fetch dt\.entity\.custom_device/);
+    assert.ok(r.warnings.some((w) => /no Smartscape node type is mapped for `cloud:aws:kafka`/.test(w.text)));
+  });
+
+  it('does not touch queries without the credential-lookup idiom', () => {
+    const idx = buildIndex([]);
+    const plain = 'timeseries avg(cloud.aws.ec2.cpu_usage), by:{dt.entity.ec2_instance}';
+    const r = rewriteDql(plain, idx);
+    assert.doesNotMatch(r.rewritten, /smartscapeNodes AWS_ACCOUNT/);
+  });
+});
+
 describe('rewriteDql — by-clause non-carrier alignment', () => {
   it('warns when a non-carrier smartscape dim is used in by:{...} after a metric rewrite', () => {
     const idx = buildIndex([
@@ -762,7 +873,7 @@ describe('rewriteDql — additional custom_device sub-types', () => {
 });
 
 describe('rewriteDql — metric-key rewrite resilience', () => {
-  it('does not rewrite metric keys inside backtick-quoted column references', () => {
+  it('realigns backtick column references to the swapped timeseries output column', () => {
     const idx = buildIndex([cpuEntry]);
     const input =
       'timeseries avg(builtin:cloud.aws.ec2.cpu.usage)\n' +
@@ -770,12 +881,18 @@ describe('rewriteDql — metric-key rewrite resilience', () => {
     const r = rewriteDql(input, idx);
     // The agg-call form gets rewritten.
     assert.match(r.rewritten, /avg\(`cloud\.aws\.ec2\.CPUUtilization\.By\.InstanceId`\)/);
-    // The backtick column ref is left alone (no nested backticks).
-    assert.match(r.rewritten, /`avg\(builtin:cloud\.aws\.ec2\.cpu\.usage\)`/);
-    assert.doesNotMatch(r.rewritten, /`avg\(`/);
-    // …and a warning surfaces explaining the column-rename problem.
+    // The backtick column ref is REALIGNED to the new column name (no inner
+    // backticks → no nesting), so the query stays valid.
+    assert.match(r.rewritten, /`avg\(cloud\.aws\.ec2\.CPUUtilization\.By\.InstanceId\)`/);
+    assert.doesNotMatch(r.rewritten, /`avg\(`/); // no nested backticks
+    assert.doesNotMatch(r.rewritten, /`avg\(builtin:cloud\.aws\.ec2\.cpu\.usage\)`/); // stale ref gone
+    // The realignment is recorded as a transform; the stale-ref warning is no
+    // longer emitted because the ref was fixed in place.
     assert.ok(
-      r.warnings.some((w) => /column reference/i.test(w.text) && /timeseries/i.test(w.text))
+      r.transforms.some((t) => /realigned/.test(t.detail ?? ''))
+    );
+    assert.ok(
+      !r.warnings.some((w) => /column reference/i.test(w.text) && /will\s+return null/i.test(w.text))
     );
   });
 

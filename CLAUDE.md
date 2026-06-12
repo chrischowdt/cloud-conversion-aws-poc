@@ -53,9 +53,10 @@ Multi-pass regex pipeline that translates a classic DQL string into its Smartsca
 
 | # | Pass | Source |
 |---|---|---|
-| 0 | **Pre-pass bailout**: if the query contains a `lookup [fetch dt.entity.<not-planned>]` chain (e.g. `custom_device`), return the query verbatim with one warning — partial translation produces invalid DQL (`device.references[…]` doesn't exist). | inline (`findNotPlannedLookupSource`) |
+| 0.5 | **Credential-lookup-chain** (runs FIRST, before the bailout): rewrite the canonical `lookup [fetch dt.entity.custom_device … accessible_by[dt.entity.aws_credentials]] … lookup [fetch dt.entity.aws_credentials … account name]` idiom to `smartscapeNodes <TYPE>` + AWS_ACCOUNT lookups. The metric's service disambiguates the otherwise-ambiguous `custom_device` to a concrete node type. No-op (and the bailout fires) if the idiom or service isn't resolvable. | `rewriteCredentialLookupChain` (inline) |
+| 0 | **Pre-pass bailout**: if the query *still* contains a `lookup [fetch dt.entity.<not-planned>]` chain (e.g. `custom_device`), return the query verbatim with one warning — partial translation produces invalid DQL (`device.references[…]` doesn't exist). | inline (`findNotPlannedLookupSource`) |
 | 1 | Metric-key swap + recipe application (`agg(classic) → agg(new)`) | `recipe-lookup.ts` |
-| 1.4 | Warn on orphan backtick column refs (`\`agg(classic)\``) | inline |
+| 1.4 | Realign backtick-quoted column refs to the swapped key (`` `agg(classic)` `` → `` `agg(new)` ``) so the renderer doesn't raise `FIELD_DOES_NOT_EXIST`; warn on refs that can't be matched | inline |
 | 1.5 | `in(<dim>, classicEntitySelector("..."))` → translated filter | `classic-selector-parser.ts` + `classic-selector-translator.ts` |
 | 1.55 | `fetch dt.entity.custom_device \| filter entity.type == "cloud:aws:X"` → `smartscapeNodes <TYPE>` | inline (CUSTOM_DEVICE_AWS_TYPE_MAP) |
 | 1.6 | `fetch dt.entity.X` → `smartscapeNodes <TYPE>` | `entity-mappings.ts` |
@@ -63,6 +64,7 @@ Multi-pass regex pipeline that translates a classic DQL string into its Smartsca
 | 2 | `dt.entity.X` → `dt.smartscape.X` (in any context) | `entity-mappings.ts` |
 | 2.5 | `entityName(x)` → `getNodeName(x)`, `entityAttr(x, "f")` → `getNodeField(x, "f")` | inline |
 | 2.6 | `entity.name` → `name` (only when fetch was restructured) | inline |
+| 2.65 | Classic source-entity signal fields → Smartscape: `dt.source_entity.type` → `dt.smartscape_source.type`, bare `dt.source_entity` → `dt.smartscape_source.id` | inline |
 | 2.7 | Classic field rename within Smartscape context (`awsAccountId` → `aws.account.id`) | `entity-field-mappings.ts` |
 | 2.8 | Warn when `by:{dt.smartscape.X}` references a non-carrier dim | `metric-dim-carriers.ts` |
 | 3 | Flag `classicEntitySelector`, classic entity ID literals | inline |
@@ -80,6 +82,8 @@ Each pass writes to `transforms[]` (what changed) and `warnings[]` (what the use
 3. **DAC index** (`dac-lookup.ts`) — the authoritative `dt-migration/references/dac-aws-to-2ndgen-metrics.json` (~4,168 entries). Last resort, broadest coverage.
 
 Tiers 2 and 3 return synthetic `mapped-no-recipe` entries — metric-key swap only, user's aggregation preserved, `availability: recommended | autodiscovered`, with a note saying which file resolved it.
+
+**Dim-variant validation (`live-metrics.ts`)** — optional post-step on the synthetic tiers only. The DAC resolves a classic key to ONE new key with a specific `.By.<Dim>` suffix, but that variant may have no series on a given tenant while a sibling (same metric, different dims) does. Verified on nic55601: `cloud.aws.rds.DatabaseConnections.By.DBClusterIdentifier` (the DAC's pick for aurora) = **0 series**, `…By.DBInstanceIdentifier` = **109**. When a tenant's `live-metrics.json` (from `discover-metrics`) is loaded, `applyDimOverride` swaps an empty key to the most-populated sibling and surfaces a `dim-variant-override` warning. **Conservative by design:** scoped to `mapped-no-recipe` only (never verified recipe-tier keys, whose agg/scale is calibrated for a specific dim); only swaps on positive evidence; requires the target to clear `minOverrideSeries` (default 2 — a 1-series target is too thin to trust on an incompletely-collected tenant). The inventory only sees *currently-collected* metrics, so an absent key may be valid-but-not-collected rather than wrong — hence the always-on warning. Opt-in: nothing changes unless you've run `discover-metrics` for that tenant. Tune with `--min-override-series`.
 
 The DAC index is built with **four indexes** keyed by every classic-key shape a dashboard might use: `builtin:cloud.aws.*`, `ext:cloud.aws.*`, the derived `dt.cloud.aws.*` form, and the camelCase→snake_case-derived bare `cloud.aws.<svc>.<snake>` form. New-form keys (with `.By.<PascalCase>` suffix) are rejected here.
 
@@ -112,6 +116,8 @@ Two pipelines that share the rewriter:
 - `rewrite-dashboard` → produces three artifacts per input: `.rewritten.json` (wrapper for re-use through our tools), `.rewrite-report.md` (per-tile transforms + warnings), `.upload.json` (inner content, name suffixed `(rewritten)`, ready to drop in via Dynatrace import UI)
 - `compare-dashboard` → runs original AND rewritten queries against the tenant in parallel, classifies parity (`match` / `mismatch` / `one-side-empty` / `both-empty` / `both-error`), emits markdown side-by-side
 - `discover-fields` → probes tenant for actual smartscape field schemas (used to seed `entity-field-mappings.ts`)
+- `discover-tags` → finds which AWS tags the new connection enriches onto metrics (writes `enriched-tags.json`); enriched tags become cheap `aws.tags.<key>` dim filters, others need a `smartscapeNodes` lookup
+- `discover-metrics` → inventories live new-connection metric keys + series counts (writes `live-metrics.json`); feeds the dim-variant validation in the lookup chain
 - `rewrite-dql` → single-query interactive form
 
 ### Dashboard JSON has dual representation

@@ -90,6 +90,25 @@ npm run dql -- --file query.dql --from now-24h --to now
 
 Writes the full result to `tools/out/dql_<timestamp>.json` and prints the first 10 records.
 
+### Dashboard pipeline + discovery
+
+The user-facing migration loop and its tenant-probing helpers. See CLAUDE.md
+("CLI surface") for the authoritative, fully-flagged list — summary here:
+
+- `download-dashboards` — dump every dashboard (new + classic) as JSON.
+- `scan-dashboards` — run the rewriter over the corpus, filter to AWS, emit a coverage report (offline).
+- `rewrite-dashboard --in <file>` — produce `.rewritten.json`, `.rewrite-report.md`, and an upload-ready `.upload.json`.
+- `compare-dashboard --in <file>` — run original vs rewritten queries against the tenant and classify parity.
+- `discover-fields` / `discover-tags` / `discover-metrics` — probe the tenant for Smartscape field schemas, which AWS tags the new connection enriches (`enriched-tags.json`), and the live new-connection metric inventory (`live-metrics.json`).
+
+`discover-metrics` feeds **dim-variant validation**: when the DAC maps a classic
+key to a `.By.<Dim>` variant that has no series on the tenant, the lookup chain
+swaps in a populated sibling (default: target needs ≥2 series; tune with
+`--min-override-series`). Opt-in — nothing changes unless `live-metrics.json` exists.
+
+> Invoke commands that take `--flags` via `node … src/cli.ts <cmd> --flag value`,
+> not `npm run cli -- …` (npm strips unknown flags). See CLAUDE.md.
+
 ## Module layout
 
 ```

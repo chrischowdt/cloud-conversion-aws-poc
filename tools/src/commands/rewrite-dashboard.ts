@@ -23,12 +23,21 @@ import {
   SKILL_MANUAL_AWS_METRICS,
   SKILL_PER_KEY_AWS_METRICS,
 } from '../lib/paths.ts';
+import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { loadRecipeIndex, lookupClassicKey, type RecipeIndex } from '../lib/recipe-lookup.ts';
 
 export interface RewriteDashboardArgs {
   input: string;
   mappingPath?: string;
   outDir?: string;
+  /**
+   * Explicit `live-metrics.json` path for dim-variant validation. Defaults to
+   * `<tenant-dir>/live-metrics.json` (two levels up from `dashboards/new/`) if
+   * present (run `discover-metrics` first).
+   */
+  liveMetricsPath?: string;
+  /** Minimum target-series count before a dim-override fires (default 2). */
+  minOverrideSeries?: number;
 }
 
 const QUERY_FIELD_NAMES = new Set(['query', 'input', 'dqlQuery']);
@@ -279,13 +288,23 @@ export async function runRewriteDashboard(args: RewriteDashboardArgs): Promise<{
 }> {
   const mappingPath =
     args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
+  const inputPath = resolve(args.input);
+  // Tenant dir is two levels up from `dashboards/new/<file>.json`. Falls back
+  // to undefined (no dim-validation) for inputs outside that layout.
+  const liveMetricsPath =
+    args.liveMetricsPath ?? liveMetricsPathIfPresent(resolve(dirname(inputPath), '..', '..'));
   const index = await loadRecipeIndex(mappingPath, {
     dacPath: SKILL_DAC_AWS_METRICS,
     manualPath: SKILL_MANUAL_AWS_METRICS,
     perKeyPath: SKILL_PER_KEY_AWS_METRICS,
+    liveMetricsPath,
+    minOverrideSeries: args.minOverrideSeries,
   });
-
-  const inputPath = resolve(args.input);
+  if (liveMetricsPath) {
+    console.log(
+      `Dim-validation: using ${liveMetricsPath} (min ${index.minOverrideSeries} target series)`
+    );
+  }
   const raw = await readFile(inputPath, 'utf8');
   const wrapper = JSON.parse(raw) as {
     metadata?: { id?: string; name?: string };

@@ -101,6 +101,11 @@ export async function loadExtraMappings(opts: {
  * Look up a classic metric key. Tries exact match first, then lowercased
  * (to pick up per-key entries when the dashboard preserved CamelCase from
  * the v2 API). Returns `null` when neither file has the key.
+ *
+ * For broader coverage including selector-modifier strip, prefix translation,
+ * and dimension-suffix strip, prefer `lookupInExtraWithNormalization` —
+ * it wraps this function and applies the full normalization chain ported
+ * from `dt-migration/scripts/migration-lookup.ts`.
  */
 export function lookupInExtra(
   index: ExtraMappingsIndex,
@@ -110,6 +115,139 @@ export function lookupInExtra(
   if (exact) return exact;
   const lower = index.byLowerKey.get(classicKey.toLowerCase());
   if (lower) return lower;
+  return null;
+}
+
+// ── Normalization helpers (ported from dt-migration/scripts/migration-lookup.ts) ──
+//
+// per-key-mappings.json is a denormalized cache: it carries the *exact* shapes
+// the skill team's index produced, which means a single CloudWatch metric can
+// appear there under several variants:
+//   `builtin:cloud.aws.lambda.invocations`   (Grail builtin form — 193 entries)
+//   `ext:cloud.aws.lambda.invocationsSum`    (Cassandra-era ext: — 5,409 entries)
+//   `cloud.aws.lambda.<snakeCase>`           (bare Grail — 82 entries)
+//   `dt.cloud.aws.lambda.<dotted>`           (rare — 25 entries)
+//
+// Dashboards in the wild use whichever shape the author picked. Exact-key
+// lookup catches some; the normalization chain below converts between
+// shapes and re-queries until something hits or we run out of variants.
+//
+// Stays in sync with the skill's `lookupMetricKey` implementation:
+//   1. exact key
+//   2. strip trailing `:avg`, `:splitBy(...)`, … selector modifiers
+//   3a. `dt.cloud.<provider>.X` → `builtin:cloud.<provider>.X` (Grail prefix swap)
+//   3b. `builtin:cloud.<provider>.X` → `builtin:<provider>.X` (Cassandra fallback)
+//   4. strip `By[A-Z]…` dimension suffix and retry every variant above
+
+/**
+ * Strip a metric-selector modifier chain (`:avg`, `:splitBy(...)`, etc.).
+ * Returns the base key (everything up to the first modifier-starting colon).
+ * Honors the `builtin:`/`ext:` prefix's own colon — only modifiers AFTER the
+ * prefix are stripped.
+ */
+export function stripSelectorModifiers(key: string): string {
+  const lower = key.toLowerCase();
+  if (lower.startsWith('builtin:') || lower.startsWith('ext:')) {
+    const prefixEnd = key.indexOf(':') + 1;
+    const rest = key.slice(prefixEnd);
+    const colon = rest.indexOf(':');
+    return colon !== -1 ? key.slice(0, prefixEnd + colon) : key;
+  }
+  // Bare keys: first colon starts modifiers.
+  const colon = key.indexOf(':');
+  return colon !== -1 ? key.slice(0, colon) : key;
+}
+
+/**
+ * Normalize a Grail/Cassandra-era builtin key shape. Returns the next-form
+ * variant or null when no further normalization applies.
+ *
+ *   `builtin:cloud.<provider>.X` → `builtin:<provider>.X`   (Cassandra)
+ *   `dt.cloud.<provider>.X`      → `builtin:<provider>.X`   (older form)
+ */
+export function normalizeBuiltinKey(key: string): string | null {
+  const lower = key.toLowerCase();
+  if (lower.startsWith('builtin:cloud.')) {
+    return 'builtin:' + key.slice('builtin:cloud.'.length);
+  }
+  const m = /^dt\.cloud\.(\w+)\.(.+)$/i.exec(key);
+  if (m) return `builtin:${m[1]}.${m[2]}`;
+  return null;
+}
+
+/**
+ * Strip a `By<Capitalized>...` dimension suffix from a classic metric key.
+ *   `ext:cloud.aws.lambda.invocationsSumByResource` → `ext:cloud.aws.lambda.invocationsSum`
+ * Returns the stripped form, or null when no suffix is present.
+ */
+export function stripDimensionSuffix(key: string): string | null {
+  const m = /By[A-Z][a-zA-Z]*$/.exec(key);
+  return m ? key.slice(0, m.index) : null;
+}
+
+/**
+ * Full normalization chain. Tries the original key first, then walks through
+ * the variants above. Returns the first matching `ExtraMappingEntry` (still
+ * lowercase-tolerant via the per-key file's normalized index) or null.
+ *
+ * Matches the behavior of `lookupMetricKey` in
+ * `dt-migration/scripts/migration-lookup.ts` so dashboards covered by the
+ * skill's own lookup also resolve here.
+ */
+export function lookupInExtraWithNormalization(
+  index: ExtraMappingsIndex,
+  classicKey: string
+): ExtraMappingEntry | null {
+  // Step 1: exact + lowercase (delegate to original).
+  const direct = lookupInExtra(index, classicKey);
+  if (direct) return direct;
+
+  // Step 2: strip selector modifiers and retry.
+  const stripped = stripSelectorModifiers(classicKey);
+  const base = stripped !== classicKey ? stripped : classicKey;
+  if (stripped !== classicKey) {
+    const hit = lookupInExtra(index, stripped);
+    if (hit) return hit;
+  }
+
+  // Step 3a: dt.cloud.<provider>.* → builtin:cloud.<provider>.*
+  const grailMatch = /^dt\.cloud\.(\w+)\.(.+)$/i.exec(base);
+  if (grailMatch) {
+    const grailForm = `builtin:cloud.${grailMatch[1]}.${grailMatch[2]}`;
+    const hit = lookupInExtra(index, grailForm);
+    if (hit) return hit;
+  }
+
+  // Step 3b: Cassandra builtin fallback (older DAC entries).
+  const cassandra = normalizeBuiltinKey(base);
+  if (cassandra) {
+    const hit = lookupInExtra(index, cassandra);
+    if (hit) return hit;
+  }
+
+  // Step 4: strip By<Dim> suffix and retry the entire chain (base, grail, Cassandra).
+  const dimStripped = stripDimensionSuffix(base);
+  if (dimStripped && dimStripped !== base) {
+    let hit = lookupInExtra(index, dimStripped);
+    if (hit) return hit;
+    if (grailMatch) {
+      const grailDimStripped = stripDimensionSuffix(
+        `builtin:cloud.${grailMatch[1]}.${grailMatch[2]}`
+      );
+      if (grailDimStripped) {
+        hit = lookupInExtra(index, grailDimStripped);
+        if (hit) return hit;
+      }
+    }
+    if (cassandra) {
+      const cassDimStripped = stripDimensionSuffix(cassandra);
+      if (cassDimStripped && cassDimStripped !== cassandra) {
+        hit = lookupInExtra(index, cassDimStripped);
+        if (hit) return hit;
+      }
+    }
+  }
+
   return null;
 }
 

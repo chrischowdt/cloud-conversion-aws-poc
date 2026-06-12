@@ -100,6 +100,101 @@ describe('loadExtraMappings + lookupInExtra', () => {
   });
 });
 
+describe('normalization helpers', () => {
+  it('strips :avg/:splitBy modifiers from prefixed keys but keeps the prefix colon', async () => {
+    const { stripSelectorModifiers } = await import('./extra-mappings.ts');
+    assert.equal(
+      stripSelectorModifiers('builtin:cloud.aws.lambda.invocations:avg'),
+      'builtin:cloud.aws.lambda.invocations'
+    );
+    assert.equal(
+      stripSelectorModifiers('ext:cloud.aws.lambda.invocationsSum:splitBy("FunctionName"):avg'),
+      'ext:cloud.aws.lambda.invocationsSum'
+    );
+    assert.equal(stripSelectorModifiers('dt.cloud.aws.lambda.invocations'), 'dt.cloud.aws.lambda.invocations');
+  });
+
+  it('normalizeBuiltinKey converts dt.cloud→builtin: and builtin:cloud→builtin:', async () => {
+    const { normalizeBuiltinKey } = await import('./extra-mappings.ts');
+    assert.equal(normalizeBuiltinKey('dt.cloud.aws.lambda.invocations'), 'builtin:aws.lambda.invocations');
+    assert.equal(
+      normalizeBuiltinKey('builtin:cloud.aws.lambda.invocations'),
+      'builtin:aws.lambda.invocations'
+    );
+    assert.equal(normalizeBuiltinKey('cloud.aws.lambda.invocations'), null);
+  });
+
+  it('stripDimensionSuffix strips trailing By<Capitalized>', async () => {
+    const { stripDimensionSuffix } = await import('./extra-mappings.ts');
+    assert.equal(
+      stripDimensionSuffix('ext:cloud.aws.lambda.invocationsSumByResource'),
+      'ext:cloud.aws.lambda.invocationsSum'
+    );
+    assert.equal(
+      stripDimensionSuffix('ext:cloud.aws.lambda.invocationsSum'),
+      null
+    );
+  });
+});
+
+describe('lookupInExtraWithNormalization', () => {
+  it('matches a dt.cloud.aws.* key against a per-key builtin:cloud.aws.* entry via step 3a', async () => {
+    const { lookupInExtraWithNormalization } = await import('./extra-mappings.ts');
+    const perKeyPath = await writeFixture('per-key.json', {
+      'builtin:cloud.aws.lambda.invocations': {
+        bestDacKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+        availability: 'recommended',
+      },
+    });
+    const idx = await loadExtraMappings({ perKeyPath });
+    // Direct match — control.
+    assert.ok(lookupInExtraWithNormalization(idx, 'builtin:cloud.aws.lambda.invocations'));
+    // The interesting case: dt.cloud.* form, which exact lookup misses.
+    const hit = lookupInExtraWithNormalization(idx, 'dt.cloud.aws.lambda.invocations');
+    assert.ok(hit, 'expected dt.cloud.* form to resolve via prefix swap');
+    assert.equal(hit!.newKey, 'cloud.aws.lambda.Invocations.By.FunctionName');
+  });
+
+  it('strips a dimension suffix to find a shorter per-key entry (step 4)', async () => {
+    const { lookupInExtraWithNormalization } = await import('./extra-mappings.ts');
+    const perKeyPath = await writeFixture('per-key.json', {
+      'ext:cloud.aws.lambda.invocationsSum': {
+        bestDacKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+        availability: 'recommended',
+      },
+    });
+    const idx = await loadExtraMappings({ perKeyPath });
+    const hit = lookupInExtraWithNormalization(idx, 'ext:cloud.aws.lambda.invocationsSumByResource');
+    assert.ok(hit, 'expected dimension-strip to bridge to the shorter key');
+    assert.equal(hit!.availability, 'recommended');
+  });
+
+  it('falls through to Cassandra builtin:<provider>.* when needed (step 3b)', async () => {
+    const { lookupInExtraWithNormalization } = await import('./extra-mappings.ts');
+    const perKeyPath = await writeFixture('per-key.json', {
+      'builtin:aws.lambda.invocations': {
+        bestDacKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+        availability: 'autodiscovered',
+      },
+    });
+    const idx = await loadExtraMappings({ perKeyPath });
+    // dt.cloud.* → step 3a tries builtin:cloud.* (miss) → step 3b tries builtin:* (hit).
+    const hit = lookupInExtraWithNormalization(idx, 'dt.cloud.aws.lambda.invocations');
+    assert.ok(hit, 'expected Cassandra fallback to resolve dt.cloud key');
+    assert.equal(hit!.availability, 'autodiscovered');
+  });
+
+  it('returns null when nothing matches across the chain', async () => {
+    const { lookupInExtraWithNormalization } = await import('./extra-mappings.ts');
+    const perKeyPath = await writeFixture('per-key.json', {});
+    const idx = await loadExtraMappings({ perKeyPath });
+    assert.equal(
+      lookupInExtraWithNormalization(idx, 'cloud.aws.totally-fictitious.metric'),
+      null
+    );
+  });
+});
+
 describe('serviceFromNewKey', () => {
   it('extracts the AWS service segment from a new-form key', () => {
     assert.equal(serviceFromNewKey('cloud.aws.lambda.Invocations.By.FunctionName'), 'lambda');

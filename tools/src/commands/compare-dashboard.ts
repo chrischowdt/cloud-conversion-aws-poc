@@ -31,6 +31,7 @@ import {
   SKILL_MANUAL_AWS_METRICS,
   SKILL_PER_KEY_AWS_METRICS,
 } from '../lib/paths.ts';
+import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 
 export interface CompareDashboardArgs {
@@ -53,6 +54,13 @@ export interface CompareDashboardArgs {
    * sides to only those AWS accounts.
    */
   injectedVars?: Map<string, string[]>;
+  /**
+   * Explicit `live-metrics.json` path for dim-variant validation. Defaults to
+   * `<outDir>/live-metrics.json` if present (run `discover-metrics` first).
+   */
+  liveMetricsPath?: string;
+  /** Minimum target-series count before a dim-override fires (default 2). */
+  minOverrideSeries?: number;
 }
 
 const QUERY_FIELD_NAMES = new Set(['query', 'input', 'dqlQuery']);
@@ -305,11 +313,19 @@ function renderRow(row: ComparisonRow): string {
 export async function runCompareDashboard(args: CompareDashboardArgs): Promise<void> {
   const mappingPath =
     args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
+  const liveMetricsPath = args.liveMetricsPath ?? liveMetricsPathIfPresent(args.outDir);
   const index = await loadRecipeIndex(mappingPath, {
     dacPath: SKILL_DAC_AWS_METRICS,
     manualPath: SKILL_MANUAL_AWS_METRICS,
     perKeyPath: SKILL_PER_KEY_AWS_METRICS,
+    liveMetricsPath,
+    minOverrideSeries: args.minOverrideSeries,
   });
+  if (liveMetricsPath) {
+    console.log(
+      `Dim-validation: using ${liveMetricsPath} (min ${index.minOverrideSeries} target series)`
+    );
+  }
 
   const inputPath = resolve(args.input);
   const wrapper = JSON.parse(await readFile(inputPath, 'utf8')) as {

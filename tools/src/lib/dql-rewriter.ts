@@ -50,6 +50,7 @@ export interface Warning {
     | 'classic-id-literal'
     | 'recipe-aggregation-mismatch'
     | 'verdict-not-exact'
+    | 'dim-variant-override'
     | 'end-of-life-service';
   text: string;
   /** Pointer to the relevant dt-migration reference (if any). */
@@ -208,6 +209,16 @@ function applyRecipe(
 export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   const transforms: Transform[] = [];
   const warnings: Warning[] = [];
+  const original = input;
+
+  // Pass 0.5: credential-lookup-chain rewrite. Runs BEFORE the not-planned
+  // bailout so the canonical `custom_device → accessible_by[aws_credentials]
+  // → lookup aws_credentials for account name` idiom gets converted to the
+  // Smartscape `smartscapeNodes <TYPE>` form instead of bailing. The metric's
+  // service disambiguates the otherwise-ambiguous custom_device to a concrete
+  // Smartscape node type. If the idiom isn't present or the service can't be
+  // resolved, this is a no-op and the bailout below still fires.
+  input = rewriteCredentialLookupChain(input, transforms, warnings);
 
   // Pre-pass: bail out if the query contains a `lookup [fetch
   // dt.entity.<not-planned-type>]` chain (e.g. `custom_device`,
@@ -232,10 +243,13 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
         `then re-run the rewriter).`,
       reference: SKILL_REFS.specialCases,
     });
-    return { original: input, rewritten: input, transforms, warnings };
+    return { original, rewritten: original, transforms, warnings };
   }
 
   // Pass 1: replace metric keys inside aggregation calls + apply recipe.
+  // Records classic→new key swaps so Pass 1.4 can fix self-referential
+  // backtick column refs (the auto-generated `agg(key)` column name).
+  const metricKeySwaps = new Map<string, string>();
   let rewritten = input.replace(
     CLASSIC_KEY_PATTERN,
     (full, userAgg: string, classicKey: string, trailing: string) => {
@@ -307,6 +321,21 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
       }
       if (lookup.kind === 'mapped-no-recipe') {
         const newKey = lookup.entry.newDtMetricKey;
+        // The live-metric inventory repaired an empty dim variant: surface it
+        // as its own warning so the dim swap (and the inventory-incompleteness
+        // caveat) isn't buried in the generic mapped-no-recipe note.
+        if (lookup.dimOverride) {
+          const o = lookup.dimOverride;
+          warnings.push({
+            kind: 'dim-variant-override',
+            text:
+              `Dimension-variant override: ${o.from} has no live series on this tenant; ` +
+              `using ${o.to} (${o.count} series) instead. The inventory only sees currently-` +
+              `collected metrics — if ${o.from} is the intended grain but simply not collected ` +
+              `here, revert this swap.`,
+            match: classicKey,
+          });
+        }
         // We know the new key (the DAC or our enriched mapping told us) but
         // have no verified recipe. Swap the metric key, preserve the user's
         // aggregation, and warn so they can spot-check.
@@ -331,6 +360,12 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
         const swapOnly = trailing === ','
           ? `${userAgg}(\`${newKey}\`,`
           : `${userAgg}(\`${newKey}\`)`;
+        // Record the auto-generated column-name swap so Pass 1.4 can fix
+        // downstream backtick refs (only for the plain `agg(key)` form, not
+        // the `agg(key, filter:…)` form which isn't a column name).
+        if (trailing === ')') {
+          metricKeySwaps.set(`${userAgg}(${classicKey})`, `${userAgg}(${newKey})`);
+        }
         transforms.push({
           kind: 'metric-key',
           before: `${userAgg}(${classicKey}${trailing === ',' ? ',' : ')'}`,
@@ -369,6 +404,9 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
 
       // Normal path — simple aggregation, can wrap freely.
       const r = applyRecipe(userAgg, newKey, recipe);
+      // Column-name swap for Pass 1.4 (strip inner backticks: DQL names the
+      // column after the source expr without them).
+      metricKeySwaps.set(`${userAgg}(${classicKey})`, r.call.replace(/`/g, ''));
       transforms.push({
         kind: 'metric-key',
         before: `${userAgg}(${classicKey})`,
@@ -383,15 +421,33 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     }
   );
 
-  // Pass 1.4: warn about backtick-quoted column references that look like
-  // an `agg(metric)` shape. These reference a column emitted earlier by a
-  // `timeseries agg(metric)` clause; after Pass 1 swaps the metric key the
-  // column name no longer matches, so the reference goes stale. The fix is
-  // to alias the timeseries output (e.g. `timeseries val = avg(...)`) and
-  // reference `val` downstream; the rewriter can't do that safely on its own.
+  // Pass 1.4: fix backtick-quoted column references that name an earlier
+  // `timeseries agg(metric)` output column. When Pass 1 swaps the metric key,
+  // that auto-generated column name changes too (`avg(<classic>)` →
+  // `avg(<new>)`), so any downstream `\`avg(<classic>)\`` ref goes stale and
+  // raises FIELD_DOES_NOT_EXIST. For every swap Pass 1 recorded, rewrite the
+  // matching backtick ref in place. Verified on tenant: the new column name
+  // is `agg(<newKey>)` with NO inner backticks even when the timeseries
+  // clause wrote `agg(\`<newKey>\`)`.
+  for (const [oldCol, newCol] of metricKeySwaps) {
+    if (oldCol === newCol) continue;
+    const ref = '`' + oldCol + '`';
+    if (rewritten.includes(ref)) {
+      rewritten = rewritten.split(ref).join('`' + newCol + '`');
+      transforms.push({
+        kind: 'metric-key',
+        before: ref,
+        after: '`' + newCol + '`',
+        detail: 'backtick column reference realigned to the swapped timeseries output column',
+      });
+    }
+  }
+  // Anything still matching the backtick-agg-of-classic-key shape wasn't
+  // covered by a recorded swap (e.g. an aliased timeseries column, or a key
+  // we left unchanged) — warn so the user can realign it by hand.
   BACKTICK_COLUMN_REF_PATTERN.lastIndex = 0;
   let bm: RegExpExecArray | null;
-  while ((bm = BACKTICK_COLUMN_REF_PATTERN.exec(input)) !== null) {
+  while ((bm = BACKTICK_COLUMN_REF_PATTERN.exec(rewritten)) !== null) {
     warnings.push({
       kind: 'recipe-aggregation-mismatch',
       text:
@@ -500,6 +556,47 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
       });
       return 'name';
     });
+  }
+
+  // Pass 2.65: classic source-entity signal fields → Smartscape source fields.
+  // Per dt-migration/references/dql-function-migration.md event-fields table:
+  //   dt.source_entity.type → dt.smartscape_source.type
+  //   dt.source_entity      → dt.smartscape_source.id   (the bare ID field)
+  // Verified on tenant nic55601: both new fields are carried on AWS metric
+  // series (`dt.smartscape_source.id` = "AWS_LAMBDA_FUNCTION-…",
+  // `dt.smartscape_source.type` = "AWS_LAMBDA_FUNCTION"). Common in classic
+  // `by:{dt.entity.X = dt.source_entity, dt.source_entity.type}` grouping
+  // idioms — appears in ~2,300 translated queries on this tenant.
+  {
+    let typeCount = 0;
+    rewritten = rewritten.replace(/\bdt\.source_entity\.type\b/g, () => {
+      typeCount++;
+      return 'dt.smartscape_source.type';
+    });
+    if (typeCount > 0) {
+      transforms.push({
+        kind: 'entity-dim',
+        before: 'dt.source_entity.type',
+        after: 'dt.smartscape_source.type',
+        detail: 'classic source-entity type field → Smartscape source type',
+      });
+    }
+    // Bare `dt.source_entity` (the source-entity ID), not followed by a field
+    // accessor we already handled. `.type` is gone by now; guard against any
+    // other `.<word>` to avoid touching unknown sub-fields.
+    let idCount = 0;
+    rewritten = rewritten.replace(/\bdt\.source_entity\b(?!\.\w)/g, () => {
+      idCount++;
+      return 'dt.smartscape_source.id';
+    });
+    if (idCount > 0) {
+      transforms.push({
+        kind: 'entity-dim',
+        before: 'dt.source_entity',
+        after: 'dt.smartscape_source.id',
+        detail: 'classic source-entity ID field → Smartscape source id',
+      });
+    }
   }
 
   // Pass 2.7: when fetch was restructured to a known Smartscape node type,
@@ -651,7 +748,7 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     }
   }
 
-  return { original: input, rewritten, transforms, warnings };
+  return { original, rewritten, transforms, warnings };
 }
 
 /**
@@ -782,6 +879,119 @@ const CUSTOM_DEVICE_AWS_TYPE_MAP: Record<string, string> = {
   'cloud:aws:eks:cluster': 'AWS_EKS_CLUSTER',
   'cloud:aws:redshift': 'AWS_REDSHIFT_CLUSTER',
 };
+
+// ─── Pass 0.5: credential-lookup-chain → smartscapeNodes ──────────────────
+//
+// The dominant Pass-0 bailout idiom (97 of 106 DynamoDB bailouts, plus
+// Lambda/etc.) is a custom_device metric joined through the classic
+// "connection" relationship to recover the account name:
+//
+//   timeseries <agg>(cloud.aws.<svc>.<metric>), by:{dt.entity.custom_device}
+//   | lookup [fetch dt.entity.custom_device
+//       | fieldsAdd dt.entity.aws_credentials = accessible_by[dt.entity.aws_credentials][0]],
+//       sourceField:dt.entity.custom_device, lookupField:id, prefix:"device."
+//   | fieldsAdd dt.entity.aws_credentials = device.accessible_by[dt.entity.aws_credentials][0]
+//   | lookup [fetch dt.entity.aws_credentials | fields name = entity.name, id],
+//       sourceField:dt.entity.aws_credentials, lookupField:id, prefix:"account."
+//   | filter account.name == "<conn>"  | filter like(device.entity.name, "…")  | summarize …
+//
+// custom_device alone is "not-planned" (hence the bailout), but the metric
+// key's service segment disambiguates it to a concrete Smartscape node
+// (`cloud.aws.dynamodb.*` → AWS_DYNAMODB_TABLE). With the node type known,
+// the two lookups collapse to the readable Smartscape form the user
+// hand-verified (keep the lookups, no static account-id map):
+//
+//   | lookup [smartscapeNodes <TYPE> | fields name, id, aws.account.id],
+//       sourceField:dt.smartscape.<type>, lookupField:id, prefix:"device."
+//   | lookup [smartscapeNodes AWS_ACCOUNT | fields name, aws.account.id],
+//       sourceField:device.aws.account.id, lookupField:aws.account.id, prefix:"account."
+//
+// CAVEAT (warned): the classic `account.name` filter targets a single
+// *credential* (connection); the Smartscape AWS_ACCOUNT node is one-per-
+// account. When an account has >1 classic credential, the rewritten filter
+// is broader. Verified on tenant nic55601 (account 560380317052 has two
+// credentials, DEV-CustomerTechnology + …-EGY).
+const CREDENTIAL_LOOKUP_CHAIN_RE = new RegExp(
+  '\\|\\s*lookup\\s*\\[\\s*fetch\\s+`?dt\\.entity\\.custom_device`?\\s*' +
+    '\\|\\s*fieldsAdd\\s+`?dt\\.entity\\.aws_credentials`?\\s*=\\s*accessible_by\\[`?dt\\.entity\\.aws_credentials`?\\]\\[0\\]\\s*\\]\\s*,\\s*' +
+    'sourceField\\s*:\\s*`?dt\\.entity\\.custom_device`?\\s*,\\s*lookupField\\s*:\\s*id\\s*,\\s*prefix\\s*:\\s*"device\\."\\s*' +
+    '\\|\\s*fieldsAdd\\s+`?dt\\.entity\\.aws_credentials`?\\s*=\\s*device\\.accessible_by\\[`?dt\\.entity\\.aws_credentials`?\\]\\[0\\]\\s*' +
+    '\\|\\s*lookup\\s*\\[\\s*fetch\\s+`?dt\\.entity\\.aws_credentials`?\\s*' +
+    '\\|\\s*fields\\s+name\\s*=\\s*entity\\.name\\s*,\\s*id\\s*\\]\\s*,\\s*' +
+    'sourceField\\s*:\\s*`?dt\\.entity\\.aws_credentials`?\\s*,\\s*lookupField\\s*:\\s*id\\s*,\\s*prefix\\s*:\\s*"account\\."',
+  'g'
+);
+
+/** Derive the AWS service segment from the first classic metric key in the query. */
+function serviceFromClassicKeyInQuery(input: string): string | null {
+  const m = /(?:dt\.)?cloud\.aws\.([a-z0-9_]+)\./.exec(input);
+  return m ? m[1]! : null;
+}
+
+function rewriteCredentialLookupChain(
+  input: string,
+  transforms: Transform[],
+  warnings: Warning[]
+): string {
+  CREDENTIAL_LOOKUP_CHAIN_RE.lastIndex = 0;
+  if (!CREDENTIAL_LOOKUP_CHAIN_RE.test(input)) return input;
+
+  // Disambiguate custom_device via the metric's service segment.
+  const service = serviceFromClassicKeyInQuery(input);
+  if (!service) return input;
+  const nodeType = CUSTOM_DEVICE_AWS_TYPE_MAP[`cloud:aws:${service}`];
+  if (!nodeType) {
+    // Recognized the idiom but can't resolve the service to a node type —
+    // leave it for the bailout, but leave a breadcrumb for table expansion.
+    warnings.push({
+      kind: 'entity-relationship-traversal',
+      text:
+        `Recognized a custom_device credential-lookup chain for service "${service}", but no ` +
+        `Smartscape node type is mapped for \`cloud:aws:${service}\` in CUSTOM_DEVICE_AWS_TYPE_MAP. ` +
+        `Add it there to auto-convert this shape.`,
+      reference: SKILL_REFS.specialCases,
+    });
+    return input;
+  }
+  const dim = `dt.smartscape.${nodeType.toLowerCase()}`;
+
+  // 1. Replace the two-lookup credential block with the Smartscape form.
+  CREDENTIAL_LOOKUP_CHAIN_RE.lastIndex = 0;
+  let out = input.replace(
+    CREDENTIAL_LOOKUP_CHAIN_RE,
+    () =>
+      `| lookup [smartscapeNodes ${nodeType} | fields name, id, aws.account.id], ` +
+      `sourceField:${dim}, lookupField:id, prefix:"device."\n` +
+      `| lookup [smartscapeNodes AWS_ACCOUNT | fields name, aws.account.id], ` +
+      `sourceField:device.aws.account.id, lookupField:aws.account.id, prefix:"account."`
+  );
+
+  // 2. Any remaining `dt.entity.custom_device` references in this query are
+  //    this service's table/resource — rewrite them to the resolved dim so
+  //    the by-clause, entityName(...), etc. all align. (The block above no
+  //    longer contains custom_device, so this only touches head/tail refs.)
+  out = out.replace(/`?dt\.entity\.custom_device`?/g, dim);
+
+  // 3. device.entity.name → device.name (the lookup now selects bare `name`).
+  out = out.replace(/\bdevice\.entity\.name\b/g, 'device.name');
+
+  transforms.push({
+    kind: 'entity-dim',
+    before: 'lookup [fetch dt.entity.custom_device … accessible_by[aws_credentials]] → lookup [fetch dt.entity.aws_credentials …]',
+    after: `lookup [smartscapeNodes ${nodeType} … aws.account.id] → lookup [smartscapeNodes AWS_ACCOUNT …]`,
+    detail: `credential-lookup chain collapsed; custom_device disambiguated to ${nodeType} via metric service "${service}"`,
+  });
+  warnings.push({
+    kind: 'unmapped-entity-type',
+    text:
+      `Collapsed a classic credential (connection) lookup to an AWS_ACCOUNT join. A single AWS ` +
+      `account can have multiple classic credentials, but Smartscape has one AWS_ACCOUNT node per ` +
+      `account — so the rewritten \`account.name == "…"\` filter is BROADER than the classic ` +
+      `single-credential filter. Verify intent for multi-credential accounts.`,
+    reference: SKILL_REFS.specialCases,
+  });
+  return out;
+}
 
 /**
  * Match `fetch dt.entity.custom_device\s*|\s*filter\s+entity.type == "cloud:aws:X"`

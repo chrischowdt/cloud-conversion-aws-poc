@@ -1,6 +1,6 @@
 # Project status — AWS classic→Smartscape dashboard conversion
 
-_Snapshot for transferring context between sessions. Updated 2026-05-29._
+_Snapshot for transferring context between sessions. Updated 2026-06-11._
 
 This is a **living status doc**, not background. `RESEARCH.md` / `GAP_ANALYSIS.md`
 are dated and frozen; `INTEGRATION.md` explains the two-halves composition;
@@ -46,6 +46,40 @@ the danger zone at EOL), ~18% are no-ops (already new-form or non-DQL).
 **Headline:** ~1 in 5 AWS panels (≈29% by views) auto-converts cleanly today.
 **Biggest single insight from access data:** ~64% of scanned AWS dashboards
 have zero user opens in 90 days — likely droppable from the migration target list.
+
+## Since last update (2026-06-11, not yet committed)
+
+Several rewriter + tooling additions landed after the commit series below; tests
+now **169 passing**, typecheck clean.
+
+- **Credential-lookup-chain pass (Pass 0.5)** — recognizes the canonical
+  `lookup [fetch dt.entity.custom_device … aws_credentials …]` idiom and rewrites
+  it to `smartscapeNodes <TYPE>` + AWS_ACCOUNT lookups, *before* the not-planned
+  bailout. Cut bailouts 223 → 126 on the translated corpus.
+- **Source-entity migration** — `dt.source_entity[.type]` → `dt.smartscape_source[.id/.type]`.
+- **`discover-tags`** → `enriched-tags.json`. The new connection enriches a
+  per-tenant-configurable set of AWS tags onto metrics (nic55601: `applicationci`,
+  `env`). Enriched tags → cheap `aws.tags.<key>` dim filters; non-enriched tags
+  need a `smartscapeNodes` lookup. Two tag surfaces with DIFFERENT casing:
+  enriched dim `aws.tags.applicationci` (lowercased) vs node tag
+  `getNodeField(n,"tags:aws")[ApplicationCI]` (original AWS case).
+- **`discover-metrics` + dim-variant validation** (this session). The DAC can map
+  a classic key to a `.By.<Dim>` variant that has **zero series** on a tenant
+  while a sibling dim is populated (verified: aurora `DatabaseConnections` →
+  `.By.DBClusterIdentifier` = 0 vs `.By.DBInstanceIdentifier` = 109). `discover-metrics`
+  inventories the tenant's 716 live metric keys → `live-metrics.json`; the lookup
+  chain swaps empty→populated siblings (`mapped-no-recipe` tier only, `min 2`
+  target series by default, always warns — the inventory only sees *currently-
+  collected* metrics). Corpus impact at default threshold: **13 keys / 55 tile
+  warnings** (the ≥2 guard correctly dropped 6 single-series swaps incl. the
+  183-ref Step Functions family). See CLAUDE.md "Dim-variant validation."
+
+**Open follow-up surfaced this session:** the DAC's `.By.<Dim>` pick isn't
+data-validated in general — dim-validation repairs it per-tenant at lookup time,
+but the underlying mapping table (`aws_mapping.*` / DAC) still ships the
+canonical-but-sometimes-empty dim. Consider a manual override for aurora/docdb
+`DatabaseConnections` → instance-level so it's correct even without a live
+inventory.
 
 ## What's been done (recent commit series)
 
