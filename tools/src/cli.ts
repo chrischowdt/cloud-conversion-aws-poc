@@ -23,6 +23,7 @@ import { runDql } from './commands/dql.ts';
 import { runEquivalence } from './commands/equivalence.ts';
 import { runMergeRecipes } from './commands/merge-recipes.ts';
 import { runCompareDashboard } from './commands/compare-dashboard.ts';
+import { runDiscoverEntityTypes } from './commands/discover-entity-types.ts';
 import { runDiscoverFields } from './commands/discover-fields.ts';
 import { runDiscoverMetrics } from './commands/discover-metrics.ts';
 import { runDiscoverTags } from './commands/discover-tags.ts';
@@ -149,6 +150,12 @@ COMMANDS
                     empty .By.<Dim> variants: if a DAC-mapped key has no data
                     but a sibling dim does, it prefers the populated one.
                     Flags: --from, --da-source.
+  discover-entity-types
+                    Derive the AWS service -> Smartscape node-type bridge from
+                    live metrics' dt.smartscape_source.type (writes
+                    entity-source-types.json). Lets the rewriter disambiguate
+                    a classic custom_device to a real node type via the query's
+                    metric key. Flags: --from, --da-source.
   equivalence       Test whether classic↔new metric pairs return same data.
   detect            Per pair, search aggregations + scale to find the
                     recipe that reproduces classic from new.
@@ -471,6 +478,17 @@ async function main(): Promise<void> {
     case 'discover-metrics': {
       const { baseUrl, token } = requireBaseAndToken(args.flags);
       await runDiscoverMetrics({
+        baseUrl,
+        token,
+        outDir: tenantOut(args.flags, baseUrl),
+        from: getString(args.flags, 'from'),
+        daSource: getString(args.flags, 'da-source'),
+      });
+      return;
+    }
+    case 'discover-entity-types': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDiscoverEntityTypes({
         baseUrl,
         token,
         outDir: tenantOut(args.flags, baseUrl),
