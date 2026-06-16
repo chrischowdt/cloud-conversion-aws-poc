@@ -14,43 +14,42 @@ export const REFERENCE_AWS_METRICS = resolve(
 );
 
 /**
- * Fresh DAC AWS metrics mapping shipped with the dt-migration skill. This
- * is the same shape as REFERENCE_AWS_METRICS but refreshed alongside the
- * skill — prefer it as the primary mapping source when present.
+ * The AWS cloud-migration skill's reference dir. NOTE (2026-06-16): the product
+ * team relocated the original `dt-migration/` skill to
+ * `product-ai-knowledgebase/dt-migration-cloud/` (and added a separate, general
+ * `dt-migration/` + `dt-dql-essentials/` alongside it). The AWS metric/entity
+ * reference JSON lives under the cloud skill.
  */
-export const SKILL_DAC_AWS_METRICS = resolve(
+const SKILL_CLOUD_REFS = resolve(
   REPO_ROOT,
-  'dt-migration',
-  'references',
-  'dac-aws-to-2ndgen-metrics.json'
+  'product-ai-knowledgebase',
+  'dt-migration-cloud',
+  'references'
 );
 
 /**
- * ~117 hand-curated AWS metric abbreviations from the dt-migration skill
+ * Fresh DAC AWS metrics mapping shipped with the dt-migration-cloud skill. This
+ * is the same shape as REFERENCE_AWS_METRICS but refreshed alongside the
+ * skill — prefer it as the primary mapping source when present.
+ */
+export const SKILL_DAC_AWS_METRICS = resolve(SKILL_CLOUD_REFS, 'dac-aws-to-2ndgen-metrics.json');
+
+/**
+ * ~117 hand-curated AWS metric abbreviations from the dt-migration-cloud skill
  * (`cloud.aws.alb.bytes`, `cloud.aws.aurora.*_by_role`, `cloud.aws.eccustom.*`,
  * etc.). Dynatrace shorthands that don't algorithmically derive from
  * CloudWatch; the DAC normalization chain will never resolve them.
  */
-export const SKILL_MANUAL_AWS_METRICS = resolve(
-  REPO_ROOT,
-  'dt-migration',
-  'references',
-  'manual-metric-mappings.json'
-);
+export const SKILL_MANUAL_AWS_METRICS = resolve(SKILL_CLOUD_REFS, 'manual-metric-mappings.json');
 
 /**
- * ~5,709 pre-resolved AWS metric mappings shipped with the dt-migration skill —
- * output of the skill team's own normalization chain (selector-strip,
+ * ~5,709 pre-resolved AWS metric mappings shipped with the dt-migration-cloud
+ * skill — output of the skill team's own normalization chain (selector-strip,
  * dt.cloud→builtin:cloud, dimension-suffix strip, service-segment scan).
  * Catches keys our local DAC normalization misses, especially lowercased
  * ext: keys and Cassandra-shape `builtin:aws.X` shapes.
  */
-export const SKILL_PER_KEY_AWS_METRICS = resolve(
-  REPO_ROOT,
-  'dt-migration',
-  'references',
-  'per-key-mappings.json'
-);
+export const SKILL_PER_KEY_AWS_METRICS = resolve(SKILL_CLOUD_REFS, 'per-key-mappings.json');
 
 export const REFERENCE_AZURE_METRICS = resolve(
   REPO_ROOT,

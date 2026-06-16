@@ -1,10 +1,44 @@
 # Project status — AWS classic→Smartscape dashboard conversion
 
-_Snapshot for transferring context between sessions. Updated 2026-06-11._
+_Snapshot for transferring context between sessions. Updated 2026-06-16._
 
 This is a **living status doc**, not background. `RESEARCH.md` / `GAP_ANALYSIS.md`
 are dated and frozen; `INTEGRATION.md` explains the two-halves composition;
 `CLAUDE.md` is the architecture reference. This file is "where we are right now."
+
+## 2026-06-16 — product-team knowledge base added (`product-ai-knowledgebase/`)
+
+The user dropped in Dynatrace product-team content and **relocated the original
+`dt-migration/` skill to `product-ai-knowledgebase/dt-migration-cloud/`**; added a
+general `dt-migration/` (classic→Grail entities/DQL/tags) and `dt-dql-essentials/`
+(full DQL + Smartscape topology). The move **broke every runtime loader** — fixed
+`tools/src/lib/paths.ts` `SKILL_*` → `dt-migration-cloud/references/` (const
+`SKILL_CLOUD_REFS`); tests green. Assessment (3 parallel deep-reads):
+
+- **Lever 2 is SETTLED — don't build identity-by-default.** No mapping file carries
+  unit/statistic/gauge-vs-counter metadata, and the skill's own agg/scale method is
+  *empirical live-tenant verification* (`metric-key-mapping.md`). So `mapped-no-recipe`
+  is honest; the recipe-tier + dim-variant probing is the correct mechanism. The
+  gauge/counter heuristic has no authoritative basis — drop it.
+- **Credential/account = a FIELD READ, not an edge.** No resource→AWS_ACCOUNT edge
+  exists; `aws.account.id` is denormalized on the resource, name via join to
+  `smartscapeNodes AWS_ACCOUNT` on `aws.account.id`. **Validates Pass 0.5**, and is
+  how to extend to the `entityAttr(...accessible_by...)` fieldsAdd form (the ~2,457
+  co-blocker). A traverse/`references` toward AWS_ACCOUNT would silently return empty.
+- **Metric Streams keys (camelCase `…By<Dims>`) are unmappable by design** — flag
+  `migration-blocked (Metric Streams)`, not a closeable gap.
+
+**Actionable backlog from the KB (prioritized, not yet done):**
+1. Fix `entityAttr(x,"tags")` → `getNodeField(x,"tags:aws")[key]=="val"` + unwrap
+   `in(…,"[AWS]k:v")` (current generic rename emits invalid DQL for tag filters).
+2. Expand `aws-service-node-types.ts` from `dac-aws-to-2ndgen-entities.json` (75 vs
+   our 40: emr, fsx, events, athena, appsync, sagemaker, cassandra, …); add ecs/
+   route53/cassandra/elasticache to `MULTI_NODE_SERVICES`. **Keep empirical overrides**
+   (es→OPENSEARCH, ecs→CLUSTER; docdb/neptune split is probe-only).
+3. Extend the credential rewrite to the `entityAttr(accessible_by)` form (field-read).
+4. Flag Metric Streams keys instead of leaving them unknown-metric.
+5. Optional: adopt `relationship-mappings.md` (150+ edges, static-vs-dynamic flag) to
+   widen `smartscape-edges.ts` + enable `traverse` for dynamic edges.
 
 ## Scope
 
