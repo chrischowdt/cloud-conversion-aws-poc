@@ -138,9 +138,9 @@ The dt-migration skill files have a small number of typos / stale entries the re
 |---|---|---|
 | `dt.smartscape.aws.lambda_function` (dotted) | `dt.smartscape.aws_lambda_function` (underscore) — every AWS Smartscape dim follows `dt.smartscape.<lowercase_node_type>` | `entity-mappings.ts` corrected; `entity-mappings.test.ts` enforces the convention |
 | `dt.entity.aws_credentials` field `awsAccountId` migrates 1:1 | New side renames it to `aws.account.id` | `entity-field-mappings.ts` |
-| All smartscape types carry their dim on metric series | ~14 types don't (ECS, EFS, NAT Gateway, …) | `metric-dim-carriers.ts` |
+| All smartscape types carry their dim on metric series | As of the 2026-06-17 re-probe, nearly all DO (incl. ECS/EFS/NAT GW/API GW — the May "non-carrier" list was stale; enrichment matured). Only `AWS_APIGATEWAYV2_API` is unverified (no data). | `metric-dim-carriers.ts` (re-probe method in its header); non-carrier caveat is the **non-blocking** `dim-not-carried` kind |
 
-When proposing a new mapping, **probe the tenant first** (`cct dql --query "smartscapeNodes <TYPE> | limit 1"`) rather than trusting type-mappings.md verbatim.
+When proposing a new mapping, **probe the tenant first** (`cct dql --query "smartscapeNodes <TYPE> | limit 1"`) rather than trusting type-mappings.md verbatim. The carrier table in particular **drifts** as the connection evolves — re-probe per tenant before trusting it.
 
 ### Conventions enforced by tests
 

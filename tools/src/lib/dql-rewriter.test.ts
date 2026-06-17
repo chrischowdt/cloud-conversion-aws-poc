@@ -646,32 +646,52 @@ describe('rewriteDql — credential-lookup-chain (Pass 0.5)', () => {
 });
 
 describe('rewriteDql — by-clause non-carrier alignment', () => {
-  it('warns when a non-carrier smartscape dim is used in by:{...} after a metric rewrite', () => {
+  it('warns (non-blocking) when a genuine non-carrier smartscape dim is used in by:{...}', () => {
+    // AWS_APIGATEWAYV2_API is the one type we can't re-verify as a carrier
+    // (no live data on the probe tenant), so it stays in the non-carrier set.
     const idx = buildIndex([
       {
-        service: 'ECS',
-        classicMetricId: 'dt.cloud.aws.ecs.cpu.utilization',
-        newDtMetricKey: 'cloud.aws.ecs.CPUUtilization.By.ClusterName',
+        service: 'ApiGatewayV2',
+        classicMetricId: 'dt.cloud.aws.apigatewayv2.count',
+        newDtMetricKey: 'cloud.aws.apigatewayv2.Count.By.ApiId',
         detectedRecipe: {
           classicAggregation: 'avg', newAggregation: 'avg', newAggregationMode: 'raw',
           scale: 1, verdict: 'exact-fit', pearsonR: 0.99, residualSmape: 0.01,
         } as any,
       },
     ]);
-    // ECS_CLUSTER is in our entity-mappings as a custom_device sub-type alias
-    // — the rewriter swaps `dt.entity.cloud:aws:ecs:cluster` → `dt.smartscape.aws_eks_cluster`?
-    // Actually we map cloud:aws:eks:cluster, not ecs:cluster. Use a generic input
-    // that produces dt.smartscape.aws_ecs_cluster via the by-clause directly.
     const input =
-      'timeseries avg(dt.cloud.aws.ecs.cpu.utilization), by:{dt.smartscape.aws_ecs_cluster}';
+      'timeseries avg(dt.cloud.aws.apigatewayv2.count), by:{dt.smartscape.aws_apigatewayv2_api}';
     const r = rewriteDql(input, idx);
+    const w = r.warnings.find((w) => /isn't carried/i.test(w.text));
+    assert.ok(w, 'expected a non-carrier warning with concrete substitution');
+    assert.equal(w!.kind, 'dim-not-carried', 'should use its own kind, not unmapped-entity-type');
+    assert.ok(/dt\.smartscape\.aws_apigatewayv2_api/.test(w!.text));
+    assert.ok(/ApiId/.test(w!.text), 'should suggest the CloudWatch dim from the .By.<Dim> suffix');
+    // The DQL still runs (only the grouping degrades) — this is a verify-me
+    // caveat, not a blocker, so it must NOT count against the conversion rate.
+    assert.equal(isBlockingWarning('dim-not-carried'), false);
+  });
+
+  it('does NOT warn for ECS — re-verified as a carrier 2026-06-17 (was stale non-carrier)', () => {
+    const idx = buildIndex([
+      {
+        service: 'ECS',
+        classicMetricId: 'dt.cloud.aws.ecs.cpu.utilization',
+        newDtMetricKey: 'cloud.aws.ecs.CPUUtilization.By.ClusterName.ServiceName',
+        detectedRecipe: {
+          classicAggregation: 'avg', newAggregation: 'avg', newAggregationMode: 'raw',
+          scale: 1, verdict: 'exact-fit', pearsonR: 0.99, residualSmape: 0.01,
+        } as any,
+      },
+    ]);
+    const r = rewriteDql(
+      'timeseries avg(dt.cloud.aws.ecs.cpu.utilization), by:{dt.smartscape.aws_ecs_cluster}',
+      idx
+    );
     assert.ok(
-      r.warnings.some((w) =>
-        /dt\.smartscape\.aws_ecs_cluster/.test(w.text) &&
-        /isn't carried/i.test(w.text) &&
-        /ClusterName/.test(w.text)
-      ),
-      'expected non-carrier warning with concrete substitution'
+      !r.warnings.some((w) => /isn't carried/i.test(w.text)),
+      'ECS now carries dt.smartscape.aws_ecs_cluster (287 distinct cluster buckets on nic55601)'
     );
   });
 

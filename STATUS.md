@@ -60,23 +60,48 @@ but are out of scope until AWS auto-conversion is much higher.
 
 ## Current conversion rate (tenant nic55601, 518 AWS dashboards / 11,561 panels)
 
-`scan-dashboards` now reports a **reframed scoreboard** (every query in exactly
+`scan-dashboards` reports a **reframed scoreboard** (every query in exactly
 one bucket) — `clean (0 warnings)` alone badly undercounted, because it lumped
-"can't convert" with "converted, just verify-flagged". As of 2026-06-16:
+"can't convert" with "converted, just verify-flagged". As of 2026-06-17:
 
 | Bucket | share | meaning |
 |---|---:|---|
-| **CONVERTED** (produces working DQL) | **52.9%** | clean **21.0%** + converted-with-verify-caveat **31.9%** |
-| BLOCKED (no equiv / needs manual) | 27.8% | sole blockers: unmapped-entity-type 14.7%, unknown-metric 4.5%, metric-streams 2.1%, relationship/selector ~2% |
+| **CONVERTED** (produces working DQL) | **57.7%** | clean **21.0%** + converted-with-verify-caveat **36.7%** |
+| BLOCKED (no equiv / needs manual) | 23.0% | sole blockers: unmapped-entity-type 11.9%, unknown-metric 2.6%, metric-streams 2.3%, relationship/selector ~2.1%, classic-id-literal 0.6% |
 | No-op (already new-form / non-DQL) | 19.3% | — |
 
-**Headline: ~53% of AWS panels auto-convert to working DQL** (21% with zero
-caveats; +32% that run but carry a verify-me flag — mostly `mapped-no-recipe`
-scale, credential breadth, multi-node grain). The old "~21% clean" was the
-no-caveat subset only. Caveat on the 32%: solid for gauge metrics; rate/counter
-`mapped-no-recipe` may carry a wrong *scale* (Lever 2, settled-unverifiable from
-metadata). Classification source of truth: `BLOCKING_WARNING_KINDS` in
-`dql-rewriter.ts`.
+**Headline: ~58% of AWS panels auto-convert to working DQL** (21% with zero
+caveats; +37% that run but carry a verify-me flag). Gains since the 52.9%
+baseline: Lever 2 (tier-4 unknown-metric snake-normalization, +106) and the
+**carrier-table refresh** below (+448). Caveat on the soft tier: solid for gauge
+metrics; rate/counter `mapped-no-recipe` may carry a wrong *scale* (settled-
+unverifiable from metadata). Classification source of truth:
+`BLOCKING_WARNING_KINDS` in `dql-rewriter.ts`.
+
+**Carrier-table refresh (2026-06-17) — biggest single win this session.**
+`metric-dim-carriers.ts` lists which Smartscape types DON'T carry their own
+`dt.smartscape.<type>` dim on metric series. It was probed 2026-05-12 and had
+gone **stale**: re-probing the live tenant showed **13 of 14** listed
+"non-carriers" now DO carry their dim (ECS = 287 distinct cluster buckets over
+1833 series; also API Gateway, EFS, NAT Gateway, VPC endpoints, EKS, EventBridge,
+autoscaling, ECR, AppSync, Firehose, Route53) — the connection's enrichment
+matured. The rewriter was emitting a **false** `by:{dt.smartscape.X}` non-carrier
+warning for these AND (bug) tagging it `unmapped-entity-type`, which is *blocking* —
+so ~470 ECS/API-Gateway panels with valid, working DQL were mis-counted as BLOCKED.
+Fix: move the 13 verified carriers (only `AWS_APIGATEWAYV2_API` stays — no live
+data to verify) + give the genuine caveat its own **non-blocking** `dim-not-carried`
+kind. Net: CONVERTED 53.8% → 57.7% (+448), BLOCKED 26.9% → 23.0%; the false warnings
+were *eliminated*, not reclassified (`dim-not-carried` now fires <20×). Re-probe
+method is in the `metric-dim-carriers.ts` header — the table will drift again, so
+this is worth turning into a `discover-carriers` command.
+
+**Note on the remaining 11.9% unmapped-entity-type wall:** re-running the rewriter
+to capture the *actual* trigger texts shows it's now ~⅔ genuinely **non-AWS**
+(`cloud_application`/K8s, `process_group`/APM, `cloud:gcp:*`, `azure_function_app`,
+`sql:*`, `ibmmq:*`, `custom:solace`) — out of scope for an AWS-integration tool —
+plus genuine AWS blocks (`cloud:aws:kafka`/`ecs`/`ec2` custom_device *lookup-chain*
+idioms that need manual redesign per the not-planned bailout). Little low-hanging
+fruit remains here.
 
 **Access-data insight (still valid):** ~64% of scanned AWS dashboards have zero
 user opens in 90 days — likely droppable from the migration target list, which

@@ -61,6 +61,7 @@ export interface Warning {
     | 'custom-device-disambiguated'
     | 'credential-collapsed'
     | 'metric-streams-blocked'
+    | 'dim-not-carried'
     | 'end-of-life-service';
   text: string;
   /** Pointer to the relevant dt-migration reference (if any). */
@@ -782,7 +783,12 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
         : 'by:{ aws.arn }';
 
       warnings.push({
-        kind: 'unmapped-entity-type',
+        // Not blocking: the DQL runs and the metric data flows — only the
+        // grouping degrades (collapses to one null bucket). The fix is a
+        // mechanical by-clause dim swap, so this is a verify-me caveat, not a
+        // "can't convert". (Most former non-carriers now carry their dim — see
+        // metric-dim-carriers.ts re-probe — so this fires rarely.)
+        kind: 'dim-not-carried',
         text:
           `by:{ dt.smartscape.${dimSlug} } — the ${nodeType} Smartscape dim isn't carried on ` +
           `the new metric series, so this grouping collapses all rows to a single null-keyed ` +
