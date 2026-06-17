@@ -1085,3 +1085,22 @@ describe('rewriteDql — credential/account fieldsAdd idiom (Pass 0.6)', () => {
     assert.match(r.rewritten, /smartscapeNodes AWS_DYNAMODB_TABLE/);
   });
 });
+
+describe('rewriteDql — AWS Metric Streams keys (migration-blocked)', () => {
+  it('flags a camelCase multi-dim Metric Streams key distinctly from unknown-metric', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('timeseries avg(cloud.aws.kafka.cpuUserByAccountIdBrokerIDClusterNameRegion)', idx);
+    const w = r.warnings.find((x) => x.kind === 'metric-streams-blocked');
+    assert.ok(w, 'expected a metric-streams-blocked warning');
+    assert.match(w!.text, /Metric Streams/);
+    assert.ok(!r.warnings.some((x) => x.kind === 'unknown-metric'));
+    assert.match(r.rewritten, /cloud\.aws\.kafka\.cpuUserByAccountIdBrokerIDClusterNameRegion/); // left unchanged
+  });
+
+  it('does NOT flag a classic snake_case unknown key as Metric Streams', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('timeseries avg(cloud.aws.foo.some_unmapped_metric_sum)', idx);
+    assert.ok(r.warnings.some((x) => x.kind === 'unknown-metric'));
+    assert.ok(!r.warnings.some((x) => x.kind === 'metric-streams-blocked'));
+  });
+});

@@ -60,6 +60,7 @@ export interface Warning {
     | 'dim-variant-override'
     | 'custom-device-disambiguated'
     | 'credential-collapsed'
+    | 'metric-streams-blocked'
     | 'end-of-life-service';
   text: string;
   /** Pointer to the relevant dt-migration reference (if any). */
@@ -120,6 +121,18 @@ const CLASSIC_KEY_PATTERN =
 function isNewConnectionShape(key: string): boolean {
   return /\.By\.[A-Z][a-zA-Z0-9]*/.test(key);
 }
+
+/**
+ * AWS Metric Streams key shape: `cloud.aws.<service>.<camelCaseMetric>By<Dim1><Dim2>…`
+ * — a camelCase metric (lowercase start, no underscores, no `.By.`) followed by
+ * `By` and 2+ concatenated PascalCase dimensions (e.g.
+ * `cpuUserByAccountIdBrokerIDClusterNameRegion`). The 2+-dim requirement (`By`
+ * then a word then another capital) distinguishes Metric Streams from a classic
+ * v2 single-dim suffix like `…ByRole`. Verified on nic55601: all 54 corpus
+ * matches are multi-dim Metric Streams (kafka/amazonmq), zero single-dim.
+ */
+const METRIC_STREAMS_KEY_RE =
+  /^(?:dt\.)?cloud\.aws\.[a-z0-9_]+\.[a-z][a-zA-Z0-9]*By[A-Z][a-z0-9]*[A-Z][a-zA-Z0-9]*$/;
 
 // Backtick-quoted column reference that LOOKS like an agg(metric) expression.
 // These are downstream references to a column emitted by an earlier
@@ -308,6 +321,26 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
 
       const lookup: LookupResult = lookupClassicKey(index, classicKey);
       if (lookup.kind === 'unknown') {
+        // AWS Metric Streams keys (camelCase metric + concatenated PascalCase
+        // dims, e.g. cloud.aws.kafka.cpuUserByAccountIdBrokerIDClusterNameRegion)
+        // have no new-connection equivalent — Metric Streams isn't supported by
+        // the new connection. Flag them distinctly rather than as a generic
+        // unknown-metric (they're unmappable by design, not a coverage gap).
+        // Only reached for keys that didn't resolve, so mapped classic keys
+        // (incl. camelCase v2 keys) are never misclassified here.
+        if (METRIC_STREAMS_KEY_RE.test(classicKey)) {
+          warnings.push({
+            kind: 'metric-streams-blocked',
+            text:
+              `AWS Metric Streams metric: ${classicKey}. The new AWS connection does not (yet) ` +
+              `support Metric Streams, so this key has no equivalent and the tile cannot be ` +
+              `migrated. Flag the account as "migration-blocked (Metric Streams)"; classic ` +
+              `polling metrics on the same account still migrate.`,
+            reference: SKILL_REFS.specialCases,
+            match: classicKey,
+          });
+          return full;
+        }
         warnings.push({
           kind: 'unknown-metric',
           text: `Classic metric key not in mapping: ${classicKey}. Leaving unchanged.`,
