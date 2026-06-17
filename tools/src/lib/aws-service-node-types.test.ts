@@ -80,3 +80,31 @@ describe('isMultiNodeService', () => {
     assert.equal(isMultiNodeService('dynamodb'), false);
   });
 });
+
+describe('expansion from DAC entities JSON (2026-06-16)', () => {
+  it('resolves newly-added metric services to their node types', () => {
+    assert.equal(nodeTypeForMetricService('emr'), 'AWS_EMR_CLUSTER');
+    assert.equal(nodeTypeForMetricService('api_gateway'), 'AWS_APIGATEWAY_RESTAPI');
+    assert.equal(nodeTypeForMetricService('apigateway'), 'AWS_APIGATEWAY_RESTAPI');
+    assert.equal(nodeTypeForMetricService('athena'), 'AWS_ATHENA_WORKGROUP');
+    assert.equal(nodeTypeForMetricService('mwaa'), 'AWS_MWAA_ENVIRONMENT');
+    assert.equal(nodeTypeForMetricService('fsx'), 'AWS_FSX_FILESYSTEM');
+  });
+
+  it('resolves the entity.type-filter form via the strip fallback', () => {
+    assert.equal(nodeTypeForCustomDeviceType('cloud:aws:emr'), 'AWS_EMR_CLUSTER');
+    assert.equal(nodeTypeForCustomDeviceType('cloud:aws:athena'), 'AWS_ATHENA_WORKGROUP');
+    assert.equal(nodeTypeForCustomDeviceType('cloud:aws:events'), 'AWS_EVENTS_EVENTBUS');
+  });
+
+  it('flags the newly-added multi-node services', () => {
+    assert.equal(isMultiNodeService('ecs'), true);
+    assert.equal(isMultiNodeService('route53'), true);
+    assert.equal(isMultiNodeService('elasticache'), true);
+  });
+
+  it('preserves empirical overrides (es→OPENSEARCH, not the doc OPENSEARCHSERVICE)', () => {
+    assert.equal(nodeTypeForMetricService('es'), 'AWS_OPENSEARCH_DOMAIN');
+    assert.equal(nodeTypeForMetricService('ecs'), 'AWS_ECS_CLUSTER');
+  });
+});

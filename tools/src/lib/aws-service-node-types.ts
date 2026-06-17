@@ -63,6 +63,27 @@ export const SERVICE_NODE_TYPE_MAP: Record<string, string> = {
   sqs: 'AWS_SQS_QUEUE',
   states: 'AWS_STEPFUNCTIONS_STATEMACHINE',
   transitgateway: 'AWS_EC2_TRANSITGATEWAY',
+
+  // Added 2026-06-16 from dac-aws-to-2ndgen-entities.json (node types derived
+  // from dacResourceType) for dashboard-referenced services the metric probe
+  // didn't see. Each node type was tenant-validated via `smartscapeNodes <T>`
+  // (all returned nodes on nic55601). Keyed by every metric-key segment shape
+  // that appears in the corpus (e.g. both `apigateway` and `api_gateway`).
+  amazonmwaa: 'AWS_MWAA_ENVIRONMENT',
+  apigateway: 'AWS_APIGATEWAY_RESTAPI',
+  api_gateway: 'AWS_APIGATEWAY_RESTAPI',
+  appsync: 'AWS_APPSYNC_GRAPHQLAPI',
+  athena: 'AWS_ATHENA_WORKGROUP',
+  aurora: 'AWS_RDS_DBCLUSTER',
+  elasticmapreduce: 'AWS_EMR_CLUSTER',
+  emr: 'AWS_EMR_CLUSTER',
+  eventbridge: 'AWS_EVENTS_EVENTBUS',
+  events: 'AWS_EVENTS_EVENTBUS',
+  fsx: 'AWS_FSX_FILESYSTEM',
+  kinesisanalytics: 'AWS_KINESISANALYTICSV2_APPLICATION',
+  kinesis_data_firehose: 'AWS_KINESISFIREHOSE_DELIVERYSTREAM',
+  kinesis_data_streams: 'AWS_KINESIS_STREAM',
+  mwaa: 'AWS_MWAA_ENVIRONMENT',
 };
 
 /**
@@ -74,6 +95,12 @@ export const MULTI_NODE_SERVICES: Record<string, string[]> = {
   docdb: ['AWS_DOCDB_DBCLUSTER', 'AWS_DOCDB_DBINSTANCE'],
   neptune: ['AWS_NEPTUNE_DBCLUSTER', 'AWS_NEPTUNE_DBINSTANCE'],
   rds: ['AWS_RDS_DBINSTANCE', 'AWS_RDS_DBCLUSTER'],
+  // The DAC entities JSON lists >1 resource type for these; default above is the
+  // grain we picked (empirical for ecs/elasticache, first-listed otherwise).
+  ecs: ['AWS_ECS_CLUSTER', 'AWS_ECS_SERVICE'],
+  route53: ['AWS_ROUTE53_HEALTHCHECK', 'AWS_ROUTE53_HOSTEDZONE'],
+  elasticache: ['AWS_ELASTICACHE_CACHECLUSTER', 'AWS_ELASTICACHE_SERVERLESSCACHE'],
+  aurora: ['AWS_RDS_DBCLUSTER', 'AWS_RDS_DBINSTANCE'],
 };
 
 /**

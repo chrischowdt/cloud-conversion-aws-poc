@@ -324,9 +324,10 @@ describe('rewriteDql — fetch restructure (Situation 3)', () => {
 
   it('flags custom_device fetch when the entity.type service has no node type', () => {
     const idx = buildIndex([]);
-    // cloud:aws:athena is genuinely not in the bridge (no live metrics / not planned).
+    // cloud:aws:elb (classic ELBv1) has no new-connection equivalent per the
+    // DAC entities reference — a stable "genuinely unmapped" example.
     const r = rewriteDql(
-      'fetch dt.entity.custom_device | filter entity.type == "cloud:aws:athena"',
+      'fetch dt.entity.custom_device | filter entity.type == "cloud:aws:elb"',
       idx
     );
     // Unresolvable → left for the downstream not-planned warning.
@@ -625,11 +626,12 @@ describe('rewriteDql — credential-lookup-chain (Pass 0.5)', () => {
 
   it('leaves the chain (bails) when the metric service has no node-type mapping', () => {
     const idx = buildIndex([]);
-    // cloud.aws.athena.* is genuinely not in the bridge (no live metrics / not planned).
-    const athena = canonical
-      .replace(/dynamodb/g, 'athena')
-      .replace(/successful_request_latency_by_operation/g, 'query_execution_time');
-    const r = rewriteDql(athena, idx);
+    // cloud.aws.elb.* (classic ELBv1) has no new-connection equivalent per the
+    // DAC entities reference — a stable "genuinely unmapped" example.
+    const elb = canonical
+      .replace(/dynamodb/g, 'elb')
+      .replace(/successful_request_latency_by_operation/g, 'latency');
+    const r = rewriteDql(elb, idx);
     // Not converted → still has the classic custom_device lookup → bails.
     assert.match(r.rewritten, /lookup \[fetch dt\.entity\.custom_device/);
     assert.ok(r.warnings.some((w) => /no Smartscape node type is mapped for it/.test(w.text)));
