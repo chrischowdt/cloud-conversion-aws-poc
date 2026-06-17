@@ -25,7 +25,7 @@ import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-import { rewriteDql, type Transform, type Warning } from '../lib/dql-rewriter.ts';
+import { rewriteDql, isBlockingWarning, type Transform, type Warning } from '../lib/dql-rewriter.ts';
 import {
   OUT_DIR,
   REPO_ROOT,
@@ -110,6 +110,15 @@ interface SummaryReport {
     rewrittenQueries: number;
     cleanQueries: number;
     flaggedQueries: number;
+    // Reframed success buckets (every query lands in exactly one):
+    //   convertedClean = transform, no warnings (== cleanQueries)
+    //   convertedSoft  = warnings, but none blocking (working DQL + verify-me)
+    //   blocked        = ≥1 blocking warning (no new equivalent / needs manual)
+    //   noopQueries    = no transform and no warnings (already new-form / non-DQL)
+    // "converted" = convertedClean + convertedSoft.
+    convertedSoft: number;
+    blocked: number;
+    noopQueries: number;
   };
   transformKindCounts: Record<string, number>;
   warningKindCounts: Record<string, number>;
@@ -228,6 +237,9 @@ export async function runScanDashboards(args: ScanDashboardsArgs): Promise<void>
       rewrittenQueries: 0,
       cleanQueries: 0,
       flaggedQueries: 0,
+      convertedSoft: 0,
+      blocked: 0,
+      noopQueries: 0,
     },
     transformKindCounts: {},
     warningKindCounts: {},
@@ -317,6 +329,11 @@ export async function runScanDashboards(args: ScanDashboardsArgs): Promise<void>
           perDash.flaggedCount++;
           summary.totals.flaggedQueries++;
         }
+        // Reframed buckets (exactly one): blocked > soft-converted > clean > no-op.
+        const hasBlocking = r.warnings.some((w) => isBlockingWarning(w.kind));
+        if (hasBlocking) summary.totals.blocked++;
+        else if (wCount > 0) summary.totals.convertedSoft++;
+        else if (tCount === 0) summary.totals.noopQueries++;
         const tKinds = new Set<string>();
         for (const t of r.transforms) {
           bump(perDash.transforms, t.kind);
@@ -377,8 +394,16 @@ export async function runScanDashboards(args: ScanDashboardsArgs): Promise<void>
   console.log(`  Parse errors:    ${summary.totals.parseErrors}`);
   console.log(`Queries seen:      ${summary.totals.queries}`);
   console.log(`  Rewritten (≥1 transform): ${summary.totals.rewrittenQueries}`);
-  console.log(`  Clean (≥1 transform, 0 warnings): ${summary.totals.cleanQueries}`);
-  console.log(`  Flagged (≥1 warning):     ${summary.totals.flaggedQueries}`);
+  const qN = summary.totals.queries || 1;
+  const qpct = (n: number) => `${((100 * n) / qN).toFixed(1)}%`;
+  const converted = summary.totals.cleanQueries + summary.totals.convertedSoft;
+  console.log('');
+  console.log('Conversion outcome (every query in exactly one bucket):');
+  console.log(`  CONVERTED:                    ${converted} (${qpct(converted)})`);
+  console.log(`    · clean (0 warnings):       ${summary.totals.cleanQueries} (${qpct(summary.totals.cleanQueries)})`);
+  console.log(`    · converted + verify caveat:${summary.totals.convertedSoft} (${qpct(summary.totals.convertedSoft)})`);
+  console.log(`  BLOCKED (no equiv / manual):  ${summary.totals.blocked} (${qpct(summary.totals.blocked)})`);
+  console.log(`  No-op (already new / non-DQL):${summary.totals.noopQueries} (${qpct(summary.totals.noopQueries)})`);
   console.log('');
   console.log('Top transform kinds:');
   for (const [k, v] of Object.entries(summary.transformKindCounts).sort((a, b) => b[1] - a[1])) {

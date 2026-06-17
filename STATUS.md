@@ -58,27 +58,29 @@ but are out of scope until AWS auto-conversion is much higher.
    returns `both-empty` for everything. Offline commands (`scan-dashboards`) are
    unaffected.
 
-## Current auto-conversion rate (tenant nic55601)
+## Current conversion rate (tenant nic55601, 518 AWS dashboards / 11,561 panels)
 
-Source: full offline scan of 518 AWS dashboards / 11,561 panels
-(`tools/out/nic55601/dashboard-scan/summary.json`), joined with 90-day audit
-access data (the `fetch dt.system.events … event.type=="GET"` query, saved at
-`tools/out/nic55601/dashboard-usage.dql`).
+`scan-dashboards` now reports a **reframed scoreboard** (every query in exactly
+one bucket) — `clean (0 warnings)` alone badly undercounted, because it lumped
+"can't convert" with "converted, just verify-flagged". As of 2026-06-16:
 
-| Slice | Clean (real Smartscape conversion) | Notes |
-|---|---|---|
-| All 518 AWS dashboards | **20.7%** of panels (2,392 / 11,561) | — |
-| Dashboards accessed ≤90d (184 of 517) | **19.3%** of panels | 333 dashboards are dormant (zero opens in 90d) |
-| Accessed ≤7d (most active 40) | **23.7%** of panels | active dashboards skew slightly easier |
-| **View-weighted (by access count)** | **29.0%** of panel-views | most user-experience-honest number |
+| Bucket | share | meaning |
+|---|---:|---|
+| **CONVERTED** (produces working DQL) | **52.9%** | clean **21.0%** + converted-with-verify-caveat **31.9%** |
+| BLOCKED (no equiv / needs manual) | 27.8% | sole blockers: unmapped-entity-type 14.7%, unknown-metric 4.5%, metric-streams 2.1%, relationship/selector ~2% |
+| No-op (already new-form / non-DQL) | 19.3% | — |
 
-Beyond the clean rate: ~53% of panels translate *with warnings* (partial,
-needs human review), ~10% bail out / unknown-metric (classic passthrough —
-the danger zone at EOL), ~18% are no-ops (already new-form or non-DQL).
+**Headline: ~53% of AWS panels auto-convert to working DQL** (21% with zero
+caveats; +32% that run but carry a verify-me flag — mostly `mapped-no-recipe`
+scale, credential breadth, multi-node grain). The old "~21% clean" was the
+no-caveat subset only. Caveat on the 32%: solid for gauge metrics; rate/counter
+`mapped-no-recipe` may carry a wrong *scale* (Lever 2, settled-unverifiable from
+metadata). Classification source of truth: `BLOCKING_WARNING_KINDS` in
+`dql-rewriter.ts`.
 
-**Headline:** ~1 in 5 AWS panels (≈29% by views) auto-converts cleanly today.
-**Biggest single insight from access data:** ~64% of scanned AWS dashboards
-have zero user opens in 90 days — likely droppable from the migration target list.
+**Access-data insight (still valid):** ~64% of scanned AWS dashboards have zero
+user opens in 90 days — likely droppable from the migration target list, which
+would lift the effective rate further.
 
 ## Since last update (2026-06-11, not yet committed)
 

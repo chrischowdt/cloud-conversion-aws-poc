@@ -69,6 +69,29 @@ export interface Warning {
   match?: string;
 }
 
+/**
+ * Warning kinds that mean "couldn't produce correct DQL" — the panel has no
+ * new-connection equivalent or needs manual work. Every OTHER warning kind is
+ * an advisory/verify-me caveat on output that DOES run (the conversion
+ * happened: metric swapped, entity disambiguated, account joined, recipe
+ * applied). scan-dashboards uses this to report `converted (clean + soft)` vs
+ * `blocked` instead of conflating both under "not clean".
+ */
+export const BLOCKING_WARNING_KINDS: ReadonlySet<Warning['kind']> = new Set([
+  'unmapped-entity-type',
+  'unknown-metric',
+  'metric-streams-blocked',
+  'composite-formula-needed',
+  'classic-entity-selector',
+  'entity-relationship-traversal',
+  'classic-id-literal',
+]);
+
+/** True when a warning means the query can't be auto-converted (vs a verify-me caveat). */
+export function isBlockingWarning(kind: Warning['kind']): boolean {
+  return BLOCKING_WARNING_KINDS.has(kind);
+}
+
 export interface RewriteResult {
   original: string;
   rewritten: string;

@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { rewriteDql } from './dql-rewriter.ts';
+import { rewriteDql, isBlockingWarning } from './dql-rewriter.ts';
 import type {
   CompositeFormula,
   DetectedRecipe,
@@ -1102,5 +1102,18 @@ describe('rewriteDql — AWS Metric Streams keys (migration-blocked)', () => {
     const r = rewriteDql('timeseries avg(cloud.aws.foo.some_unmapped_metric_sum)', idx);
     assert.ok(r.warnings.some((x) => x.kind === 'unknown-metric'));
     assert.ok(!r.warnings.some((x) => x.kind === 'metric-streams-blocked'));
+  });
+});
+
+describe('isBlockingWarning classification', () => {
+  it('marks no-equivalent / manual-required kinds as blocking', () => {
+    for (const k of ['unmapped-entity-type','unknown-metric','metric-streams-blocked','composite-formula-needed','classic-entity-selector','entity-relationship-traversal','classic-id-literal'] as const) {
+      assert.equal(isBlockingWarning(k), true, k);
+    }
+  });
+  it('marks verify-me caveats on converted output as non-blocking', () => {
+    for (const k of ['mapped-no-recipe','recipe-aggregation-mismatch','verdict-not-exact','dim-variant-override','custom-device-disambiguated','credential-collapsed','end-of-life-service'] as const) {
+      assert.equal(isBlockingWarning(k), false, k);
+    }
   });
 });
