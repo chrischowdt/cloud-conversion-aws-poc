@@ -13,6 +13,7 @@ import { readFile } from 'node:fs/promises';
 
 import { loadDacIndex, lookupInDac, type DacIndex } from './dac-lookup.ts';
 import {
+  classicSnakeCandidates,
   loadExtraMappings,
   lookupInExtraWithNormalization,
   serviceFromNewKey,
@@ -223,7 +224,11 @@ function applyDimOverride(index: RecipeIndex, synthetic: MappingEntry): DimOverr
  * Tiers 2 and 3 return synthetic `mapped-no-recipe` entries (no aggregation/
  * scale recipe, user's original aggregation preserved, warning surfaced).
  */
-export function lookupClassicKey(index: RecipeIndex, classicMetricId: string): LookupResult {
+export function lookupClassicKey(
+  index: RecipeIndex,
+  classicMetricId: string,
+  tryNormalization = true
+): LookupResult {
   let entry = index.byClassicId.get(classicMetricId);
   if (!entry) entry = index.byDqlClassicKey.get(classicMetricId);
   if (entry) {
@@ -275,6 +280,25 @@ export function lookupClassicKey(index: RecipeIndex, classicMetricId: string): L
       };
       const dimOverride = applyDimOverride(index, synthetic);
       return { kind: 'mapped-no-recipe', entry: synthetic, dimOverride };
+    }
+  }
+
+  // Tier 4 — snake-shape normalization retry. Classic DQL snake keys
+  // (`cloud.aws.<svc>.<metric>_<stat>_by_<dims>`) are stored in the maps under a
+  // CloudWatch-derived bare-snake (DAC) or per-key flattened `ext:` shape. Strip
+  // the statistic infix + `_by_<dims>` and flatten, then retry the tiers above.
+  // `tryNormalization` guards the recursion to one level.
+  if (tryNormalization) {
+    for (const cand of classicSnakeCandidates(classicMetricId)) {
+      const r = lookupClassicKey(index, cand, false);
+      if (r.kind === 'mapped-no-recipe') {
+        // Synthetic entries are freshly built, so annotating is safe.
+        r.entry.notes =
+          (r.entry.notes ? r.entry.notes + ' ' : '') +
+          `(matched after normalizing "${classicMetricId}" → "${cand}"; verify it's the same metric.)`;
+        return r;
+      }
+      if (r.kind !== 'unknown') return r;
     }
   }
   return { kind: 'unknown' };

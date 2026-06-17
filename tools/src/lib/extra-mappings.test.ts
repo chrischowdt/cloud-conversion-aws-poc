@@ -4,7 +4,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { loadExtraMappings, lookupInExtra, serviceFromNewKey } from './extra-mappings.ts';
+import { classicSnakeCandidates, loadExtraMappings, lookupInExtra, serviceFromNewKey } from './extra-mappings.ts';
 
 async function writeFixture(name: string, contents: unknown): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'extra-mappings-'));
@@ -206,5 +206,25 @@ describe('serviceFromNewKey', () => {
 
   it('falls back to "aws" when the shape is unrecognized', () => {
     assert.equal(serviceFromNewKey('some.weird.key'), 'aws');
+  });
+});
+
+describe('classicSnakeCandidates', () => {
+  it('strips the statistic infix + _by_ dims and flattens for the per-key map', () => {
+    const c = classicSnakeCandidates('cloud.aws.containerinsights.pending_task_count_sum_by_service_name');
+    // DAC bare-snake (CloudWatch-derived) base
+    assert.ok(c.includes('cloud.aws.containerinsights.pending_task_count'));
+    // per-key flattened form
+    assert.ok(c.includes('ext:cloud.aws.containerinsights.pendingtaskcountbyservicename'));
+  });
+
+  it('removes the service-segment underscore for the per-key form (api_gateway → apigateway)', () => {
+    const c = classicSnakeCandidates('cloud.aws.api_gateway.count_sum_by_stage_resource_method');
+    assert.ok(c.some((x) => x.startsWith('ext:cloud.aws.apigateway.')));
+  });
+
+  it('returns nothing for already-camelCase / new-form keys (no underscore)', () => {
+    assert.deepEqual(classicSnakeCandidates('cloud.aws.lambda.Invocations.By.FunctionName'), []);
+    assert.deepEqual(classicSnakeCandidates('ext:cloud.aws.sqs.approximateAgeOfOldestMessage'), []);
   });
 });

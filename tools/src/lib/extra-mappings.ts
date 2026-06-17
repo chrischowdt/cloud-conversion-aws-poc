@@ -252,6 +252,37 @@ export function lookupInExtraWithNormalization(
 }
 
 /**
+ * Snake-shape normalization candidates for a classic DQL metric key the regular
+ * chain leaves unresolved. Classic dashboards write keys like
+ * `cloud.aws.containerinsights.pending_task_count_sum_by_service_name`, but the
+ * maps store them either as a CloudWatch-derived bare-snake DAC key
+ * (`cloud.aws.containerinsights.pending_task_count`) or the per-key map's
+ * flattened `ext:` form (`ext:cloud.aws.containerinsights.pendingtaskcountbyservicename`).
+ * We can't tell which form a given key uses, so we generate both, with the
+ * classic statistic infix (`_sum`/`_average`/…) stripped and progressively the
+ * `_by_<dims>` suffix stripped, and let the caller try each through the tiers.
+ * Calibrated on nic55601: resolves ~55% of the residual unknown-metric panels.
+ */
+export function classicSnakeCandidates(key: string): string[] {
+  const m = /^(?:ext:|builtin:|dt\.)?(cloud\.aws\.)([a-z0-9_]+)\.(.+)$/i.exec(key);
+  if (!m) return [];
+  const svc = m[2]!.toLowerCase();
+  const seg = m[3]!.toLowerCase();
+  if (!seg.includes('_')) return []; // camelCase/new shapes are handled elsewhere
+  const STAT = /_(sum|average|avg|maximum|max|minimum|min|samplecount)(?=_by_|$)/;
+  const noStat = seg.replace(STAT, '');
+  const noDim = noStat.replace(/_by_.*$/, '');
+  const out = new Set<string>();
+  for (const s of [seg, noStat, noDim]) {
+    out.add(`cloud.aws.${svc}.${s}`); // DAC bare-snake (CloudWatch-derived)
+    out.add(`ext:cloud.aws.${svc.replace(/_/g, '')}.${s.replace(/_/g, '')}`); // per-key flatten (svc+metric)
+    out.add(`ext:cloud.aws.${svc}.${s.replace(/_/g, '')}`); // per-key flatten (metric only)
+  }
+  out.delete(key);
+  return [...out];
+}
+
+/**
  * Derive a human-readable service name from a new-form key
  * (`cloud.aws.<service>.<MetricName>.By.<Dims>` → `<service>`). Used to
  * populate the synthetic `MappingEntry.service` field when surfacing extra
