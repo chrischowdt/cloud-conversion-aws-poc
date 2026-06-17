@@ -59,6 +59,7 @@ export interface Warning {
     | 'verdict-not-exact'
     | 'dim-variant-override'
     | 'custom-device-disambiguated'
+    | 'credential-collapsed'
     | 'end-of-life-service';
   text: string;
   /** Pointer to the relevant dt-migration reference (if any). */
@@ -227,6 +228,12 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // Smartscape node type. If the idiom isn't present or the service can't be
   // resolved, this is a no-op and the bailout below still fires.
   input = rewriteCredentialLookupChain(input, transforms, warnings);
+
+  // Pass 0.6: the fieldsAdd-form of the same credential→account resolution
+  // (`entityAttr(custom_device,"accessible_by")[aws_credentials]` →
+  // `entityName(...)`). Collapsed to the same resource→AWS_ACCOUNT join, since
+  // there's no resource→AWS_ACCOUNT edge to traverse.
+  input = rewriteCredentialFieldsAdd(input, transforms, warnings);
 
   // Pre-pass: bail out if the query contains a `lookup [fetch
   // dt.entity.<not-planned-type>]` chain (e.g. `custom_device`,
@@ -971,12 +978,67 @@ function rewriteCredentialLookupChain(
     detail: `credential-lookup chain collapsed; custom_device disambiguated to ${nodeType} via metric service "${service}"`,
   });
   warnings.push({
-    kind: 'unmapped-entity-type',
+    kind: 'credential-collapsed',
     text:
       `Collapsed a classic credential (connection) lookup to an AWS_ACCOUNT join. A single AWS ` +
       `account can have multiple classic credentials, but Smartscape has one AWS_ACCOUNT node per ` +
       `account — so the rewritten \`account.name == "…"\` filter is BROADER than the classic ` +
       `single-credential filter. Verify intent for multi-credential accounts.`,
+    reference: SKILL_REFS.specialCases,
+  });
+  return out;
+}
+
+// Pass 0.6 — the fieldsAdd-form of the same credential→account resolution. The
+// canonical 2-line idiom (2,587 panels) reads the account name by traversing
+// the classic `accessible_by` relationship to the credential entity:
+//   | fieldsAdd dt.entity.aws_credentials = entityAttr(dt.entity.custom_device, "accessible_by")[dt.entity.aws_credentials][0]
+//   | fieldsAdd <acct> = lower(entityName(dt.entity.aws_credentials))
+// There is NO resource→AWS_ACCOUNT edge in Smartscape (a `getNodeField(x,
+// "accessible_by")[…]` traversal silently returns empty). The account is a
+// denormalized field — so resolve it the same way Pass 0.5 does: join the
+// resource node for its `aws.account.id`, then join AWS_ACCOUNT for the name.
+const CREDENTIAL_FIELDSADD_RE =
+  /\|\s*fieldsAdd\s+dt\.entity\.aws_credentials\s*=\s*entityAttr\(\s*dt\.entity\.custom_device\s*,\s*"accessible_by"\)\s*\[\s*dt\.entity\.aws_credentials\s*\]\s*\[\s*0\s*\]\s*\r?\n\s*\|\s*fieldsAdd\s+(\w+)\s*=\s*(lower\(\s*)?entityName\(\s*dt\.entity\.aws_credentials\s*\)\s*(\))?/g;
+
+function rewriteCredentialFieldsAdd(
+  input: string,
+  transforms: Transform[],
+  warnings: Warning[]
+): string {
+  CREDENTIAL_FIELDSADD_RE.lastIndex = 0;
+  if (!CREDENTIAL_FIELDSADD_RE.test(input)) return input;
+  const service = serviceFromClassicKeyInQuery(input);
+  const nodeType = service ? nodeTypeForMetricService(service) : undefined;
+  if (!service || !nodeType) return input; // unresolved → leave for generic passes
+  const dim = smartscapeDimForNodeType(nodeType);
+
+  CREDENTIAL_FIELDSADD_RE.lastIndex = 0;
+  let out = input.replace(
+    CREDENTIAL_FIELDSADD_RE,
+    (_full, acctVar: string, lowerOpen: string | undefined, lowerClose: string | undefined) =>
+      `| lookup [smartscapeNodes ${nodeType} | fields name, id, aws.account.id], ` +
+      `sourceField:${dim}, lookupField:id, prefix:"device."\n` +
+      `| lookup [smartscapeNodes AWS_ACCOUNT | fields name, aws.account.id], ` +
+      `sourceField:device.aws.account.id, lookupField:aws.account.id, prefix:"account."\n` +
+      `| fieldsAdd ${acctVar} = ${lowerOpen ?? ''}account.name${lowerClose ?? ''}`
+  );
+  // Align remaining custom_device refs (by-clause, entityAttr(…,"arn"), etc.).
+  out = out.replace(/`?dt\.entity\.custom_device`?/g, dim);
+
+  transforms.push({
+    kind: 'entity-dim',
+    before: 'fieldsAdd dt.entity.aws_credentials = entityAttr(custom_device,"accessible_by")[…] → entityName(…)',
+    after: `lookup [smartscapeNodes ${nodeType} … aws.account.id] → lookup [smartscapeNodes AWS_ACCOUNT …] → account.name`,
+    detail: `credential field-read collapsed; custom_device disambiguated to ${nodeType} via metric service "${service}"`,
+  });
+  warnings.push({
+    kind: 'credential-collapsed',
+    text:
+      `Collapsed a classic credential (connection) field-read to an AWS_ACCOUNT join. A single AWS ` +
+      `account can have multiple classic credentials, but Smartscape has one AWS_ACCOUNT node per ` +
+      `account — so any \`account.name\`-based filter is BROADER than the classic single-credential ` +
+      `one. Verify intent for multi-credential accounts.`,
     reference: SKILL_REFS.specialCases,
   });
   return out;
