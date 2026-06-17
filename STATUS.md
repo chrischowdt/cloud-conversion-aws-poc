@@ -29,8 +29,19 @@ general `dt-migration/` (classic→Grail entities/DQL/tags) and `dt-dql-essentia
   `migration-blocked (Metric Streams)`, not a closeable gap.
 
 **Actionable backlog from the KB (prioritized, not yet done):**
-1. Fix `entityAttr(x,"tags")` → `getNodeField(x,"tags:aws")[key]=="val"` + unwrap
-   `in(…,"[AWS]k:v")` (current generic rename emits invalid DQL for tag filters).
+1. **Tag value-extraction idiom (NOT a syntax bug — corrected 2026-06-16).**
+   `getNodeField(x,"tags")` is *valid* (probe-verified: returns a tags record like
+   `{ApplicationCI:"cvg",env:"dev",…}`), so our generic `entityAttr→getNodeField`
+   isn't wrong DQL — there are several valid ways to reach tags. The real gap: the
+   dominant classic idiom (**5,085 panels, all `dt.entity.custom_device`** — the
+   Lever-1 family) extracts a value via
+   `splitString(toString(entityAttr(x,"tags")), "[AWS]<Key>:")`. That silently
+   returns **empty** against the new model, because the new tags is a RECORD, not
+   the classic `[AWS]key:val` string, so `toString`+`splitString` finds nothing.
+   Fix = translate the whole extraction to a direct record read
+   `getNodeField(x,"tags:aws")[<Key>]` (KB-recommended, simpler) or the enriched
+   `aws.tags.<key>` dim where present. High value, and couples with the Lever-1
+   custom_device disambiguation (same panels).
 2. Expand `aws-service-node-types.ts` from `dac-aws-to-2ndgen-entities.json` (75 vs
    our 40: emr, fsx, events, athena, appsync, sagemaker, cassandra, …); add ecs/
    route53/cassandra/elasticache to `MULTI_NODE_SERVICES`. **Keep empirical overrides**
