@@ -205,15 +205,15 @@ describe('rewriteDql — flags constructs needing manual migration', () => {
     assert.doesNotMatch(r.rewritten, /entityName/);
   });
 
-  it('translates entityAttr(x, "f") to getNodeField(x, "f")', () => {
+  it('translates entityAttr(x, "f") to getNodeField(x, "f") for a generic field', () => {
     const idx = buildIndex([]);
     const r = rewriteDql(
-      'fields tags = entityAttr(dt.entity.aws_lambda_function, "tags")',
+      'fields nm = entityAttr(dt.entity.aws_lambda_function, "detected_name")',
       idx
     );
     assert.match(
       r.rewritten,
-      /getNodeField\(dt\.smartscape\.aws_lambda_function, "tags"\)/
+      /getNodeField\(dt\.smartscape\.aws_lambda_function, "detected_name"\)/
     );
     assert.doesNotMatch(r.rewritten, /entityAttr/);
   });
@@ -996,5 +996,60 @@ describe('rewriteDql — end-to-end', () => {
       r.rewritten,
       /getNodeField\(dt\.smartscape\.aws_ec2_instance, "aws\.region"\) == "us-east-1"/
     );
+  });
+});
+
+describe('rewriteDql — AWS tag value-extraction idiom (Pass 2.5 tags + 2.55)', () => {
+  it('maps entityAttr(x, "tags") to the provider-namespaced getNodeField(x, "tags:aws")', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'fetch dt.smartscape.aws_lambda_function | fieldsAdd t = entityAttr(dt.smartscape.aws_lambda_function, "tags")',
+      idx
+    );
+    assert.match(r.rewritten, /getNodeField\(dt\.smartscape\.aws_lambda_function, "tags:aws"\)/);
+    assert.doesNotMatch(r.rewritten, /entityAttr/);
+  });
+
+  it('collapses the splitString(toString(tags), "[AWS]Key:") idiom to a record read tags[Key]', () => {
+    const idx = buildIndex([]);
+    const input = 'fieldsAdd appci = splitString(splitString(toString(tags), "[AWS]ApplicationCI:")[1], "\\"")[0]';
+    const r = rewriteDql(input, idx);
+    assert.match(r.rewritten, /appci = tags\[ApplicationCI\]/);
+    assert.doesNotMatch(r.rewritten, /splitString/);
+  });
+
+  it('end-to-end: a custom_device tag-extraction panel becomes node + tags:aws record reads', () => {
+    const idx = buildIndex([]);
+    const input =
+      'timeseries avg(cloud.aws.lambda.invocations_sum), by:{dt.entity.custom_device}\n' +
+      '| fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")\n' +
+      '| fieldsAdd appci = splitString(splitString(toString(tags), "[AWS]ApplicationCI:")[1], "\\"")[0]\n' +
+      '| fieldsAdd subci = splitString(splitString(toString(tags), "[AWS]subapplicationci:")[1], "\\"")[0]';
+    const r = rewriteDql(input, idx);
+    // entity disambiguated, tags record sourced from tags:aws, values read by key
+    assert.match(r.rewritten, /by:\{dt\.smartscape\.aws_lambda_function\}/);
+    assert.match(r.rewritten, /tags = getNodeField\(dt\.smartscape\.aws_lambda_function, "tags:aws"\)/);
+    assert.match(r.rewritten, /appci = tags\[ApplicationCI\]/);
+    assert.match(r.rewritten, /subci = tags\[subapplicationci\]/);
+    assert.doesNotMatch(r.rewritten, /splitString|entityAttr|toString\(tags\)/);
+  });
+});
+
+describe('rewriteDql — tag value-extraction idiom variants (Pass 2.55)', () => {
+  it('handles a bare "<Key>:" delimiter (no [AWS] prefix)', () => {
+    const idx = buildIndex([]);
+    const input = 'fieldsAdd loc = splitString(splitString(toString(tags), "location:")[1], "\\"")[0]';
+    const r = rewriteDql(input, idx);
+    assert.match(r.rewritten, /loc = tags\[location\]/);
+    assert.doesNotMatch(r.rewritten, /splitString/);
+  });
+
+  it('handles an inline getNodeField(...) as the toString arg', () => {
+    const idx = buildIndex([]);
+    const input =
+      'fieldsAdd reg = splitString(splitString(toString(getNodeField(dt.smartscape.aws_ec2_instance, "tags:aws")), "Region:")[1], "\\"")[0]';
+    const r = rewriteDql(input, idx);
+    assert.match(r.rewritten, /reg = getNodeField\(dt\.smartscape\.aws_ec2_instance, "tags:aws"\)\[Region\]/);
+    assert.doesNotMatch(r.rewritten, /splitString/);
   });
 });

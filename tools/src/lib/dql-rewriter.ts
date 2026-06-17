@@ -555,6 +555,10 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // Runs AFTER the dt.entity.* dim swap so x is already in smartscape form.
   rewritten = rewriteEntityNameAttr(rewritten, transforms);
 
+  // Pass 2.55: collapse the classic `splitString(toString(<tags>), "[AWS]Key:")…`
+  // value-extraction idiom to a direct record read `<tags>[Key]` (tags:aws).
+  rewritten = rewriteTagExtraction(rewritten, transforms);
+
   // Pass 2.6: when we rewrote `fetch dt.entity.X` to `smartscapeNodes`,
   // any `entity.name` field reference inside should become bare `name`.
   if (fetchContext.didRewriteFetch) {
@@ -1340,13 +1344,17 @@ function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
   let rewritten = input.replace(
     /\bentityAttr\(\s*([^,)]+?)\s*,\s*("[^"]+")\s*\)/g,
     (full, arg: string, field: string) => {
-      transforms.push({
-        kind: 'entity-dim',
-        before: full,
-        after: `getNodeField(${arg}, ${field})`,
-        detail: 'entityAttr(x, "f") → getNodeField(x, "f")',
-      });
-      return `getNodeField(${arg}, ${field})`;
+      // Classic "tags" maps to the provider-namespaced "tags:aws" record on the
+      // new side (verified on tenant — getNodeField(x,"tags") also returns a
+      // record, but "tags:aws" is the AWS-scoped, KB-recommended form, and is
+      // what Pass 2.55 reads by key). Other fields pass through unchanged.
+      const newField = field === '"tags"' ? '"tags:aws"' : field;
+      const detail =
+        field === '"tags"'
+          ? 'entityAttr(x, "tags") → getNodeField(x, "tags:aws") (AWS tag record)'
+          : 'entityAttr(x, "f") → getNodeField(x, "f")';
+      transforms.push({ kind: 'entity-dim', before: full, after: `getNodeField(${arg}, ${newField})`, detail });
+      return `getNodeField(${arg}, ${newField})`;
     }
   );
 
@@ -1365,4 +1373,31 @@ function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
   );
 
   return rewritten;
+}
+
+// ─── Pass 2.55: classic tag value-extraction idiom → direct record read ───
+//
+// The dominant classic AWS tag-read idiom string-parses the serialized tags to
+// pull one tag's value:
+//   splitString(splitString(toString(<src>), "[AWS]<Key>:")[1], "\"")[0]
+// where <src> holds the tags — either a fieldsAdd var or, after Pass 2.5, an
+// inline getNodeField(x,"tags:aws") (a RECORD). The `[AWS]` prefix is optional
+// (some dashboards split on a bare "<Key>:"). The string-parse silently yields
+// empty against the new record shape, so collapse the whole expression to a
+// direct key read: <src>[<Key>]. Case is preserved from the classic key, which
+// matches the AWS tag key on the record.
+const TAG_EXTRACT_RE =
+  /splitString\(\s*splitString\(\s*toString\(\s*((?:[A-Za-z_]\w*)|(?:getNodeField\([^)]*\)))\s*\)\s*,\s*"(?:\[AWS\])?([^:"\]]+):"\s*\)\s*\[\s*1\s*\]\s*,\s*"\\?""\s*\)\s*\[\s*0\s*\]/g;
+
+function rewriteTagExtraction(input: string, transforms: Transform[]): string {
+  return input.replace(TAG_EXTRACT_RE, (full, varName: string, key: string) => {
+    const repl = `${varName}[${key}]`;
+    transforms.push({
+      kind: 'entity-dim',
+      before: full,
+      after: repl,
+      detail: `classic tag string-parse → record read ${repl} (tags:aws by key)`,
+    });
+    return repl;
+  });
 }
