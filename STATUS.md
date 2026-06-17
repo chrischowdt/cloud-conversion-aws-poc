@@ -28,28 +28,16 @@ general `dt-migration/` (classic→Grail entities/DQL/tags) and `dt-dql-essentia
 - **Metric Streams keys (camelCase `…By<Dims>`) are unmappable by design** — flag
   `migration-blocked (Metric Streams)`, not a closeable gap.
 
-**Actionable backlog from the KB (prioritized, not yet done):**
-1. **Tag value-extraction idiom (NOT a syntax bug — corrected 2026-06-16).**
-   `getNodeField(x,"tags")` is *valid* (probe-verified: returns a tags record like
-   `{ApplicationCI:"cvg",env:"dev",…}`), so our generic `entityAttr→getNodeField`
-   isn't wrong DQL — there are several valid ways to reach tags. The real gap: the
-   dominant classic idiom (**5,085 panels, all `dt.entity.custom_device`** — the
-   Lever-1 family) extracts a value via
-   `splitString(toString(entityAttr(x,"tags")), "[AWS]<Key>:")`. That silently
-   returns **empty** against the new model, because the new tags is a RECORD, not
-   the classic `[AWS]key:val` string, so `toString`+`splitString` finds nothing.
-   Fix = translate the whole extraction to a direct record read
-   `getNodeField(x,"tags:aws")[<Key>]` (KB-recommended, simpler) or the enriched
-   `aws.tags.<key>` dim where present. High value, and couples with the Lever-1
-   custom_device disambiguation (same panels).
-2. Expand `aws-service-node-types.ts` from `dac-aws-to-2ndgen-entities.json` (75 vs
-   our 40: emr, fsx, events, athena, appsync, sagemaker, cassandra, …); add ecs/
-   route53/cassandra/elasticache to `MULTI_NODE_SERVICES`. **Keep empirical overrides**
-   (es→OPENSEARCH, ecs→CLUSTER; docdb/neptune split is probe-only).
-3. Extend the credential rewrite to the `entityAttr(accessible_by)` form (field-read).
-4. Flag Metric Streams keys instead of leaving them unknown-metric.
-5. Optional: adopt `relationship-mappings.md` (150+ edges, static-vs-dynamic flag) to
-   widen `smartscape-edges.ts` + enable `traverse` for dynamic edges.
+**Implemented from the KB backlog (2026-06-16):**
+- **Tag value-extraction idiom** — Pass 2.5 maps `entityAttr(x,"tags")`→`getNodeField(x,"tags:aws")`; Pass 2.55 collapses `splitString(toString(<src>),"[AWS]?<Key>:")…`→`<src>[<Key>]`. 3,388/3,450 (98.2%) converted. (commit 7a23766)
+- **Service→node map expanded** 40→55 from `dac-aws-to-2ndgen-entities.json` (api_gateway, emr, athena, appsync, fsx, kinesis*, eventbridge, mwaa, aurora…); +ecs/route53/elasticache/aurora to MULTI_NODE_SERVICES; node types tenant-validated. Entity wall 22%→~18%. (8a64385)
+- **Credential/account field-read** (Pass 0.6) — the `entityAttr(custom_device,"accessible_by")[aws_credentials]`→`entityName(...)` idiom now collapses to the resource→`aws.account.id`→AWS_ACCOUNT join (no fake traversal). 2,645/3,040 (87%) converted. Also corrected a warning mislabel: the credential-collapse caveat was counted as `unmapped-entity-type` (inflated the wall); new kind `credential-collapsed`. Accurate scan now: clean 21.0%, wall (real not-planned) 17.7%, credential-collapsed 23.1%. (85c8b93)
+
+Tests 184→195. Clean rate held ~21% across all three — these are **correctness** wins (tag columns populate, account names resolve, DQL is valid) on the heavily-flagged custom_device family; clean doesn't move because those panels still carry `mapped-no-recipe` (Lever 2, settled-unverifiable) + the credential-breadth caveat.
+
+**Remaining KB backlog:**
+- Flag Metric Streams camelCase keys as `migration-blocked` instead of unknown-metric (they're unmappable by design — don't count them as a closeable gap).
+- Optional: adopt `relationship-mappings.md` (150+ edges, static-vs-dynamic flag) to widen `smartscape-edges.ts` + enable `traverse` for dynamic edges.
 
 ## Scope
 
