@@ -78,6 +78,30 @@ metrics; rate/counter `mapped-no-recipe` may carry a wrong *scale* (settled-
 unverifiable from metadata). Classification source of truth:
 `BLOCKING_WARNING_KINDS` in `dql-rewriter.ts`.
 
+**The 57.7% denominator includes ~20% non-AWS noise.** The corpus is "AWS
+*dashboards*", but individual panels often reference only K8s/APM/GCP/Azure/SQL
+entities — out of scope for an AWS-integration tool. Classifying each query by
+AWS-relevance (AWS marker in original *or* rewritten, or a classic AWS entity
+type like `ec2_instance`) and re-bucketing:
+
+| Denominator | queries | CONVERTED | BLOCKED | no-op |
+|---|---:|---:|---:|---:|
+| All queries (headline) | 11,561 | 57.7% | 23.0% | 19.3% |
+| **AWS-only** (pure non-AWS removed) | 9,243 | **72.1%** | 27.6% | 0.3% |
+| *removed: pure non-AWS* | 2,318 | 0.2% | 4.8% | **95.0%** |
+
+**The honest "how good are we at our actual job" number is ~72%, with a ceiling
+near ~81%.** The 19.3% no-op bucket was almost entirely non-AWS (2,202 / 2,231
+were already-new-form K8s/APM panels) — removing non-AWS deletes the no-ops, so
+AWS queries are nearly all *real* conversion attempts. Of the 2,548 AWS-blocked,
+**1,020 (40%) are *mixed*** (an AWS metric joined to a K8s/APM entity that is the
+actual blocker) — held back by their out-of-scope half, not by an AWS limitation;
+discount those and the pure-AWS rate is ~81.4%. The genuinely in-scope failures
+are **1,528 queries (~17% of AWS)**: `custom_device` lookup-chains
+(kafka/ecs/ec2), unknown AWS metrics, Metric Streams (unmappable by design),
+classic-id literals, and the credential `accessible_by` variant (the only one
+with tractable headroom left).
+
 **Carrier-table refresh (2026-06-17) — biggest single win this session.**
 `metric-dim-carriers.ts` lists which Smartscape types DON'T carry their own
 `dt.smartscape.<type>` dim on metric series. It was probed 2026-05-12 and had
