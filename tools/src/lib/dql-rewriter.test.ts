@@ -736,7 +736,7 @@ describe('rewriteDql — DAC fallback for keys missing from recipe mapping', () 
     };
     dac.set('ext:cloud.aws.lambda.invocationsSum', dacEntry);
     dac.set('cloud.aws.lambda.invocations_sum', dacEntry);
-    const idx = { ...baseIdx, dac: { byClassicKey: dac } };
+    const idx = { ...baseIdx, dac: { byClassicKey: dac, statisticByLiveBase: new Map() } };
 
     const r = rewriteDql('timeseries sum(cloud.aws.lambda.invocations_sum)', idx);
     assert.match(r.rewritten, /cloud\.aws\.lambda\.Invocations\.By\.FunctionName/);
@@ -758,11 +758,62 @@ describe('rewriteDql — DAC fallback for keys missing from recipe mapping', () 
       builtInMetricKey: 'not-matched',
       endOfLife: true,
     });
-    const idx = { ...baseIdx, dac: { byClassicKey: dac } };
+    const idx = { ...baseIdx, dac: { byClassicKey: dac, statisticByLiveBase: new Map() } };
 
     const r = rewriteDql('timeseries sum(ext:cloud.aws.opsworks.cpuIdleSum)', idx);
     // Pre-baked slug lookup already covers OpsWorks; either way an EOL warning fires.
     assert.ok(r.warnings.some((w) => w.kind === 'end-of-life-service'));
+  });
+
+  // The DAC encodes each new metric's CloudWatch statistic in secondGenMetricKey
+  // (e.g. `…invocationsSum` → Sum). A Sum metric aggregated with avg() under-
+  // reports — flag it (non-blocking; we can't auto-flip since some Sum-typed
+  // metrics are really gauges).
+  function lambdaInvocationsIdx() {
+    const dac = new Map();
+    const dacEntry = {
+      cloudwatchNamespace: 'AWS/Lambda', cloudwatchMetricName: 'Invocations',
+      cloudwatchDimensions: ['FunctionName'],
+      secondGenMetricKey: 'ext:cloud.aws.lambda.invocationsSum',
+      dacRecommendedMetricKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+      dacAutodiscoveredMetricKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+      builtInMetricKey: 'not-matched', endOfLife: false,
+    };
+    dac.set('dt.cloud.aws.lambda.invocations', dacEntry);
+    const statisticByLiveBase = new Map([['cloud.aws.lambda.invocations', 'Sum']]);
+    return { ...buildIndex([]), dac: { byClassicKey: dac, statisticByLiveBase } };
+  }
+
+  it('warns (non-blocking) when a Sum-statistic metric is aggregated with avg()', () => {
+    const r = rewriteDql('timeseries avg(dt.cloud.aws.lambda.invocations)', lambdaInvocationsIdx());
+    const w = r.warnings.find((x) => x.kind === 'aggregation-mismatch');
+    assert.ok(w, 'expected an aggregation-mismatch warning');
+    assert.match(w!.text, /Sum-statistic/);
+    assert.match(w!.text, /sum\(\)/);
+    // Must NOT count against the conversion rate — the DQL runs, it's a verify-me caveat.
+    assert.equal(isBlockingWarning('aggregation-mismatch'), false);
+  });
+
+  it('does NOT warn aggregation-mismatch when the metric is already summed', () => {
+    const r = rewriteDql('timeseries sum(dt.cloud.aws.lambda.invocations)', lambdaInvocationsIdx());
+    assert.ok(!r.warnings.some((x) => x.kind === 'aggregation-mismatch'));
+  });
+
+  it('does NOT warn aggregation-mismatch for a non-Sum (Average) statistic', () => {
+    const dac = new Map();
+    const dacEntry = {
+      cloudwatchNamespace: 'AWS/EC2', cloudwatchMetricName: 'CPUUtilization',
+      cloudwatchDimensions: ['InstanceId'],
+      secondGenMetricKey: 'ext:cloud.aws.ec2.cpuUtilizationAverage',
+      dacRecommendedMetricKey: 'cloud.aws.ec2.CPUUtilization.By.InstanceId',
+      dacAutodiscoveredMetricKey: 'cloud.aws.ec2.CPUUtilization.By.InstanceId',
+      builtInMetricKey: 'not-matched', endOfLife: false,
+    };
+    dac.set('dt.cloud.aws.ec2.cpu.usage', dacEntry);
+    const statisticByLiveBase = new Map([['cloud.aws.ec2.cpuutilization', 'Average']]);
+    const idx = { ...buildIndex([]), dac: { byClassicKey: dac, statisticByLiveBase } };
+    const r = rewriteDql('timeseries avg(dt.cloud.aws.ec2.cpu.usage)', idx);
+    assert.ok(!r.warnings.some((x) => x.kind === 'aggregation-mismatch'));
   });
 });
 

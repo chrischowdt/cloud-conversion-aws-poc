@@ -64,6 +64,32 @@ export interface DacLookupResult {
 
 export interface DacIndex {
   byClassicKey: Map<string, DacEntry>;
+  /**
+   * The CloudWatch statistic baked into each new metric, keyed by the live
+   * key's base (`dacAutodiscoveredMetricKey` with the `.By.<Dims>` suffix
+   * stripped, lowercased). The statistic is encoded in `secondGenMetricKey`'s
+   * camelCase — e.g. `ext:cloud.aws.applicationelb.requestCountSumBy…` → `Sum`.
+   * Lets the rewriter flag a counter (`Sum`) metric that a dashboard is
+   * querying with `avg()`/`max()` (which under-reports). Value ∈
+   * {Sum, Average, Maximum, Minimum, SampleCount}.
+   */
+  statisticByLiveBase: Map<string, string>;
+}
+
+/** Statistic token the DAC bakes into `secondGenMetricKey` before `By<Dim>`/EOL. */
+const STAT_RE = /(Sum|Average|Maximum|Minimum|SampleCount)(?:By[A-Z][A-Za-z0-9]*)?$/;
+
+/** Strip the `.By.<Dims>` suffix and lowercase — the join key for the statistic map. */
+function liveKeyBase(newKey: string): string {
+  return newKey.replace(/\.By\..*$/, '').toLowerCase();
+}
+
+/**
+ * The CloudWatch statistic for a live new-connection metric key, or null if
+ * unknown. `newKey` is the `cloud.aws.<svc>.<Metric>.By.<Dims>` form.
+ */
+export function cloudwatchStatisticForNewKey(index: DacIndex, newKey: string): string | null {
+  return index.statisticByLiveBase.get(liveKeyBase(newKey)) ?? null;
 }
 
 const NOT_MATCHED = 'not-matched';
@@ -102,8 +128,19 @@ function addKeyed(map: Map<string, DacEntry>, key: string, entry: DacEntry): voi
 export async function loadDacIndex(path: string): Promise<DacIndex> {
   const entries = JSON.parse(await readFile(path, 'utf8')) as DacEntry[];
   const byClassicKey = new Map<string, DacEntry>();
+  const statisticByLiveBase = new Map<string, string>();
 
   for (const e of entries) {
+    // Record the CloudWatch statistic for the live key (independent of whether
+    // the row is a usable classic→new mapping below).
+    if (isMatched(e.secondGenMetricKey) && isMatched(e.dacAutodiscoveredMetricKey)) {
+      const sm = STAT_RE.exec(e.secondGenMetricKey);
+      if (sm && e.dacAutodiscoveredMetricKey.startsWith('cloud.aws.')) {
+        const base = liveKeyBase(e.dacAutodiscoveredMetricKey);
+        if (!statisticByLiveBase.has(base)) statisticByLiveBase.set(base, sm[1]!);
+      }
+    }
+
     // Skip rows with no new-side key at all — they can't help us anyway.
     if (!isMatched(e.dacRecommendedMetricKey) && !isMatched(e.dacAutodiscoveredMetricKey)) {
       continue;
@@ -134,7 +171,7 @@ export async function loadDacIndex(path: string): Promise<DacIndex> {
     }
   }
 
-  return { byClassicKey };
+  return { byClassicKey, statisticByLiveBase };
 }
 
 export function lookupInDac(index: DacIndex, classicKey: string): DacLookupResult | null {

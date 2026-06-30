@@ -24,7 +24,7 @@ import {
 } from './aws-service-node-types.ts';
 import { parseSelector } from './classic-selector-parser.ts';
 import { translateSelector } from './classic-selector-translator.ts';
-import { lookupInDac } from './dac-lookup.ts';
+import { lookupInDac, cloudwatchStatisticForNewKey } from './dac-lookup.ts';
 import { ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE } from './entity-field-mappings.ts';
 import { classicEntityToSmartscape, lookupByDimRef } from './entity-mappings.ts';
 import { lookupEolForClassicKey } from './eol-lookup.ts';
@@ -62,6 +62,7 @@ export interface Warning {
     | 'credential-collapsed'
     | 'metric-streams-blocked'
     | 'dim-not-carried'
+    | 'aggregation-mismatch'
     | 'end-of-life-service';
   text: string;
   /** Pointer to the relevant dt-migration reference (if any). */
@@ -429,6 +430,27 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
             (lookup.entry.notes ? ` (${lookup.entry.notes})` : ''),
           match: classicKey,
         });
+        // Counter check: the DAC records each new metric's CloudWatch statistic.
+        // If it's `Sum` (an additive counter) but the dashboard aggregates with
+        // avg()/max()/etc., the rewritten tile under-reports — often by 100s× —
+        // because we preserved the user's aggregation (no recipe to flip it).
+        // Non-blocking + advisory: we can't auto-flip safely (a few Sum-typed
+        // metrics are really gauges — concurrency, provisioned capacity — where
+        // avg() is correct), so we surface the statistic and let the author judge.
+        if (index.dac && userAgg !== 'sum' && userAgg !== 'count') {
+          const stat = cloudwatchStatisticForNewKey(index.dac, newKey);
+          if (stat === 'Sum') {
+            warnings.push({
+              kind: 'aggregation-mismatch',
+              text:
+                `${newKey} is a CloudWatch Sum-statistic metric, but this tile aggregates with ` +
+                `${userAgg}(). For an additive counter (requests, invocations, errors, bytes) ${userAgg}() ` +
+                `under-reports — use sum(). If it's a level/gauge (concurrent executions, provisioned ` +
+                `capacity), ${userAgg}() is correct — leave as is. Verify against the classic side.`,
+              match: classicKey,
+            });
+          }
+        }
         const swapOnly = trailing === ','
           ? `${userAgg}(\`${newKey}\`,`
           : `${userAgg}(\`${newKey}\`)`;

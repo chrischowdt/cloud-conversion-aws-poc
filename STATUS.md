@@ -78,6 +78,24 @@ metrics; rate/counter `mapped-no-recipe` may carry a wrong *scale* (settled-
 unverifiable from metadata). Classification source of truth:
 `BLOCKING_WARNING_KINDS` in `dql-rewriter.ts`.
 
+**Counter-aggregation triage (2026-06-17).** Tenant comparison (classic
+`dt.cloud.aws.*` vs new `cloud.aws.*`) showed gauges keep their CloudWatch unit
+(CPU %, latency s/ms, memory bytes) so an `avg()` key-swap is unit-safe — but
+*counters* don't: e.g. `avg(dt.cloud.aws.alb.requests)`≈510 vs naive
+`avg(cloud.aws.applicationelb.RequestCount.By.LoadBalancer)`≈0.74 (~700× low),
+Lambda `Invocations` 288→1.0. The classic metric was a rolled-up interval count;
+the new key is a raw CloudWatch **Sum** series, so the preserved `avg()` under-
+reports. The DAC encodes the statistic in `secondGenMetricKey` (`…requestCount`**`Sum`**`By…`);
+`dac-lookup.ts` now indexes it (`statisticByLiveBase`), and the rewriter emits a
+non-blocking **`aggregation-mismatch`** warning when a `Sum` metric is resolved
+via `mapped-no-recipe` and queried with a non-`sum` aggregation — **1,696
+occurrences** in the corpus. It doesn't move the rate (these were already
+`converted-soft`) but upgrades a vague "spot-check" note into precise "use
+`sum()`" guidance. *Not* auto-flipped: a few `Sum`-typed metrics are really
+gauges (`ConcurrentExecutions`, `Provisioned*CapacityUnits`, `ActiveConnectionCount`)
+where `avg()` is correct, so the call is left to the author. A curated
+auto-flip for unambiguous additive families is the natural follow-up.
+
 **The 57.7% denominator includes ~20% non-AWS noise.** The corpus is "AWS
 *dashboards*", but individual panels often reference only K8s/APM/GCP/Azure/SQL
 entities — out of scope for an AWS-integration tool. Classifying each query by
