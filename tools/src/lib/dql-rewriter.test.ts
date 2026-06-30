@@ -1145,6 +1145,37 @@ describe('rewriteDql — tag value-extraction idiom variants (Pass 2.55)', () =>
   });
 });
 
+describe('rewriteDql — credential→account-id lookup (Pass 0.7)', () => {
+  const idiom =
+    'fetch dt.entity.custom_device\n' +
+    '| filter entity.type == "cloud:aws:eks:cluster"\n' +
+    '| fieldsAdd  aws_credentials=accessible_by[dt.entity.aws_credentials][0],  instance.id =entity.name\n' +
+    '| lookup [fetch dt.entity.aws_credentials | fieldsadd name = entity.name, id, awsAccountId ], sourceField:aws_credentials, lookupField:id, prefix:"aws.credentials." | fieldsRename aws.account_id =  aws.credentials.awsAccountId\n' +
+    '| summarize  count=count(), by: aws.account_id';
+
+  it('collapses the credential lookup to the resource aws.account.id field', () => {
+    const r = rewriteDql(idiom, buildIndex([]));
+    assert.doesNotMatch(r.rewritten, /accessible_by\[/, 'accessible_by traversal removed');
+    assert.doesNotMatch(r.rewritten, /dt\.entity\.aws_credentials/, 'aws_credentials fetch/ref removed');
+    assert.doesNotMatch(r.rewritten, /aws\.credentials\.awsAccountId/, 'prefixed cred field rewired');
+    assert.match(r.rewritten, /aws\.account\.id/);
+    assert.ok(r.warnings.some((w) => w.kind === 'credential-collapsed'));
+    // The credential traversal is no longer a blocker.
+    assert.ok(!r.warnings.some((w) => w.kind === 'entity-relationship-traversal'));
+    assert.ok(!isBlockingWarning('credential-collapsed'));
+  });
+
+  it('does NOT half-rewrite when the lookup prefix carries more than awsAccountId', () => {
+    // aws.credentials.name is also consumed downstream → unsafe to collapse;
+    // the result-guard must leave the query intact (no partial rewrite).
+    const variant = idiom.replace('by: aws.account_id', 'by: {aws.account_id}\n| fields aws.account_id, aws.credentials.name');
+    const r = rewriteDql(variant, buildIndex([]));
+    // The result-guard must prevent Pass 0.7's collapse (its distinctive warning
+    // is absent); the credential traversal stays for the generic handling.
+    assert.ok(!r.warnings.some((w) => /credential→account-id lookup/.test(w.text)), 'Pass 0.7 must not collapse an unsafe variant');
+  });
+});
+
 describe('rewriteDql — credential/account fieldsAdd idiom (Pass 0.6)', () => {
   it('rewrites the entityAttr(accessible_by)[aws_credentials] field-read to an AWS_ACCOUNT join', () => {
     const idx = buildIndex([]);

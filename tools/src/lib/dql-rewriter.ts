@@ -273,6 +273,13 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // there's no resource→AWS_ACCOUNT edge to traverse.
   input = rewriteCredentialFieldsAdd(input, transforms, warnings);
 
+  // Pass 0.7: the credential→account-id LOOKUP-JOIN idiom — the resource is on
+  // the main stream and a `lookup [fetch dt.entity.aws_credentials … awsAccountId]`
+  // pulls the account id onto each row. Smartscape carries `aws.account.id` on
+  // the resource node directly, so the whole extract+lookup scaffold collapses
+  // to that field (custom_device → smartscapeNodes is handled by Pass 1.55).
+  input = rewriteCredentialAccountLookup(input, transforms, warnings);
+
   // Pre-pass: bail out if the query contains a `lookup [fetch
   // dt.entity.<not-planned-type>]` chain (e.g. `custom_device`,
   // `host_group`, `process_group`). The lookup's output prefixes downstream
@@ -1137,6 +1144,83 @@ function rewriteCredentialFieldsAdd(
       `account can have multiple classic credentials, but Smartscape has one AWS_ACCOUNT node per ` +
       `account — so any \`account.name\`-based filter is BROADER than the classic single-credential ` +
       `one. Verify intent for multi-credential accounts.`,
+    reference: SKILL_REFS.specialCases,
+  });
+  return out;
+}
+
+// Pass 0.7 — the credential→account-id LOOKUP-JOIN idiom (distinct from Pass
+// 0.5's nested-lookup chain and 0.6's entityName field-read). The dominant
+// blocked shape on the corpus: the resource is on the main stream and a single
+// lookup into dt.entity.aws_credentials pulls `awsAccountId` per row:
+//   | fieldsAdd <cred>=accessible_by[dt.entity.aws_credentials][0], …
+//   | lookup [fetch dt.entity.aws_credentials | fieldsadd …, awsAccountId],
+//       sourceField:<cred>, lookupField:id, prefix:"P."
+//   | fieldsRename <x> = P.awsAccountId
+// In Smartscape the account is a denormalized `aws.account.id` field on the
+// resource node, so the whole extract+lookup scaffold collapses to that field.
+// Conservative by construction: applies the removal, then REVERTS unless the
+// result is a clean full collapse (no credential remnant, no dangling prefixed
+// field) — so variant shapes fall through to the generic warning rather than
+// emit a half-rewritten (broken) query.
+const CRED_ACCOUNT_LOOKUP_RE =
+  /\|\s*lookup\s*\[\s*fetch\s+`?dt\.entity\.aws_credentials`?\b[^\]]*\]\s*,\s*sourceField\s*:\s*`?(\w+)`?\s*,\s*lookupField\s*:\s*id\b\s*(?:,\s*prefix\s*:\s*"([^"]*)")?/;
+const reEsc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// `<cred> = (arrayFirst()? accessible_by[dt.entity.aws_credentials][0])`
+const CRED_VAL =
+  '(?:arrayFirst\\(\\s*)?accessible_by\\[\\s*`?dt\\.entity\\.aws_credentials`?\\s*\\](?:\\s*\\[\\s*0\\s*\\])?\\s*\\)?';
+
+function dropCredAssignment(s: string, credField: string): string {
+  const f = reEsc(credField);
+  const variants = [
+    new RegExp(`\\s*,\\s*${f}\\s*=\\s*${CRED_VAL}`), // ", cred = …"
+    new RegExp(`${f}\\s*=\\s*${CRED_VAL}\\s*,\\s*`), // "cred = …, "
+    new RegExp(`\\|\\s*fieldsAdd\\s+${f}\\s*=\\s*${CRED_VAL}\\s*(?=\\||$)`), // sole fieldsAdd
+  ];
+  for (const r of variants) if (r.test(s)) return s.replace(r, '');
+  return s;
+}
+
+function rewriteCredentialAccountLookup(
+  input: string,
+  transforms: Transform[],
+  warnings: Warning[]
+): string {
+  const m = CRED_ACCOUNT_LOOKUP_RE.exec(input);
+  if (!m) return input;
+  const credField = m[1]!;
+  const prefix = m[2] ?? '';
+  const lookupBlock = m[0];
+
+  // Must be the accessible_by-sourced credential id we understand.
+  if (!new RegExp(`\\b${reEsc(credField)}\\s*=\\s*${CRED_VAL}`).test(input)) return input;
+
+  let out = input.replace(lookupBlock, '');
+  out = dropCredAssignment(out, credField);
+  if (prefix) out = out.split(`${prefix}awsAccountId`).join('aws.account.id');
+
+  // Commit only on a clean, complete collapse — otherwise no-op (a variant we
+  // didn't fully handle stays for the generic warning, never half-rewritten).
+  const remnant =
+    /accessible_by\[\s*`?dt\.entity\.aws_credentials/.test(out) ||
+    /\bdt\.entity\.aws_credentials\b/.test(out) ||
+    (prefix !== '' && new RegExp(`${reEsc(prefix)}\\w`).test(out)) ||
+    new RegExp(`(?<![.\\w])${reEsc(credField)}\\b`).test(out);
+  if (remnant) return input;
+
+  transforms.push({
+    kind: 'entity-dim',
+    before: 'fieldsAdd <cred>=accessible_by[aws_credentials][0] | lookup [fetch dt.entity.aws_credentials … awsAccountId]',
+    after: 'aws.account.id (denormalized on the resource node)',
+    detail: 'credential→account-id lookup collapsed; Smartscape carries aws.account.id directly on the resource',
+  });
+  warnings.push({
+    kind: 'credential-collapsed',
+    text:
+      `Collapsed a classic credential→account-id lookup (\`lookup [fetch dt.entity.aws_credentials … ` +
+      `awsAccountId]\`) to the resource node's denormalized \`aws.account.id\`. A single AWS account can ` +
+      `have multiple classic credentials but one Smartscape AWS_ACCOUNT — verify intent for ` +
+      `multi-credential accounts, and that the account id still lands on the grouped/renamed column.`,
     reference: SKILL_REFS.specialCases,
   });
   return out;
