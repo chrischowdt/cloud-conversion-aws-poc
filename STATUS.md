@@ -86,15 +86,23 @@ unverifiable from metadata). Classification source of truth:
 Lambda `Invocations` 288→1.0. The classic metric was a rolled-up interval count;
 the new key is a raw CloudWatch **Sum** series, so the preserved `avg()` under-
 reports. The DAC encodes the statistic in `secondGenMetricKey` (`…requestCount`**`Sum`**`By…`);
-`dac-lookup.ts` now indexes it (`statisticByLiveBase`), and the rewriter emits a
-non-blocking **`aggregation-mismatch`** warning when a `Sum` metric is resolved
-via `mapped-no-recipe` and queried with a non-`sum` aggregation — **1,696
-occurrences** in the corpus. It doesn't move the rate (these were already
-`converted-soft`) but upgrades a vague "spot-check" note into precise "use
-`sum()`" guidance. *Not* auto-flipped: a few `Sum`-typed metrics are really
-gauges (`ConcurrentExecutions`, `Provisioned*CapacityUnits`, `ActiveConnectionCount`)
-where `avg()` is correct, so the call is left to the author. A curated
-auto-flip for unambiguous additive families is the natural follow-up.
+`dac-lookup.ts` now indexes it (`statisticByLiveBase`). When a `Sum` metric is
+resolved via `mapped-no-recipe` and queried with a non-`sum` aggregation, the
+rewriter **auto-corrects `avg()`→`sum()`** for metrics that are unambiguously
+additive counters (`isAdditiveSumMetric` — requests, invocations, errors, bytes,
+ops, consumed capacity), recording an `aggregation-corrected` transform; Pass 1.4
+realigns any downstream `avg(key)` column refs to the flipped call. For the
+gauge-like exceptions the DAC *also* labels `Sum` (`ConcurrentExecutions`,
+`Provisioned*CapacityUnits`, `*HostCount`, `ActiveConnectionCount`,
+`StatusCheckFailed`, `Container*` — concurrency/level/state, where `avg()` is
+correct) it does **not** flip, emitting a non-blocking `aggregation-mismatch`
+warning instead. Corpus: **1,270 auto-corrected** + **426 warned** (was 1,696
+all-warned before the flip). Doesn't move the headline rate (these were already
+`converted-soft` via `mapped-no-recipe`) but eliminates the silent ~100–700×
+under-report on counter tiles — the reviewer no longer has to find and fix them
+by hand. Classification is corpus-complete (all 39 distinct Sum-with-non-sum
+metrics on nic55601 hand-checked) with general patterns for out-of-corpus safety;
+unknown metrics default to the safe side (warn, don't flip).
 
 **The 57.7% denominator includes ~20% non-AWS noise.** The corpus is "AWS
 *dashboards*", but individual panels often reference only K8s/APM/GCP/Azure/SQL

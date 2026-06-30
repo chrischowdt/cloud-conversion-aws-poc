@@ -92,6 +92,50 @@ export function cloudwatchStatisticForNewKey(index: DacIndex, newKey: string): s
   return index.statisticByLiveBase.get(liveKeyBase(newKey)) ?? null;
 }
 
+/** The `<Metric>` segment of a live key `cloud.aws.<svc>.<Metric>.By.<Dims>`. */
+function metricNameOf(newKey: string): string {
+  return /^cloud\.aws\.[a-z0-9_]+\.([A-Za-z0-9_]+)/.exec(newKey)?.[1] ?? '';
+}
+
+/**
+ * CloudWatch metrics the DAC labels `Sum` but that represent a LEVEL/STATE
+ * (current concurrency, provisioned capacity, host counts, queue depth), NOT
+ * an additive event count. Summing these over time is wrong — avg()/max() is
+ * what a dashboard wants — so the rewriter must NOT auto-flip them.
+ */
+const GAUGE_LIKE_SUM_METRICS = new Set<string>([
+  'ConcurrentExecutions',
+  'ActiveConnectionCount',
+  'StatusCheckFailed',
+  'StatusCheckFailed_Instance',
+  'StatusCheckFailed_System',
+  'StatusCheckFailed_AttachedEBS',
+  'ContainerAllocated',
+  'ContainerReserved',
+  'ContainerPending',
+]);
+
+function isGaugeLikeSumMetric(name: string): boolean {
+  if (GAUGE_LIKE_SUM_METRICS.has(name)) return true;
+  if (/^Provisioned/.test(name)) return true; // provisioned-capacity levels
+  if (/^Concurrent/.test(name)) return true; // concurrency levels
+  if (/HostCount$/.test(name)) return true; // Healthy/UnHealthyHostCount (current count)
+  if (/^Approximate/.test(name)) return true; // queue-depth approximations (current backlog)
+  return false;
+}
+
+/**
+ * True when a `Sum`-statistic metric is an *additive* event/byte counter
+ * (requests, invocations, errors, bytes, ops, consumed-capacity) that is safe
+ * to auto-aggregate with sum(), vs a gauge the DAC happens to label `Sum`
+ * (see `GAUGE_LIKE_SUM_METRICS`). Callers should gate this on the metric
+ * actually being `Sum` (via `cloudwatchStatisticForNewKey`) first.
+ */
+export function isAdditiveSumMetric(newKey: string): boolean {
+  const name = metricNameOf(newKey);
+  return name !== '' && !isGaugeLikeSumMetric(name);
+}
+
 const NOT_MATCHED = 'not-matched';
 
 function isMatched(v: string | undefined): v is string {

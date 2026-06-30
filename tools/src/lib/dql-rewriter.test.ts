@@ -766,37 +766,55 @@ describe('rewriteDql — DAC fallback for keys missing from recipe mapping', () 
   });
 
   // The DAC encodes each new metric's CloudWatch statistic in secondGenMetricKey
-  // (e.g. `…invocationsSum` → Sum). A Sum metric aggregated with avg() under-
-  // reports — flag it (non-blocking; we can't auto-flip since some Sum-typed
-  // metrics are really gauges).
-  function lambdaInvocationsIdx() {
+  // (e.g. `…invocationsSum` → Sum). An additive Sum counter aggregated with avg()
+  // is auto-corrected to sum(); a gauge the DAC also labels Sum (concurrency,
+  // provisioned capacity, host counts) is left as-is and warned.
+  function sumMetricIdx(classicKey: string, liveKey: string) {
     const dac = new Map();
     const dacEntry = {
-      cloudwatchNamespace: 'AWS/Lambda', cloudwatchMetricName: 'Invocations',
+      cloudwatchNamespace: 'AWS/Lambda', cloudwatchMetricName: 'X',
       cloudwatchDimensions: ['FunctionName'],
-      secondGenMetricKey: 'ext:cloud.aws.lambda.invocationsSum',
-      dacRecommendedMetricKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
-      dacAutodiscoveredMetricKey: 'cloud.aws.lambda.Invocations.By.FunctionName',
+      secondGenMetricKey: 'ext:placeholderSum',
+      dacRecommendedMetricKey: liveKey,
+      dacAutodiscoveredMetricKey: liveKey,
       builtInMetricKey: 'not-matched', endOfLife: false,
     };
-    dac.set('dt.cloud.aws.lambda.invocations', dacEntry);
-    const statisticByLiveBase = new Map([['cloud.aws.lambda.invocations', 'Sum']]);
+    dac.set(classicKey, dacEntry);
+    const base = liveKey.replace(/\.By\..*$/, '').toLowerCase();
+    const statisticByLiveBase = new Map([[base, 'Sum']]);
     return { ...buildIndex([]), dac: { byClassicKey: dac, statisticByLiveBase } };
   }
+  const INV = ['dt.cloud.aws.lambda.invocations', 'cloud.aws.lambda.Invocations.By.FunctionName'] as const;
 
-  it('warns (non-blocking) when a Sum-statistic metric is aggregated with avg()', () => {
-    const r = rewriteDql('timeseries avg(dt.cloud.aws.lambda.invocations)', lambdaInvocationsIdx());
-    const w = r.warnings.find((x) => x.kind === 'aggregation-mismatch');
-    assert.ok(w, 'expected an aggregation-mismatch warning');
-    assert.match(w!.text, /Sum-statistic/);
-    assert.match(w!.text, /sum\(\)/);
-    // Must NOT count against the conversion rate — the DQL runs, it's a verify-me caveat.
-    assert.equal(isBlockingWarning('aggregation-mismatch'), false);
+  it('auto-corrects avg()→sum() for an additive Sum counter (Lambda Invocations)', () => {
+    const r = rewriteDql('timeseries avg(dt.cloud.aws.lambda.invocations)', sumMetricIdx(...INV));
+    assert.match(r.rewritten, /sum\(`cloud\.aws\.lambda\.Invocations\.By\.FunctionName`\)/);
+    assert.ok(r.transforms.some((t) => t.kind === 'aggregation-corrected'), 'expected an aggregation-corrected transform');
+    assert.ok(!r.warnings.some((x) => x.kind === 'aggregation-mismatch'), 'flipped — should not also warn');
   });
 
-  it('does NOT warn aggregation-mismatch when the metric is already summed', () => {
-    const r = rewriteDql('timeseries sum(dt.cloud.aws.lambda.invocations)', lambdaInvocationsIdx());
+  it('realigns a downstream column ref when the aggregation is auto-corrected', () => {
+    const r = rewriteDql(
+      'timeseries avg(dt.cloud.aws.lambda.invocations) | fields `avg(dt.cloud.aws.lambda.invocations)`',
+      sumMetricIdx(...INV)
+    );
+    assert.ok(!/avg\(dt\.cloud\.aws\.lambda\.invocations\)/.test(r.rewritten), 'stale avg(classic) ref should be realigned');
+    assert.match(r.rewritten, /sum\(cloud\.aws\.lambda\.Invocations\.By\.FunctionName\)/);
+  });
+
+  it('does NOT auto-correct or warn when the metric is already summed', () => {
+    const r = rewriteDql('timeseries sum(dt.cloud.aws.lambda.invocations)', sumMetricIdx(...INV));
     assert.ok(!r.warnings.some((x) => x.kind === 'aggregation-mismatch'));
+    assert.ok(!r.transforms.some((t) => t.kind === 'aggregation-corrected'));
+  });
+
+  it('warns (no flip) for a gauge-like Sum metric (ConcurrentExecutions)', () => {
+    const idx = sumMetricIdx('dt.cloud.aws.lambda.conc_executions', 'cloud.aws.lambda.ConcurrentExecutions.By.FunctionName');
+    const r = rewriteDql('timeseries avg(dt.cloud.aws.lambda.conc_executions)', idx);
+    assert.ok(r.warnings.some((x) => x.kind === 'aggregation-mismatch'), 'gauge-like Sum metric should warn, not flip');
+    assert.equal(isBlockingWarning('aggregation-mismatch'), false);
+    assert.match(r.rewritten, /avg\(`cloud\.aws\.lambda\.ConcurrentExecutions\.By\.FunctionName`\)/);
+    assert.ok(!r.transforms.some((t) => t.kind === 'aggregation-corrected'));
   });
 
   it('does NOT warn aggregation-mismatch for a non-Sum (Average) statistic', () => {

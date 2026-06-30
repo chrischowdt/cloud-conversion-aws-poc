@@ -24,7 +24,7 @@ import {
 } from './aws-service-node-types.ts';
 import { parseSelector } from './classic-selector-parser.ts';
 import { translateSelector } from './classic-selector-translator.ts';
-import { lookupInDac, cloudwatchStatisticForNewKey } from './dac-lookup.ts';
+import { lookupInDac, cloudwatchStatisticForNewKey, isAdditiveSumMetric } from './dac-lookup.ts';
 import { ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE } from './entity-field-mappings.ts';
 import { classicEntityToSmartscape, lookupByDimRef } from './entity-mappings.ts';
 import { lookupEolForClassicKey } from './eol-lookup.ts';
@@ -39,7 +39,7 @@ import {
 } from './recipe-lookup.ts';
 
 export interface Transform {
-  kind: 'metric-key' | 'entity-dim' | 'recipe-applied' | 'composite-formula' | 'classic-selector';
+  kind: 'metric-key' | 'entity-dim' | 'recipe-applied' | 'composite-formula' | 'classic-selector' | 'aggregation-corrected';
   before: string;
   after: string;
   detail?: string;
@@ -430,41 +430,55 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
             (lookup.entry.notes ? ` (${lookup.entry.notes})` : ''),
           match: classicKey,
         });
-        // Counter check: the DAC records each new metric's CloudWatch statistic.
-        // If it's `Sum` (an additive counter) but the dashboard aggregates with
-        // avg()/max()/etc., the rewritten tile under-reports — often by 100s× —
-        // because we preserved the user's aggregation (no recipe to flip it).
-        // Non-blocking + advisory: we can't auto-flip safely (a few Sum-typed
-        // metrics are really gauges — concurrency, provisioned capacity — where
-        // avg() is correct), so we surface the statistic and let the author judge.
+        // Counter aggregation: the DAC records each new metric's CloudWatch
+        // statistic. A `Sum` metric (additive counter) aggregated with
+        // avg()/max() under-reports — often by 100s× — because the classic
+        // metric was a rolled-up interval count while the new key is a raw Sum
+        // series. For metrics that are unambiguously additive counters
+        // (requests, invocations, errors, bytes, ops, consumed capacity) we
+        // auto-correct the aggregation to sum(). For the gauge-like exceptions
+        // the DAC also labels `Sum` (concurrency, provisioned capacity, host
+        // counts, status checks) avg() is correct — leave those and just warn.
+        // Only the plain `agg(key)` form is auto-flipped; the
+        // `agg(key, filter:…)` form is left as-is and warned.
+        let effAgg = userAgg;
         if (index.dac && userAgg !== 'sum' && userAgg !== 'count') {
           const stat = cloudwatchStatisticForNewKey(index.dac, newKey);
           if (stat === 'Sum') {
-            warnings.push({
-              kind: 'aggregation-mismatch',
-              text:
-                `${newKey} is a CloudWatch Sum-statistic metric, but this tile aggregates with ` +
-                `${userAgg}(). For an additive counter (requests, invocations, errors, bytes) ${userAgg}() ` +
-                `under-reports — use sum(). If it's a level/gauge (concurrent executions, provisioned ` +
-                `capacity), ${userAgg}() is correct — leave as is. Verify against the classic side.`,
-              match: classicKey,
-            });
+            if (trailing === ')' && isAdditiveSumMetric(newKey)) {
+              effAgg = 'sum';
+            } else {
+              warnings.push({
+                kind: 'aggregation-mismatch',
+                text:
+                  `${newKey} is a CloudWatch Sum-statistic metric, but this tile aggregates with ` +
+                  `${userAgg}(). For an additive counter ${userAgg}() under-reports — use sum(). If it's ` +
+                  `a level/gauge (concurrent executions, provisioned capacity, host count), ${userAgg}() ` +
+                  `is correct — leave as is. Verify against the classic side.`,
+                match: classicKey,
+              });
+            }
           }
         }
+        const aggCorrected = effAgg !== userAgg;
         const swapOnly = trailing === ','
           ? `${userAgg}(\`${newKey}\`,`
-          : `${userAgg}(\`${newKey}\`)`;
+          : `${effAgg}(\`${newKey}\`)`;
         // Record the auto-generated column-name swap so Pass 1.4 can fix
         // downstream backtick refs (only for the plain `agg(key)` form, not
-        // the `agg(key, filter:…)` form which isn't a column name).
+        // the `agg(key, filter:…)` form which isn't a column name). The KEY is
+        // the ORIGINAL `userAgg(classicKey)` column name; the VALUE carries the
+        // (possibly flipped) effective aggregation so refs realign correctly.
         if (trailing === ')') {
-          metricKeySwaps.set(`${userAgg}(${classicKey})`, `${userAgg}(${newKey})`);
+          metricKeySwaps.set(`${userAgg}(${classicKey})`, `${effAgg}(${newKey})`);
         }
         transforms.push({
-          kind: 'metric-key',
+          kind: aggCorrected ? 'aggregation-corrected' : 'metric-key',
           before: `${userAgg}(${classicKey}${trailing === ',' ? ',' : ')'}`,
           after: swapOnly,
-          detail: 'metric-only swap (no verified recipe — agg preserved as user wrote it)',
+          detail: aggCorrected
+            ? `aggregation auto-corrected ${userAgg}()→sum() — ${newKey} is a CloudWatch Sum-statistic additive counter`
+            : 'metric-only swap (no verified recipe — agg preserved as user wrote it)',
         });
         return swapOnly;
       }
