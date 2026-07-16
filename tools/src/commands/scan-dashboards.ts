@@ -317,22 +317,28 @@ export async function runScanDashboards(args: ScanDashboardsArgs): Promise<void>
         const r = rewriteDql(q.query, index);
         const tCount = r.transforms.length;
         const wCount = r.warnings.length;
+        // `non-aws-entity` is an informational "left untouched" note (the entity
+        // migrates with the general tooling and isn't decommissioned here), NOT
+        // an AWS-conversion caveat — so it doesn't count toward clean/soft/
+        // blocked/flagged. A query whose only warning is that note, with no AWS
+        // transform, is a no-op for this automation.
+        const awsW = r.warnings.filter((w) => w.kind !== 'non-aws-entity').length;
         if (tCount > 0) {
           perDash.rewrittenCount++;
           summary.totals.rewrittenQueries++;
         }
-        if (tCount > 0 && wCount === 0) {
+        if (tCount > 0 && awsW === 0) {
           perDash.cleanCount++;
           summary.totals.cleanQueries++;
         }
-        if (wCount > 0) {
+        if (awsW > 0) {
           perDash.flaggedCount++;
           summary.totals.flaggedQueries++;
         }
         // Reframed buckets (exactly one): blocked > soft-converted > clean > no-op.
-        const hasBlocking = r.warnings.some((w) => isBlockingWarning(w.kind));
+        const hasBlocking = r.warnings.some((w) => w.kind !== 'non-aws-entity' && isBlockingWarning(w.kind));
         if (hasBlocking) summary.totals.blocked++;
-        else if (wCount > 0) summary.totals.convertedSoft++;
+        else if (awsW > 0) summary.totals.convertedSoft++;
         else if (tCount === 0) summary.totals.noopQueries++;
         const tKinds = new Set<string>();
         for (const t of r.transforms) {

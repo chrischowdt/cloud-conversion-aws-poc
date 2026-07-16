@@ -26,7 +26,7 @@ import { parseSelector } from './classic-selector-parser.ts';
 import { translateSelector } from './classic-selector-translator.ts';
 import { lookupInDac, cloudwatchStatisticForNewKey, isAdditiveSumMetric } from './dac-lookup.ts';
 import { ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE } from './entity-field-mappings.ts';
-import { classicEntityToSmartscape, lookupByDimRef } from './entity-mappings.ts';
+import { classicEntityToSmartscape, lookupByDimRef, entityScope } from './entity-mappings.ts';
 import { lookupEolForClassicKey } from './eol-lookup.ts';
 import { isMetricCarrier, isKnownNonCarrier } from './metric-dim-carriers.ts';
 import { findEdgesBetween } from './smartscape-edges.ts';
@@ -63,6 +63,7 @@ export interface Warning {
     | 'metric-streams-blocked'
     | 'dim-not-carried'
     | 'aggregation-mismatch'
+    | 'non-aws-entity'
     | 'end-of-life-service';
   text: string;
   /** Pointer to the relevant dt-migration reference (if any). */
@@ -92,6 +93,26 @@ export const BLOCKING_WARNING_KINDS: ReadonlySet<Warning['kind']> = new Set([
 /** True when a warning means the query can't be auto-converted (vs a verify-me caveat). */
 export function isBlockingWarning(kind: Warning['kind']): boolean {
   return BLOCKING_WARNING_KINDS.has(kind);
+}
+
+/**
+ * Record that a non-AWS entity (APM/infra/K8s/Azure) was left UNTOUCHED. Emitted
+ * once per distinct type. Non-blocking: leaving it classic is the correct
+ * outcome for an AWS-only migration, not a failure — these entities migrate
+ * with the general classic→Grail tooling and are not decommissioned by the
+ * cloud-integration migration.
+ */
+function noteNonAwsEntity(warnings: Warning[], entityType: string): void {
+  const match = `dt.entity.${entityType}`;
+  if (warnings.some((w) => w.kind === 'non-aws-entity' && w.match === match)) return;
+  warnings.push({
+    kind: 'non-aws-entity',
+    text:
+      `${match} is a non-AWS entity (APM / infrastructure / Kubernetes / Azure) — left unchanged. ` +
+      `It's out of scope for the AWS cloud-integration migration and isn't decommissioned by it; ` +
+      `migrate it with the general classic→Grail tooling.`,
+    match,
+  });
 }
 
 export interface RewriteResult {
@@ -611,6 +632,11 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   const pass2NonSmartscapeRegions = findNonSmartscapeLookupRegions(rewritten);
   rewritten = rewritten.replace(ENTITY_DIM_PATTERN, (full, entityType: string, offset: number) => {
     if (isInsideRegion(offset, pass2NonSmartscapeRegions)) return full;
+    // Only rewrite AWS entities. Non-AWS (APM/infra/K8s/Azure) are left classic.
+    if (entityScope(entityType) === 'non-aws') {
+      noteNonAwsEntity(warnings, entityType);
+      return full;
+    }
     const mapping = lookupByDimRef(full);
     if (!mapping) {
       warnings.push({
@@ -1330,6 +1356,11 @@ function rewriteFetchEntity(
   ctx: FetchContext
 ): string {
   return input.replace(FETCH_ENTITY_PATTERN, (full, entityType: string) => {
+    // Only restructure AWS entities. Non-AWS `fetch dt.entity.X` stays classic.
+    if (entityScope(entityType) === 'non-aws') {
+      noteNonAwsEntity(warnings, entityType);
+      return full;
+    }
     const mapping = classicEntityToSmartscape(entityType);
     if (!mapping || !mapping.smartscapeNodeType) {
       if (mapping?.status === 'not-planned') {
@@ -1510,6 +1541,13 @@ function rewriteRelationshipBrackets(
         return full;
       }
 
+    // Relationships to a non-AWS target (K8s cloud_application, kubernetes_*,
+    // process_group, host, …) are left classic — those belong to the general
+    // migration, not this AWS automation.
+    if (entityScope(targetClassicType) === 'non-aws') {
+      noteNonAwsEntity(warnings, targetClassicType);
+      return full;
+    }
     const targetMapping = classicEntityToSmartscape(targetClassicType);
     if (!targetMapping || !targetMapping.smartscapeNodeType) {
       warnings.push({
@@ -1582,12 +1620,20 @@ function rewriteRelationshipBrackets(
 
 // ─── Pass 2.5: entityName / entityAttr → getNodeName / getNodeField ───────
 
+/** The x in entityName(x)/entityAttr(x,…) references a non-AWS classic entity. */
+function argRefsNonAwsEntity(arg: string): boolean {
+  const m = /dt\.entity\.([\w:]+)/.exec(arg);
+  return !!m && entityScope(m[1]!) === 'non-aws';
+}
+
 function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
   // entityAttr(x, "field") → getNodeField(x, "field"). Must run before
   // entityName replacement so we don't accidentally match Attr's "Name" prefix.
   let rewritten = input.replace(
     /\bentityAttr\(\s*([^,)]+?)\s*,\s*("[^"]+")\s*\)/g,
     (full, arg: string, field: string) => {
+      // Leave entityAttr on a non-AWS entity classic (matches the untouched entity).
+      if (argRefsNonAwsEntity(arg)) return full;
       // Classic "tags" maps to the provider-namespaced "tags:aws" record on the
       // new side (verified on tenant — getNodeField(x,"tags") also returns a
       // record, but "tags:aws" is the AWS-scoped, KB-recommended form, and is
@@ -1604,8 +1650,10 @@ function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
 
   // entityName(x) — drop optional `type:"..."` argument per skill rule.
   rewritten = rewritten.replace(
-    /\bentityName\(\s*([^,)]+?)(?:\s*,\s*type:\s*"[^"]+")?\s*\)/g,
-    (full, arg: string) => {
+    /\bentityName\(\s*([^,)]+?)(?:\s*,\s*type:\s*"([^"]+)")?\s*\)/g,
+    (full, arg: string, typeRef: string | undefined) => {
+      // Leave classic when the entity is non-AWS (named via `type:` or the arg).
+      if ((typeRef && entityScope(typeRef) === 'non-aws') || argRefsNonAwsEntity(arg)) return full;
       transforms.push({
         kind: 'entity-dim',
         before: full,

@@ -95,7 +95,7 @@ The DAC index is built with **four indexes** keyed by every classic-key shape a 
 
 | File | What it indexes | Source of truth |
 |---|---|---|
-| `entity-mappings.ts` | classic entity type → Smartscape node type + dim | `dt-migration/references/entity-type-mapping.md` |
+| `entity-mappings.ts` | classic entity type → Smartscape node type + dim. **AWS-only scope**: `entityScope()` gates every entity pass so only `AWS_*`-node entities convert; non-AWS (APM `service`/`host`/`process_group[_instance]`, RUM `application`, K8s `cloud_application*`/`kubernetes_*`, `azure_*`, …) are left **untouched** with a non-blocking `non-aws-entity` note (they belong to the general migration and converting them over-reached — a `process_group_instance → dt.smartscape.process` conversion passed the rewriter but failed at runtime with `ENRICHMENT_FUNCTION_TABLE_SIZE`). | `dt-migration/references/entity-type-mapping.md` |
 | `aws-service-node-types.ts` | AWS metric-service (`cloud.aws.<svc>`) → Smartscape node type, for custom_device disambiguation | empirical: `discover-entity-types` reads `dt.smartscape_source.type` (the entities JSON's `dacResourceType` has wrong granularity) |
 | `entity-field-mappings.ts` | per-node-type field renames (`awsAccountId`, `rdsEngine`, …) | empirical tenant probing |
 | `metric-dim-carriers.ts` | which Smartscape types carry their dim on metric series | empirical tenant probing |

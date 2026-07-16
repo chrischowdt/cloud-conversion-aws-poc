@@ -61,22 +61,39 @@ but are out of scope until AWS auto-conversion is much higher.
 ## Current conversion rate (tenant nic55601, 518 AWS dashboards / 11,561 panels)
 
 `scan-dashboards` reports a **reframed scoreboard** (every query in exactly
-one bucket) — `clean (0 warnings)` alone badly undercounted, because it lumped
-"can't convert" with "converted, just verify-flagged". As of 2026-06-17:
+one bucket). As of 2026-07-16 (after **AWS-only entity scoping** — see below):
 
 | Bucket | share | meaning |
 |---|---:|---|
-| **CONVERTED** (produces working DQL) | **57.7%** | clean **21.0%** + converted-with-verify-caveat **36.7%** |
-| BLOCKED (no equiv / needs manual) | 23.0% | sole blockers: unmapped-entity-type 11.9%, unknown-metric 2.6%, metric-streams 2.3%, relationship/selector ~2.1%, classic-id-literal 0.6% |
-| No-op (already new-form / non-DQL) | 19.3% | — |
+| **CONVERTED** (produces working DQL) | **44.7%** | clean **6.8%** + converted-with-verify-caveat **37.9%** |
+| BLOCKED (no equiv / needs manual) | 16.1% | AWS-only blockers: unknown-metric, metric-streams, custom_device lookup-chains, classic-id-literal |
+| No-op (already new-form / non-DQL / **non-AWS left untouched**) | 39.2% | — |
 
-**Headline: ~58% of AWS panels auto-convert to working DQL** (21% with zero
-caveats; +37% that run but carry a verify-me flag). Gains since the 52.9%
-baseline: Lever 2 (tier-4 unknown-metric snake-normalization, +106) and the
-**carrier-table refresh** below (+448). Caveat on the soft tier: solid for gauge
-metrics; rate/counter `mapped-no-recipe` may carry a wrong *scale* (settled-
-unverifiable from metadata). Classification source of truth:
-`BLOCKING_WARNING_KINDS` in `dql-rewriter.ts`.
+**The all-up rate dropped from 57.7% because the rewriter now only touches AWS
+entities** (see "AWS-only scoping"). The **AWS-relevant** conversion rate is
+unchanged: of tiles that exercise AWS conversion, **73.5%** convert
+(5,172 CONVERTED / 7,033 AWS-relevant = converted+blocked); the rest of the
+corpus (~39% no-op) is non-AWS (APM/K8s/Azure) or already-new-form. Caveat on
+the soft tier: solid for gauge metrics; rate/counter `mapped-no-recipe` may
+carry a wrong *scale*. Classification source of truth: `BLOCKING_WARNING_KINDS`
+in `dql-rewriter.ts`.
+
+**AWS-only entity scoping (2026-07-16).** The rewriter now converts **only AWS
+entities** (those mapping to an `AWS_*` Smartscape node); every non-AWS entity —
+APM `service`/`host`/`process_group[_instance]`, RUM `application`, Kubernetes
+`cloud_application*`/`kubernetes_*`, `azure_*`, `disk`, `network_interface`, … —
+is left **untouched** and flagged with a non-blocking `non-aws-entity` note.
+Rationale: those belong to the general classic→Grail migration, aren't
+decommissioned by the cloud-integration migration, and converting them was
+*over-reach that failed at runtime* — a real dashboard tile converting
+`dt.entity.process_group_instance → dt.smartscape.process` (+ an `append
+[smartscapeNodes PROCESS]`) passed the rewriter clean but hit
+`ENRICHMENT_FUNCTION_TABLE_SIZE`, forcing a manual revert. `entityScope()` in
+`entity-mappings.ts` is the gate; it fires in Pass 1.6 (fetch), 1.7
+(relationship target), 2 (dim-swap), and 2.5 (entityName/entityAttr). Effect:
+~4,670 non-AWS refs no longer converted; `unmapped-entity-type` 5,373→2,757 and
+`entity-relationship-traversal` 896→175 (their non-AWS share reclassified to the
+non-blocking `non-aws-entity`, so BLOCKED is now AWS-only).
 
 **Counter-aggregation triage (2026-06-17).** Tenant comparison (classic
 `dt.cloud.aws.*` vs new `cloud.aws.*`) showed gauges keep their CloudWatch unit

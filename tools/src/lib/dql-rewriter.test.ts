@@ -175,14 +175,15 @@ describe('rewriteDql — entity dimension swap', () => {
     assert.ok(r.warnings.some((w) => w.kind === 'unmapped-entity-type'));
   });
 
-  it('warns on not-planned entity types (host_group)', () => {
+  it('leaves non-AWS host_group untouched with a non-blocking non-aws-entity note', () => {
     const idx = buildIndex([]);
     const r = rewriteDql(
       'timeseries avg(x), by:{ dt.entity.host_group }',
       idx
     );
     assert.match(r.rewritten, /dt\.entity\.host_group/);
-    assert.ok(r.warnings.some((w) => w.kind === 'unmapped-entity-type'));
+    assert.ok(r.warnings.some((w) => w.kind === 'non-aws-entity'));
+    assert.equal(isBlockingWarning('non-aws-entity'), false);
   });
 });
 
@@ -198,11 +199,18 @@ describe('rewriteDql — flags constructs needing manual migration', () => {
     assert.match(w.reference ?? '', /mass-data-filtering/);
   });
 
-  it('translates entityName(x) to getNodeName(x)', () => {
+  it('translates entityName(x) to getNodeName(x) for an AWS entity', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('fields name = entityName(dt.entity.ec2_instance)', idx);
+    assert.match(r.rewritten, /getNodeName\(dt\.smartscape\.aws_ec2_instance\)/);
+    assert.doesNotMatch(r.rewritten, /entityName/);
+  });
+
+  it('leaves entityName on a non-AWS entity (host) classic', () => {
     const idx = buildIndex([]);
     const r = rewriteDql('fields name = entityName(dt.entity.host)', idx);
-    assert.match(r.rewritten, /getNodeName\(dt\.smartscape\.host\)/);
-    assert.doesNotMatch(r.rewritten, /entityName/);
+    assert.match(r.rewritten, /entityName\(dt\.entity\.host\)/);
+    assert.doesNotMatch(r.rewritten, /getNodeName/);
   });
 
   it('translates entityAttr(x, "f") to getNodeField(x, "f") for a generic field', () => {
@@ -218,25 +226,25 @@ describe('rewriteDql — flags constructs needing manual migration', () => {
     assert.doesNotMatch(r.rewritten, /entityAttr/);
   });
 
-  it('drops type: argument from entityName per skill rule', () => {
+  it('drops type: argument from entityName per skill rule (AWS entity)', () => {
     const idx = buildIndex([]);
     const r = rewriteDql(
-      'fields name = entityName(dt.entity.host, type:"dt.entity.host")',
+      'fields name = entityName(dt.entity.ec2_instance, type:"dt.entity.ec2_instance")',
       idx
     );
-    assert.match(r.rewritten, /getNodeName\(dt\.smartscape\.host\)/);
+    assert.match(r.rewritten, /getNodeName\(dt\.smartscape\.aws_ec2_instance\)/);
     assert.doesNotMatch(r.rewritten, /type:/);
   });
 
-  it('translates simple <edge>[dt.entity.X] to references[<edge>.<x>]', () => {
+  it('translates simple <edge>[dt.entity.X] to references[<edge>.<x>] for AWS entities', () => {
     const idx = buildIndex([]);
     const r = rewriteDql(
-      'fetch dt.entity.network_interface | fieldsAdd host = belongs_to[dt.entity.host]',
+      'fetch dt.entity.ec2_instance | fieldsAdd az = belongs_to[dt.entity.aws_availability_zone]',
       idx
     );
-    // fetch restructure + bracket translation
-    assert.match(r.rewritten, /smartscapeNodes NETWORK_INTERFACE/);
-    assert.match(r.rewritten, /references\[belongs_to\.host\]/);
+    // fetch restructure + bracket translation (edge may be validator-substituted)
+    assert.match(r.rewritten, /smartscapeNodes AWS_EC2_INSTANCE/);
+    assert.match(r.rewritten, /references\[\w+\.aws_availability_zone\]/);
   });
 
   it('relationship-bracket validator substitutes edge when classic name is wrong for source-target pair', () => {
@@ -281,8 +289,8 @@ describe('rewriteDql — composite formulas', () => {
 describe('rewriteDql — fetch restructure (Situation 3)', () => {
   it('rewrites fetch dt.entity.X to smartscapeNodes <TYPE>', () => {
     const idx = buildIndex([]);
-    const r = rewriteDql('fetch dt.entity.host | fields entity.name, id', idx);
-    assert.match(r.rewritten, /smartscapeNodes HOST/);
+    const r = rewriteDql('fetch dt.entity.ec2_instance | fields entity.name, id', idx);
+    assert.match(r.rewritten, /smartscapeNodes AWS_EC2_INSTANCE/);
     assert.doesNotMatch(r.rewritten, /fetch dt\.entity/);
   });
 
@@ -302,13 +310,11 @@ describe('rewriteDql — fetch restructure (Situation 3)', () => {
     assert.match(r.rewritten, /entity\.name/);
   });
 
-  it('flags fetch dt.entity.host_group as not-planned and leaves it alone', () => {
+  it('leaves non-AWS fetch dt.entity.host_group untouched (non-aws-entity)', () => {
     const idx = buildIndex([]);
     const r = rewriteDql('fetch dt.entity.host_group | fields id', idx);
     assert.match(r.rewritten, /fetch dt\.entity\.host_group/);
-    assert.ok(
-      r.warnings.some((w) => /no Smartscape replacement/i.test(w.text))
-    );
+    assert.ok(r.warnings.some((w) => w.kind === 'non-aws-entity'));
   });
 
   it('translates fetch dt.entity.custom_device | filter entity.type == "cloud:aws:lambda" to smartscapeNodes AWS_LAMBDA_FUNCTION', () => {
@@ -335,28 +341,46 @@ describe('rewriteDql — fetch restructure (Situation 3)', () => {
     assert.ok(r.warnings.some((w) => w.kind === 'unmapped-entity-type'));
   });
 
-  it('flags ambiguous cloud_application mapping with alternatives listed', () => {
+  it('leaves non-AWS cloud_application (Kubernetes) untouched', () => {
     const idx = buildIndex([]);
     const r = rewriteDql(
       'timeseries avg(x), by:{dt.entity.cloud_application}',
       idx
     );
-    // Default to K8S_DEPLOYMENT, but warn the user about alternatives.
-    assert.match(r.rewritten, /dt\.smartscape\.k8s_deployment/);
-    assert.ok(
-      r.warnings.some((w) => /ambiguous/i.test(w.text) && /K8S_DAEMONSET/.test(w.text))
-    );
+    // K8s workload — out of AWS scope; left classic (no k8s_* swap, no ambiguous warning).
+    assert.match(r.rewritten, /dt\.entity\.cloud_application/);
+    assert.doesNotMatch(r.rewritten, /dt\.smartscape\.k8s/);
+    assert.ok(r.warnings.some((w) => w.kind === 'non-aws-entity'));
   });
 
-  it('translates kubernetes_cluster, cloud_application_instance, container_group_instance', () => {
+  it('leaves non-AWS kubernetes_cluster / cloud_application_instance / container_group_instance untouched', () => {
     const idx = buildIndex([]);
     const r = rewriteDql(
       'timeseries avg(x), by:{dt.entity.kubernetes_cluster, dt.entity.cloud_application_instance, dt.entity.container_group_instance}',
       idx
     );
-    assert.match(r.rewritten, /dt\.smartscape\.k8s_cluster/);
-    assert.match(r.rewritten, /dt\.smartscape\.k8s_pod/);
-    assert.match(r.rewritten, /dt\.smartscape\.container/);
+    assert.match(r.rewritten, /dt\.entity\.kubernetes_cluster/);
+    assert.match(r.rewritten, /dt\.entity\.cloud_application_instance/);
+    assert.match(r.rewritten, /dt\.entity\.container_group_instance/);
+    assert.doesNotMatch(r.rewritten, /dt\.smartscape\.(k8s|container)/);
+    assert.ok(r.warnings.some((w) => w.kind === 'non-aws-entity'));
+  });
+
+  it('leaves an APM/process tile entirely classic (the CLS tile-106 case)', () => {
+    // process_group_instance → PROCESS is non-AWS; converting it produced clean
+    // DQL that failed at runtime (ENRICHMENT_FUNCTION_TABLE_SIZE). Leave it all.
+    const idx = buildIndex([]);
+    const q =
+      'timeseries {cpu = avg(dt.process.cpu.usage)}, by:{dt.entity.process_group_instance}\n' +
+      '| fieldsRename id = dt.entity.process_group_instance\n' +
+      '| fieldsAdd Service = entityName(id, type:"dt.entity.process_group_instance")';
+    const r = rewriteDql(q, idx);
+    assert.match(r.rewritten, /by:\{dt\.entity\.process_group_instance\}/);
+    assert.match(r.rewritten, /entityName\(id, type:"dt\.entity\.process_group_instance"\)/);
+    assert.doesNotMatch(r.rewritten, /dt\.smartscape\.process/);
+    assert.doesNotMatch(r.rewritten, /getNodeName/);
+    assert.ok(r.warnings.some((w) => w.kind === 'non-aws-entity'));
+    assert.ok(!r.warnings.some((w) => isBlockingWarning(w.kind)), 'non-AWS content must not be blocking');
   });
 
   it('renames classic AWS_ACCOUNT field awsAccountId to aws.account.id when fetch was restructured', () => {

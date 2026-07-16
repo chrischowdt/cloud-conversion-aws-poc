@@ -125,6 +125,47 @@ export function classicEntityToSmartscape(classicType: string): EntityMapping | 
 }
 
 /**
+ * Classic types with no Smartscape node (`not-planned`, empty node type) that
+ * are NOT AWS — they belong to the general/APM/K8s migration, not the AWS
+ * cloud integration. (Split out because other empty-node-type entries like
+ * `elastic_load_balancer` and `custom_device` ARE AWS.)
+ */
+const NON_AWS_NOT_PLANNED = new Set<string>([
+  'process_group',
+  'host_group',
+  'container_group',
+  'custom_device_group',
+  'environment',
+]);
+
+export type EntityScope = 'aws' | 'non-aws' | 'unknown';
+
+/**
+ * Whether a classic entity type is in scope for the **AWS** cloud-integration
+ * migration. This automation only rewrites AWS resources; every non-AWS entity
+ * (APM `service`/`host`/`process_group[_instance]`, RUM `application`,
+ * Kubernetes `cloud_application*`/`kubernetes_*`, `azure_*`, `disk`,
+ * `network_interface`, …) is left UNTOUCHED — it migrates with the general
+ * classic→Grail tooling. Converting those here is out of scope and, for heavy
+ * process/APM tiles, produces DQL that fails at runtime (e.g. a
+ * `dt.smartscape.process` join hitting `ENRICHMENT_FUNCTION_TABLE_SIZE`).
+ *
+ * Discriminator: AWS entities map to an `AWS_*` Smartscape node type. Empty
+ * node types (not-planned) split via `NON_AWS_NOT_PLANNED`.
+ *
+ * `classicType` may be a bare type (`process_group_instance`) or a full ref
+ * (`dt.entity.process_group_instance`, backticked or not).
+ */
+export function entityScope(classicType: string): EntityScope {
+  const t = classicType.replace(/^`/, '').replace(/`$/, '').replace(/^dt\.entity\./, '').toLowerCase();
+  const m = classicEntityToSmartscape(t);
+  if (!m) return 'unknown';
+  if (m.smartscapeNodeType.startsWith('AWS_')) return 'aws';
+  if (m.smartscapeNodeType !== '') return 'non-aws';
+  return NON_AWS_NOT_PLANNED.has(t) ? 'non-aws' : 'aws';
+}
+
+/**
  * Given a `dt.entity.X` reference (full string), return the mapping. Handles
  * both bare `dt.entity.ec2_instance` and backticked forms like
  * `` `dt.entity.cloud:aws:applicationelb` `` (DQL needs backticks for keys
