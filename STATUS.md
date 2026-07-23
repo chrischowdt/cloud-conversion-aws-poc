@@ -124,6 +124,13 @@ Tests 184→195. Clean rate held ~21% across all three — these are **correctne
 **AWS only** right now. Azure/GCP mappings exist in `dt-migration/references/`
 but are out of scope until AWS auto-conversion is much higher.
 
+**New platform only** (decided 2026-07-23). Conversion targets new-platform
+assets: new dashboards, notebooks, and Davis anomaly detectors. **Classic
+dashboards are out of scope** — they can't be usage-scoped (not Document-Service
+documents, so no `dt.system.events` per-doc open signal), and the migration is
+about the new platform. `download-dashboards` still supports the classic side
+(Config API v1) if that changes, but we don't scan/convert it.
+
 ## Two hard constraints (don't forget these)
 
 1. **Classic-passthrough is not a real conversion.** The rewriter's "leave the
