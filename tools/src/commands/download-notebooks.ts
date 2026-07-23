@@ -11,11 +11,13 @@
  *   <tenant>/notebooks/manifest.json       — index with per-notebook status
  */
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { DocumentApiError, DocumentClient, type Document } from '../dynatrace/document.ts';
+import { DqlClient } from '../dynatrace/dql.ts';
 import { OUT_DIR } from '../lib/paths.ts';
+import { APP_ID, fetchUsedDocumentIds, type UsageInfo } from '../lib/asset-usage.ts';
 
 export interface DownloadNotebooksArgs {
   baseUrl: string;
@@ -23,6 +25,8 @@ export interface DownloadNotebooksArgs {
   outDir?: string;
   /** Limit how many to download (for testing). */
   limit?: number;
+  /** Only download notebooks opened in the last N days (usage-scoped). */
+  usedWithinDays?: number;
 }
 
 interface Entry {
@@ -33,6 +37,8 @@ interface Entry {
   size?: number;
   status: 'ok' | 'error';
   error?: string;
+  lastAccessed?: string;
+  accessCount?: number;
 }
 
 const MAX_FILENAME_LEN = 80;
@@ -46,6 +52,9 @@ function safeFilenameSlug(name: string): string {
 export async function runDownloadNotebooks(args: DownloadNotebooksArgs): Promise<void> {
   const outDir = args.outDir ?? OUT_DIR;
   const nbDir = join(outDir, 'notebooks');
+  // Fresh dump: clear any prior download so the output reflects exactly this run
+  // (avoids leaving stale/deleted notebooks behind, esp. when usage-scoping).
+  await rm(nbDir, { recursive: true, force: true });
   await mkdir(nbDir, { recursive: true });
 
   const client = new DocumentClient({
@@ -74,6 +83,21 @@ export async function runDownloadNotebooks(args: DownloadNotebooksArgs): Promise
     console.log(`  notebooks: list FAILED — ${sourceError}`);
   }
 
+  // Usage scoping: keep only notebooks opened in the last N days.
+  let usage: Map<string, UsageInfo> | undefined;
+  if (args.usedWithinDays && listed.length) {
+    console.log(`  scoping to notebooks opened in the last ${args.usedWithinDays}d...`);
+    try {
+      const dql = new DqlClient({ baseUrl: args.baseUrl, token: args.token });
+      usage = await fetchUsedDocumentIds(dql, APP_ID.notebooks, args.usedWithinDays);
+      const before = listed.length;
+      listed = listed.filter((d) => usage!.has(d.id));
+      console.log(`  ${listed.length}/${before} notebooks used in window (${usage.size} used docs seen)`);
+    } catch (e) {
+      console.log(`  usage query FAILED (${(e as Error).message}); downloading all notebooks unscoped.`);
+    }
+  }
+
   const queue = args.limit ? listed.slice(0, args.limit) : listed;
   console.log(`  downloading ${queue.length} notebooks...`);
   const entries: Entry[] = [];
@@ -91,7 +115,17 @@ export async function runDownloadNotebooks(args: DownloadNotebooksArgs): Promise
         2
       );
       await writeFile(filePath, payload);
-      entries.push({ id: doc.id, name: doc.name, owner: doc.owner, filePath, size: payload.length, status: 'ok' });
+      const u = usage?.get(doc.id);
+      entries.push({
+        id: doc.id,
+        name: doc.name,
+        owner: doc.owner,
+        filePath,
+        size: payload.length,
+        status: 'ok',
+        lastAccessed: u?.lastAccessed,
+        accessCount: u?.accessCount,
+      });
       fetched++;
       if ((i + 1) % 50 === 0 || i === queue.length - 1) console.log(`  ${i + 1}/${queue.length}`);
     } catch (e) {

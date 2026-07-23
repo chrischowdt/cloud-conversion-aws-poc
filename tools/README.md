@@ -95,11 +95,11 @@ Writes the full result to `tools/out/dql_<timestamp>.json` and prints the first 
 The user-facing migration loop and its tenant-probing helpers. See CLAUDE.md
 ("CLI surface") for the authoritative, fully-flagged list — summary here:
 
-- `download-dashboards` — dump every dashboard (new + classic) as JSON.
+- `download-dashboards` — dump every dashboard (new + classic) as JSON. Clears the dir first; `--used-within-days <N>` scopes the new side to dashboards opened in the last N days (usage via `dt.system.events`).
 - `scan-dashboards` — run the rewriter over the corpus, filter to AWS, emit a coverage report (offline).
 - `rewrite-dashboard --in <file>` — produce `.rewritten.json`, `.rewrite-report.md`, and an upload-ready `.upload.json`.
 - `compare-dashboard --in <file>` — run original vs rewritten queries against the tenant and classify parity.
-- `download-notebooks` / `scan-notebooks` — same rewriter over notebooks (Document Service `type=='notebook'`; DQL at `sections[].state.input.value`). Report under `notebook-scan/`.
+- `download-notebooks` / `scan-notebooks` — same rewriter over notebooks (Document Service `type=='notebook'`; DQL at `sections[].state.input.value`). `download-notebooks --used-within-days <N>` scopes to notebooks opened in the last N days. Report under `notebook-scan/`.
 - `download-anomaly-detectors` / `scan-anomaly-detectors` — same rewriter over Davis anomaly detectors (Settings 2.0 `builtin:davis.anomaly-detectors`; DQL at `analyzer.input[].value`). Report under `anomaly-detector-scan/`.
 - `discover-fields` / `discover-tags` / `discover-metrics` — probe the tenant for Smartscape field schemas, which AWS tags the new connection enriches (`enriched-tags.json`), and the live new-connection metric inventory (`live-metrics.json`).
 - `discover --by-account` + `reconcile-metrics [--by-account]` — join classic keys → mapped new key → live inventory to decide **which metric keys to add to the new integration** (incl. the Metric Streams case). Emits `metric-reconciliation.csv|.md` (+ `-by-account`).
@@ -131,6 +131,7 @@ src/
     ├── asset-scan.ts            Shared scan core (markers, classifier) — App-portable
     ├── asset-scan-run.ts        Node runner + coverage-report writer
     ├── asset-extractors.ts      Pull DQL out of notebooks / anomaly detectors
+    ├── asset-usage.ts           Which documents were opened in the last N days
     ├── metric-reconcile.ts      Classic→new key reconciliation (add-to-integration)
     ├── dql-parser.ts            timeseries record → TimeSeriesPoint[]
     ├── markdown.ts              Tiny md table helpers

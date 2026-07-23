@@ -18,7 +18,7 @@
  * It still saves whatever it could fetch.
  */
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -27,7 +27,9 @@ import {
   type ClassicDashboardListItem,
 } from '../dynatrace/classic-dashboards.ts';
 import { DocumentApiError, DocumentClient, type Document } from '../dynatrace/document.ts';
+import { DqlClient } from '../dynatrace/dql.ts';
 import { OUT_DIR } from '../lib/paths.ts';
+import { APP_ID, fetchUsedDocumentIds, type UsageInfo } from '../lib/asset-usage.ts';
 
 export interface DownloadDashboardsArgs {
   baseUrl: string;
@@ -39,6 +41,12 @@ export interface DownloadDashboardsArgs {
   skipClassic?: boolean;
   /** Limit how many of each kind to download (for testing). */
   limit?: number;
+  /**
+   * Only download NEW dashboards opened in the last N days (usage-scoped via
+   * dt.system.events). Classic dashboards aren't documents, so this filter
+   * doesn't apply to them.
+   */
+  usedWithinDays?: number;
 }
 
 interface NewEntry {
@@ -52,6 +60,8 @@ interface NewEntry {
   size?: number;
   status: 'ok' | 'error';
   error?: string;
+  lastAccessed?: string;
+  accessCount?: number;
 }
 
 interface ClassicEntry {
@@ -90,6 +100,10 @@ export async function runDownloadDashboards(args: DownloadDashboardsArgs): Promi
   const dashDir = join(outDir, 'dashboards');
   const newDir = join(dashDir, 'new');
   const classicDir = join(dashDir, 'classic');
+  // Fresh dump: clear the dir for each side we're about to (re)download so the
+  // output reflects exactly this run — no stale/deleted or out-of-scope files.
+  if (!args.skipNew) await rm(newDir, { recursive: true, force: true });
+  if (!args.skipClassic) await rm(classicDir, { recursive: true, force: true });
   await mkdir(newDir, { recursive: true });
   await mkdir(classicDir, { recursive: true });
 
@@ -129,6 +143,21 @@ export async function runDownloadDashboards(args: DownloadDashboardsArgs): Promi
       manifest.newDashboards.sourceError = msg;
     }
 
+    // Usage scoping: keep only new dashboards opened in the last N days.
+    let usage: Map<string, UsageInfo> | undefined;
+    if (args.usedWithinDays && listed.length) {
+      console.log(`  scoping to dashboards opened in the last ${args.usedWithinDays}d...`);
+      try {
+        const dql = new DqlClient({ baseUrl: args.baseUrl, token: args.token });
+        usage = await fetchUsedDocumentIds(dql, APP_ID.dashboards, args.usedWithinDays);
+        const before = listed.length;
+        listed = listed.filter((d) => usage!.has(d.id));
+        console.log(`  ${listed.length}/${before} new dashboards used in window (${usage.size} used docs seen)`);
+      } catch (e) {
+        console.log(`  usage query FAILED (${(e as Error).message}); downloading all new dashboards unscoped.`);
+      }
+    }
+
     const newQueue = args.limit ? listed.slice(0, args.limit) : listed;
     console.log(`  downloading ${newQueue.length} new dashboards...`);
     for (let i = 0; i < newQueue.length; i++) {
@@ -157,6 +186,8 @@ export async function runDownloadDashboards(args: DownloadDashboardsArgs): Promi
           filePath,
           size: payload.length,
           status: 'ok',
+          lastAccessed: usage?.get(doc.id)?.lastAccessed,
+          accessCount: usage?.get(doc.id)?.accessCount,
         });
         manifest.newDashboards.fetched++;
         if ((i + 1) % 25 === 0 || i === newQueue.length - 1) {

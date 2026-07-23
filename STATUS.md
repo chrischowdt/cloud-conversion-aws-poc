@@ -65,6 +65,19 @@ manual-migration blocker as dashboards. Other blockers are genuine: classic ELB
 NLB), Metric Streams camelCase keys, and the unknown-metric tail. Reports:
 `<tenant>/{notebook-scan,anomaly-detector-scan}/summary.md`. Tests 224→238.
 
+**Usage-scoped, fresh downloads (2026-07-23).** The dashboard dump was stale
+(late May). `download-dashboards` / `download-notebooks` now **clear their target
+dir first** (a dump reflects the current tenant, not accumulated deleted assets)
+and take `--used-within-days <N>`, which keeps only documents *opened* in the
+last N days — usage from `dt.system.events` AUDIT_EVENT GETs by the Dashboards/
+Notebooks apps (`lib/asset-usage.ts`; parses the documentId out of the
+`/documents/<id>/content` resource). Manifests record `lastAccessed`/`accessCount`.
+90-day scope on nic55601: dashboards 4,586→**1,868**, notebooks 3,305→**1,063**
+(existing ∩ used). Fresh scoped coverage: **dashboards** 218 AWS / 5,818 queries →
+48.6% converted all-up (73.6% AWS-relevant); **notebooks** 115 AWS / 953 AWS
+queries → 51.9% converted. (Davis anomaly detectors are Settings objects, not
+documents, so this usage signal doesn't apply — left at full scope, 39.4%.)
+
 **Deferred (asked + parked):** (1) classic **metric events**
 (`builtin:anomaly-detection.metric-events`, ~1,100 objects, ~66% AWS) use classic
 metric *selectors* (`queryDefinition.metricKey`/`metricSelector` + `entityFilter`),

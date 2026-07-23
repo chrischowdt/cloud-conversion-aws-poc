@@ -188,11 +188,16 @@ COMMANDS
   download-dashboards
                     Pull every dashboard from the tenant for offline
                     analysis: new dashboards via Document Service, classic
-                    dashboards via Config API v1.
+                    dashboards via Config API v1. Clears the target dir first
+                    (fresh dump). Flags: --skip-new, --skip-classic, --limit,
+                    --used-within-days <N> (scope NEW dashboards to those opened
+                    in the last N days, via dt.system.events).
   download-notebooks
                     Pull every notebook (Document Service, type=notebook)
                     for offline analysis. DQL lives in
-                    sections[].state.input.value.
+                    sections[].state.input.value. Clears the target dir first.
+                    Flags: --limit, --used-within-days <N> (scope to notebooks
+                    opened in the last N days).
   download-anomaly-detectors
                     Pull Davis anomaly detectors (Settings 2.0,
                     builtin:davis.anomaly-detectors) whose analyzer input
@@ -434,6 +439,7 @@ async function main(): Promise<void> {
         limit: getNumber(args.flags, 'limit'),
         skipNew: args.flags.get('skip-new') === true,
         skipClassic: args.flags.get('skip-classic') === true,
+        usedWithinDays: getNumber(args.flags, 'used-within-days'),
         outDir: tenantOut(args.flags, baseUrl),
       });
       return;
@@ -477,6 +483,7 @@ async function main(): Promise<void> {
         token,
         outDir: tenantOut(args.flags, baseUrl),
         limit: getNumber(args.flags, 'limit'),
+        usedWithinDays: getNumber(args.flags, 'used-within-days'),
       });
       return;
     }
