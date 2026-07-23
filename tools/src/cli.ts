@@ -30,6 +30,7 @@ import { runDiscoverTags } from './commands/discover-tags.ts';
 import { runRewriteDashboard } from './commands/rewrite-dashboard.ts';
 import { runRewriteDql } from './commands/rewrite-dql.ts';
 import { runScanDashboards } from './commands/scan-dashboards.ts';
+import { runReconcileMetrics } from './commands/reconcile-metrics.ts';
 import { SHARED_OUT_DIR, tenantOutDir } from './lib/paths.ts';
 import type { CloudProvider } from './lib/types.ts';
 
@@ -150,6 +151,15 @@ COMMANDS
                     empty .By.<Dim> variants: if a DAC-mapped key has no data
                     but a sibling dim does, it prefers the populated one.
                     Flags: --from, --da-source.
+  reconcile-metrics Join this tenant's classic keys (discover) to their new
+                    equivalents (mapping chain), then check each against the
+                    live inventory (discover-metrics). Emits
+                    metric-reconciliation.csv + .md showing which metrics the
+                    new integration already collects, which to enable, and
+                    which have no standard equivalent (custom/Metric Streams).
+                    Run discover + discover-metrics first. Flags: --min-series,
+                    --by-account (per-account CSV; needs discover --by-account),
+                    --env/--base-url/--out-dir, --mapping.
   discover-entity-types
                     Derive the AWS service -> Smartscape node-type bridge from
                     live metrics' dt.smartscape_source.type (writes
@@ -300,6 +310,7 @@ async function main(): Promise<void> {
         from: getString(args.flags, 'from'),
         to: getString(args.flags, 'to'),
         outDir: tenantOut(args.flags, baseUrl),
+        byAccount: args.flags.get('by-account') === true,
       });
       return;
     }
@@ -437,6 +448,26 @@ async function main(): Promise<void> {
         all: args.flags.get('all') === true,
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),
+      });
+      return;
+    }
+    case 'reconcile-metrics': {
+      // Offline: joins this tenant's tenant_keys.aws.json (discover) to
+      // live-metrics.json (discover-metrics). Resolve the env like other
+      // offline commands.
+      const outDir = offlineTenantOut(args.flags);
+      if (!outDir) {
+        throw new Error(
+          'reconcile-metrics: cannot tell which tenant to reconcile. Pass --env <id>, ' +
+            '--base-url <url>, set DT_BASE_URL, or pass --out-dir <dir>.'
+        );
+      }
+      await runReconcileMetrics({
+        outDir,
+        mappingPath: getString(args.flags, 'mapping'),
+        minSeries: getNumber(args.flags, 'min-series'),
+        minOverrideSeries: getNumber(args.flags, 'min-override-series'),
+        byAccount: args.flags.get('by-account') === true,
       });
       return;
     }

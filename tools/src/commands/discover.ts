@@ -28,6 +28,15 @@ export interface DiscoverArgs {
   from?: string;
   to?: string;
   outDir?: string;
+  /**
+   * Also emit `tenant_keys_by_account.aws.json` — the same classic/new split,
+   * but grouped by `aws.account.id` as well as metric key. Feeds
+   * `reconcile-metrics --by-account`. NOTE: classic series mostly don't carry
+   * `aws.account.id` (account lives in the classic entity model), so the
+   * classic side is only partially covered per account; the new side is
+   * complete.
+   */
+  byAccount?: boolean;
 }
 
 const DEFAULT_KEY_PREFIXES = ['cloud.aws.'];
@@ -245,6 +254,58 @@ export async function runDiscover(args: DiscoverArgs): Promise<void> {
       2
     )
   );
+
+  // Optional: per-account classic/new split, for reconcile-metrics --by-account.
+  if (args.byAccount) {
+    const acctDql = `
+      fetch metric.series, from: ${from}, to: ${to}
+      | filter ${buildPrefixFilter(prefixes)}
+      | filter isNotNull(aws.account.id)
+      | summarize {
+          classic = countIf(isNull(dt.smartscape_source.type)),
+          new = countIf(isNotNull(dt.smartscape_source.type))
+        }, by: { aws.account.id, metric.key }
+      | filter classic > 0 or new > 0
+      | sort \`aws.account.id\` asc, \`metric.key\` asc
+    `.trim();
+
+    console.log('Discovering per-account classic/new key split…');
+    const acctResult = await client.query({
+      query: acctDql,
+      maxResultRecords: 200_000,
+      fetchTimeoutSeconds: 120,
+    });
+    // { "<account>": { classic: {key:count}, new: {key:count} } }
+    const accounts: Record<string, { classic: Record<string, number>; new: Record<string, number> }> = {};
+    for (const r of acctResult.records) {
+      const acct = r['aws.account.id'] as string | undefined;
+      const key = (r['metric.key'] ?? r['metricKey']) as string | undefined;
+      if (!acct || !key) continue;
+      const c = toNumber(r['classic']);
+      const nw = toNumber(r['new']);
+      const bucket = (accounts[acct] ??= { classic: {}, new: {} });
+      if (c > 0) bucket.classic[key] = c;
+      if (nw > 0) bucket.new[key] = nw;
+    }
+    const outPath = join(outDir, 'tenant_keys_by_account.aws.json');
+    await writeFile(
+      outPath,
+      JSON.stringify(
+        {
+          generated: new Date().toISOString(),
+          baseUrl: args.baseUrl,
+          window: { from, to },
+          dql: acctDql,
+          accountCount: Object.keys(accounts).length,
+          accounts,
+        },
+        null,
+        2
+      )
+    );
+    console.log(`  ${Object.keys(accounts).length} accounts with cloud.aws.* data`);
+    console.log(`Wrote ${outPath}`);
+  }
 
   console.log('');
   console.log(`Total cloud.aws.* keys      : ${keys.length}`);

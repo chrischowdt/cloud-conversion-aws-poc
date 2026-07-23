@@ -112,6 +112,7 @@ Two pipelines that share the rewriter:
 - `equivalence` → checks classic↔new metric pairs produce same data
 - `detect` / `detect-all` / `detect-per-resource` → fits aggregation + scale recipes per pair (top-K resource sampling is the most reliable mode)
 - `merge-recipes` → folds detected recipes back into `mappings/aws_mapping.json`
+- `reconcile-metrics` → offline join of a tenant's classic keys (`discover`) → mapped new key (lookup chain) → live inventory (`discover-metrics`). Emits `metric-reconciliation.csv` + `.md` bucketing every classic-with-data key as **collected** / **add-to-new** (mapped to a real new key not flowing here) / **unmapped-add-metric** (service onboarded, this metric absent) / **custom-or-metric-streams** (service not collected at all → arbitrary custom key). The unmapped tail is placed via a classic→new *service bridge* built from the pairs that did map, plus a conservative metric-name match (heuristic `unmapped-likely-collected` rows are labelled "verify"). Answers "which metric keys must we add to the new integration?". Logic in `lib/metric-reconcile.ts` (pure, tested).
 
 **Dashboard pipeline** (the user-facing migration loop):
 - `download-dashboards` → dumps every dashboard (new platform + classic) as JSON
