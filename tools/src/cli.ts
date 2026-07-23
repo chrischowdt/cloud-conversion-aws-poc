@@ -31,6 +31,10 @@ import { runRewriteDashboard } from './commands/rewrite-dashboard.ts';
 import { runRewriteDql } from './commands/rewrite-dql.ts';
 import { runScanDashboards } from './commands/scan-dashboards.ts';
 import { runReconcileMetrics } from './commands/reconcile-metrics.ts';
+import { runDownloadNotebooks } from './commands/download-notebooks.ts';
+import { runDownloadAnomalyDetectors } from './commands/download-anomaly-detectors.ts';
+import { runScanNotebooks } from './commands/scan-notebooks.ts';
+import { runScanAnomalyDetectors } from './commands/scan-anomaly-detectors.ts';
 import { SHARED_OUT_DIR, tenantOutDir } from './lib/paths.ts';
 import type { CloudProvider } from './lib/types.ts';
 
@@ -185,6 +189,21 @@ COMMANDS
                     Pull every dashboard from the tenant for offline
                     analysis: new dashboards via Document Service, classic
                     dashboards via Config API v1.
+  download-notebooks
+                    Pull every notebook (Document Service, type=notebook)
+                    for offline analysis. DQL lives in
+                    sections[].state.input.value.
+  download-anomaly-detectors
+                    Pull Davis anomaly detectors (Settings 2.0,
+                    builtin:davis.anomaly-detectors) whose analyzer input
+                    carries DQL. Flags: --schema to override the schema id.
+  scan-notebooks    Run the rewriter against downloaded notebooks (filtered
+                    to AWS-referencing ones); emits a coverage report under
+                    notebook-scan/. Flags: --all, --limit, --input-dir.
+  scan-anomaly-detectors
+                    Run the rewriter against downloaded Davis anomaly
+                    detectors; emits a coverage report under
+                    anomaly-detector-scan/. Flags: --all, --limit, --input-file.
   scan-dashboards   Run the DQL rewriter against every downloaded new
                     dashboard, filtered to AWS-using ones. Emits a coverage
                     summary + per-dashboard JSONL.
@@ -444,6 +463,62 @@ async function main(): Promise<void> {
         inputDir: getString(args.flags, 'input-dir'),
         mappingPath: getString(args.flags, 'mapping'),
         outDir,
+        limit: getNumber(args.flags, 'limit'),
+        all: args.flags.get('all') === true,
+        liveMetricsPath: getString(args.flags, 'live-metrics'),
+        minOverrideSeries: getNumber(args.flags, 'min-override-series'),
+      });
+      return;
+    }
+    case 'download-notebooks': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDownloadNotebooks({
+        baseUrl,
+        token,
+        outDir: tenantOut(args.flags, baseUrl),
+        limit: getNumber(args.flags, 'limit'),
+      });
+      return;
+    }
+    case 'download-anomaly-detectors': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDownloadAnomalyDetectors({
+        baseUrl,
+        token,
+        outDir: tenantOut(args.flags, baseUrl),
+        schemaId: getString(args.flags, 'schema'),
+      });
+      return;
+    }
+    case 'scan-notebooks': {
+      const outDir = offlineTenantOut(args.flags);
+      if (!outDir && !getString(args.flags, 'input-dir')) {
+        throw new Error(
+          'scan-notebooks: pass --env <id>, --base-url <url>, set DT_BASE_URL, or pass --input-dir.'
+        );
+      }
+      await runScanNotebooks({
+        inputDir: getString(args.flags, 'input-dir'),
+        outDir,
+        mappingPath: getString(args.flags, 'mapping'),
+        limit: getNumber(args.flags, 'limit'),
+        all: args.flags.get('all') === true,
+        liveMetricsPath: getString(args.flags, 'live-metrics'),
+        minOverrideSeries: getNumber(args.flags, 'min-override-series'),
+      });
+      return;
+    }
+    case 'scan-anomaly-detectors': {
+      const outDir = offlineTenantOut(args.flags);
+      if (!outDir && !getString(args.flags, 'input-file')) {
+        throw new Error(
+          'scan-anomaly-detectors: pass --env <id>, --base-url <url>, set DT_BASE_URL, or pass --input-file.'
+        );
+      }
+      await runScanAnomalyDetectors({
+        inputFile: getString(args.flags, 'input-file'),
+        outDir,
+        mappingPath: getString(args.flags, 'mapping'),
         limit: getNumber(args.flags, 'limit'),
         all: args.flags.get('all') === true,
         liveMetricsPath: getString(args.flags, 'live-metrics'),

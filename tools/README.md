@@ -90,7 +90,7 @@ npm run dql -- --file query.dql --from now-24h --to now
 
 Writes the full result to `tools/out/dql_<timestamp>.json` and prints the first 10 records.
 
-### Dashboard pipeline + discovery
+### Asset pipeline + discovery
 
 The user-facing migration loop and its tenant-probing helpers. See CLAUDE.md
 ("CLI surface") for the authoritative, fully-flagged list — summary here:
@@ -99,7 +99,10 @@ The user-facing migration loop and its tenant-probing helpers. See CLAUDE.md
 - `scan-dashboards` — run the rewriter over the corpus, filter to AWS, emit a coverage report (offline).
 - `rewrite-dashboard --in <file>` — produce `.rewritten.json`, `.rewrite-report.md`, and an upload-ready `.upload.json`.
 - `compare-dashboard --in <file>` — run original vs rewritten queries against the tenant and classify parity.
+- `download-notebooks` / `scan-notebooks` — same rewriter over notebooks (Document Service `type=='notebook'`; DQL at `sections[].state.input.value`). Report under `notebook-scan/`.
+- `download-anomaly-detectors` / `scan-anomaly-detectors` — same rewriter over Davis anomaly detectors (Settings 2.0 `builtin:davis.anomaly-detectors`; DQL at `analyzer.input[].value`). Report under `anomaly-detector-scan/`.
 - `discover-fields` / `discover-tags` / `discover-metrics` — probe the tenant for Smartscape field schemas, which AWS tags the new connection enriches (`enriched-tags.json`), and the live new-connection metric inventory (`live-metrics.json`).
+- `discover --by-account` + `reconcile-metrics [--by-account]` — join classic keys → mapped new key → live inventory to decide **which metric keys to add to the new integration** (incl. the Metric Streams case). Emits `metric-reconciliation.csv|.md` (+ `-by-account`).
 
 `discover-metrics` feeds **dim-variant validation**: when the DAC maps a classic
 key to a `.By.<Dim>` variant that has no series on the tenant, the lookup chain
@@ -120,8 +123,15 @@ src/
 │   ├── equivalence.ts           Per-pair value comparison via DQL
 │   └── dql.ts                   Raw DQL runner
 ├── dynatrace/
-│   └── dql.ts                   Grail Storage Query client (Bearer auth)
+│   ├── dql.ts                   Grail Storage Query client (Bearer auth)
+│   ├── document.ts              Document Service client (dashboards, notebooks)
+│   └── settings.ts              Settings 2.0 client (Davis anomaly detectors)
 └── lib/
+    ├── dql-rewriter.ts          The multi-pass classic→Smartscape DQL rewriter
+    ├── asset-scan.ts            Shared scan core (markers, classifier) — App-portable
+    ├── asset-scan-run.ts        Node runner + coverage-report writer
+    ├── asset-extractors.ts      Pull DQL out of notebooks / anomaly detectors
+    ├── metric-reconcile.ts      Classic→new key reconciliation (add-to-integration)
     ├── dql-parser.ts            timeseries record → TimeSeriesPoint[]
     ├── markdown.ts              Tiny md table helpers
     ├── paths.ts                 Repo-relative path constants
@@ -131,4 +141,4 @@ src/
 
 ## Reusing in the Dynatrace App
 
-`src/dynatrace/dql.ts`, `src/lib/dql-parser.ts`, `src/lib/stats.ts`, and `src/lib/types.ts` have no third-party dependencies. The App can import them directly; replace the constructor's `baseUrl`/`token` with whatever the App uses for auth.
+`src/dynatrace/{dql,document,settings}.ts`, `src/lib/dql-parser.ts`, `src/lib/stats.ts`, `src/lib/types.ts`, and the scan core `src/lib/asset-scan.ts` have no third-party dependencies (asset-scan is fetch/fs-free — only `asset-scan-run.ts` touches `node:fs`). The App can import them directly; replace the client constructors' `baseUrl`/`token` with whatever the App uses for auth.

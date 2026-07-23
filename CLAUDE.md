@@ -124,6 +124,12 @@ Two pipelines that share the rewriter:
 - `discover-metrics` → inventories live new-connection metric keys + series counts (writes `live-metrics.json`); feeds the dim-variant validation in the lookup chain
 - `rewrite-dql` → single-query interactive form
 
+**Notebook + anomaly-detector pipeline** (same rewriter, other asset types):
+- `download-notebooks` → dumps every notebook (Document Service, `type == 'notebook'`) as `<tenant>/notebooks/<id>__<slug>.json` (same `{ metadata, content }` wrapper as dashboards). Notebook DQL lives in `content.sections[].state.input.value`.
+- `download-anomaly-detectors` → dumps Davis anomaly detectors (Settings 2.0 `builtin:davis.anomaly-detectors`, via `dynatrace/settings.ts`) to `<tenant>/anomaly-detectors/objects.json`. DQL lives in `value.analyzer.input[]` under `key == "query"`. (Classic `builtin:anomaly-detection.metric-events` use metric *selectors*, not DQL — a separate transform, not yet built.)
+- `scan-notebooks` / `scan-anomaly-detectors` → run the rewriter over the extracted DQL, filtered to AWS-referencing assets, emitting a coverage report (`<subdir>/summary.json|results.jsonl|summary.md`). Both are thin wrappers over the shared scan core.
+- Shared core: `lib/asset-scan.ts` (AWS markers incl. the **bare `cloud.aws.`** form these assets use, `looksLikeDql`, `classifyRewrite` into clean/soft/blocked/no-op, `ScanAccumulator`) — kept fetch/fs-free for App reuse; `lib/asset-scan-run.ts` (Node runner + report writer); `lib/asset-extractors.ts` (`extractNotebookQueries`, `extractDetectorQueries`, pure + tested). The bucketing matches `scan-dashboards` so reports are comparable.
+
 ### Dashboard JSON has dual representation
 
 This is the biggest non-obvious thing in the codebase. A new-platform dashboard tile carries BOTH:

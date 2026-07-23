@@ -1,10 +1,77 @@
-# Project status — AWS classic→Smartscape dashboard conversion
+# Project status — AWS classic→Smartscape asset conversion
 
-_Snapshot for transferring context between sessions. Updated 2026-06-16._
+_Snapshot for transferring context between sessions. Updated 2026-07-23._
 
 This is a **living status doc**, not background. `RESEARCH.md` / `GAP_ANALYSIS.md`
 are dated and frozen; `INTEGRATION.md` explains the two-halves composition;
 `CLAUDE.md` is the architecture reference. This file is "where we are right now."
+
+Scope has grown beyond dashboards: the same DQL rewriter now also drives
+**notebooks** and **Davis anomaly detectors**, and a **metric reconciliation**
+answers "which metric keys must we add to the new integration?" (see the
+2026-07-23 section).
+
+## 2026-07-23 — metric reconciliation + notebooks & Davis anomaly detectors
+
+**Metric reconciliation (`reconcile-metrics`).** Offline join: a tenant's
+discovered classic keys (`discover`) → mapped new key (lookup chain) → live
+new-integration inventory (`discover-metrics`). Buckets every classic-with-data
+key as **collected** / **add-to-new** (maps to a real new key not flowing here)
+/ **unmapped-add-metric** (service onboarded, this metric absent) /
+**custom-or-metric-streams** (service not collected at all → arbitrary custom
+key — the Metric Streams case). Answers "which metric keys must we add to the new
+integration?". Pure logic in `lib/metric-reconcile.ts` (tested); the unmapped
+tail is placed via a data-driven classic→new *service bridge* + a conservative
+metric-name match (heuristic rows labelled "verify"). **nic55601 snapshot:** 1000
+classic-with-data keys vs 579 live new keys → **485 already collected**, **515
+add-candidates** (292 add-to-new [263 autodiscovered → add via `recommended +
+custom`, 29 recommended-but-absent → verify resource present], 186
+service-onboarded-metric-absent, 37 service-entirely-absent → custom/Metric
+Streams). `--by-account` also emits a per-account CSV (791 accounts). **Caveat:**
+classic series mostly don't carry `aws.account.id` (account lives in the classic
+entity model), so the per-account *classic* side is partial (375/791 accounts
+carry any account-tagged classic key); the *new* side is complete. Artifacts:
+`<tenant>/metric-reconciliation.csv|.md` (+ `-by-account`). Committed `ec24062`.
+
+**Notebooks + Davis anomaly detectors — same rewriter, new asset types.** The
+download+scan framework now covers three asset types. New commands:
+`download-notebooks` / `scan-notebooks` (Document Service `type=='notebook'`; DQL
+at `sections[].state.input.value`) and `download-anomaly-detectors` /
+`scan-anomaly-detectors` (Settings 2.0 `builtin:davis.anomaly-detectors` via
+`dynatrace/settings.ts`; DQL at `analyzer.input[].value` where `key=="query"`).
+Shared scan core `lib/asset-scan.ts` (AWS markers incl. the **bare `cloud.aws.`**
+form these assets use — dashboards use `dt.cloud.aws.`; `classifyRewrite`
+clean/soft/blocked/no-op identical to `scan-dashboards`; App-portable) +
+`asset-scan-run.ts` (Node runner/report) + `asset-extractors.ts` (pure, tested).
+
+Scanners filter to **AWS-referencing queries per-query** (a notebook averages
+~40 cells, most unrelated logs/other-cloud; `--all` overrides) so the rate isn't
+drowned in non-AWS no-ops. Per-query rewrite errors are **isolated** (non-fatal,
+recorded) — this surfaced a latent `RangeError: Invalid array length` the
+rewriter throws on one *non-AWS* query; out of scope (we don't process it), but
+the isolation keeps a batch of thousands from dying on one input.
+
+**nic55601 coverage:**
+
+| asset | total | AWS | AWS queries | converted | blocked | no-op |
+|---|--:|--:|--:|--:|--:|--:|
+| notebooks | 3,305 | 384 | 2,386 | **56.8%** | 37.8% | 5.3% |
+| Davis anomaly detectors | 1,083 | 645 | 645 | **39.4%** | 60.6% | 0% |
+
+Anomaly detectors convert lower because they lean on the
+`classicEntitySelector("type(custom_device),tag(\"[AWS]…\"))` idiom — the same
+manual-migration blocker as dashboards. Other blockers are genuine: classic ELB
+(`dt.entity.elastic_load_balancer`, no new equivalent → re-architect onto ALB/
+NLB), Metric Streams camelCase keys, and the unknown-metric tail. Reports:
+`<tenant>/{notebook-scan,anomaly-detector-scan}/summary.md`. Tests 224→238.
+
+**Deferred (asked + parked):** (1) classic **metric events**
+(`builtin:anomaly-detection.metric-events`, ~1,100 objects, ~66% AWS) use classic
+metric *selectors* (`queryDefinition.metricKey`/`metricSelector` + `entityFilter`),
+**not DQL** — a separate transform path (map the metricKey via the lookup chain +
+translate the entityFilter dimension). (2) **Re-importable rewrite artifacts** for
+notebooks/detectors (like the dashboard `.upload.json` / a Settings PUT-ready
+object). This pass is scan + coverage report only (non-mutating).
 
 ## 2026-06-16 — product-team knowledge base added (`product-ai-knowledgebase/`)
 
