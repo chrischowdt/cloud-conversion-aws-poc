@@ -35,6 +35,7 @@ import { runDownloadNotebooks } from './commands/download-notebooks.ts';
 import { runDownloadAnomalyDetectors } from './commands/download-anomaly-detectors.ts';
 import { runScanNotebooks } from './commands/scan-notebooks.ts';
 import { runScanAnomalyDetectors } from './commands/scan-anomaly-detectors.ts';
+import { runMigrateRefresh } from './commands/migrate-refresh.ts';
 import { SHARED_OUT_DIR, tenantOutDir } from './lib/paths.ts';
 import type { CloudProvider } from './lib/types.ts';
 
@@ -155,6 +156,11 @@ COMMANDS
                     empty .By.<Dim> variants: if a DAC-mapped key has no data
                     but a sibling dim does, it prefers the populated one.
                     Flags: --from, --da-source.
+  migrate-refresh   Build/refresh the shared migration tracker (.xlsx) from
+                    scan + compare + manifest artifacts already on disk. Read-only
+                    (no tenant/dtctl). Assigns each AWS asset a confidence + lane
+                    (fast/review/blocked) and preserves human decision/notes.
+                    Flags: --env/--base-url/--out-dir, --tracker <path>.
   reconcile-metrics Join this tenant's classic keys (discover) to their new
                     equivalents (mapping chain), then check each against the
                     live inventory (discover-metrics). Emits
@@ -530,6 +536,20 @@ async function main(): Promise<void> {
         all: args.flags.get('all') === true,
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),
+      });
+      return;
+    }
+    case 'migrate-refresh': {
+      // Offline: builds the .xlsx tracker from scan/compare/manifest artifacts.
+      const outDir = offlineTenantOut(args.flags);
+      if (!outDir) {
+        throw new Error(
+          'migrate-refresh: pass --env <id>, --base-url <url>, set DT_BASE_URL, or --out-dir <dir>.'
+        );
+      }
+      await runMigrateRefresh({
+        outDir,
+        trackerPath: getString(args.flags, 'tracker'),
       });
       return;
     }

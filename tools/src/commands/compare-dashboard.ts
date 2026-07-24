@@ -410,6 +410,28 @@ export async function runCompareDashboard(args: CompareDashboardArgs): Promise<v
 
   const body = rows.map(renderRow).join('\n---\n\n');
   await writeFile(outPath, header + body);
+
+  // JSON sibling so downstream tooling (migrate-refresh) can read parity
+  // programmatically — the markdown is for humans, this is for the tracker.
+  const jsonPath = join(outDir, `${baseName}.compare.json`);
+  await writeFile(
+    jsonPath,
+    JSON.stringify(
+      {
+        generated: new Date().toISOString(),
+        id: wrapper.metadata?.id ?? null,
+        name: dashName,
+        source: inputPath,
+        tenant: args.baseUrl,
+        timeframe: { from: args.from ?? '-2h', to: args.to ?? 'now' },
+        parityCounts,
+        tiles: rows.map((r) => ({ path: r.path, field: r.field, parity: r.parity, notes: r.parityNotes })),
+      },
+      null,
+      2
+    )
+  );
+
   console.log('');
   console.log('Parity breakdown:', parityCounts);
   console.log(`Wrote ${outPath}`);
