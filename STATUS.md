@@ -45,14 +45,27 @@ asset seamlessly); drift guard aborts if the original changed since we based on
 it; `pre_promote_version` makes rollback one command; nothing writes without
 `--apply`. Tests 259→272; typecheck clean.
 
-**Prerequisite / open:** dtctl must be installed with a readwrite context + write
-scopes — it was **NOT present in the build environment**, so the live `--apply`
-path (create/cutover/restore) is written to dtctl's documented interface but
-**not yet smoke-tested against a real dtctl**; validate on one low-risk dashboard
-before batch cutovers. Also unconfirmed live: `dtctl apply` accepting our JSON
-apply files, the create-result id shape (`idFromApplyResult`), and `externalId`
-on create (linkage currently lives in the tracker). PREPARE mode + the pure
-builders (`dtctl-apply`, `asset-confidence`, `tracker-xlsx`) are fully validated.
+**Live validation (2026-07-24, dtctl 0.35.0 against nic55601 — `ualpre` is a DNS
+alias for the same tenant):** wrapper + parsers confirmed against the real CLI —
+the `--agent` envelope, the `get` shape (`versionFromGet`→top-level `version`,
+`contentFromGet`→`result.content`), and the create-result id (`idFromApplyResult`).
+Ran the **non-destructive path live** on a self-owned dashboard:
+`migrate-stage --apply` → `migrate-pull` → `dtctl delete` (create copy, fetch it
+back, remove it) — all clean, then reset the tracker row. dtctl 0.35 has **no
+`auth can-i`**; the write preflight now uses the global `--check-scopes` flag
+(commit 43888da), and the wrapper got a 120s timeout.
+
+**Still to exercise live:** the in-place cutover (`migrate-promote --apply`) +
+`migrate-rollback` — they mutate a real original, so validate on one low-usage
+owned dashboard with an immediate rollback before any batch.
+
+**Permission caveat (important for scale):** dtctl acts as the OAuth **user**
+(chris.chow), which is narrower than cct's admin platform token — private
+documents owned by *others* return **403 Document not accessible**. So
+staging/cutover only covers assets the dtctl identity can access (on nic55601,
+**13 of the 333** AWS assets are owned by that user). Fleet-wide cutover needs a
+dtctl token with document write + admin scope (or run per-owner). `externalId`-on-
+create is still unconfirmed; copy↔original linkage lives in the tracker regardless.
 
 ## 2026-07-23 — metric reconciliation + notebooks & Davis anomaly detectors
 
