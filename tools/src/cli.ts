@@ -36,6 +36,11 @@ import { runDownloadAnomalyDetectors } from './commands/download-anomaly-detecto
 import { runScanNotebooks } from './commands/scan-notebooks.ts';
 import { runScanAnomalyDetectors } from './commands/scan-anomaly-detectors.ts';
 import { runMigrateRefresh } from './commands/migrate-refresh.ts';
+import { runMigrateStage } from './commands/migrate-stage.ts';
+import { runMigratePull } from './commands/migrate-pull.ts';
+import { runMigratePromote } from './commands/migrate-promote.ts';
+import { runMigrateVerify } from './commands/migrate-verify.ts';
+import { runMigrateRollback } from './commands/migrate-rollback.ts';
 import { SHARED_OUT_DIR, tenantOutDir } from './lib/paths.ts';
 import type { CloudProvider } from './lib/types.ts';
 
@@ -161,6 +166,25 @@ COMMANDS
                     (no tenant/dtctl). Assigns each AWS asset a confidence + lane
                     (fast/review/blocked) and preserves human decision/notes.
                     Flags: --env/--base-url/--out-dir, --tracker <path>.
+  migrate-stage     Review lane: publish a migrated COPY of each review-lane
+                    asset (original untouched) for human review. Default PREPARE
+                    mode writes dtctl apply files + prints commands (no dtctl
+                    needed); --apply drives dtctl live and marks rows staged.
+                    Flags: --apply, --ids <a,b>, --limit, --dtctl-bin, --context,
+                    --tracker, --env/--base-url/--out-dir.
+  migrate-pull      Fetch the human-fixed review copies (dtctl get) into
+                    migration/reviewed/ and mark rows in-review. Needs dtctl.
+                    Flags: --ids, --limit, --dtctl-bin, --context, --tracker.
+  migrate-promote   Cutover: update each APPROVED original in place (dtctl apply
+                    with id). Default PREPARE writes apply files + prints diff/
+                    apply commands; --apply drives dtctl with a drift guard
+                    (--force to override). Records pre_promote_version for
+                    rollback. Flags: --apply, --force, --ids, --limit, --context.
+  migrate-verify    Confirm a cutover landed (version advanced). Marks verified.
+                    Needs dtctl. Flags: --ids, --limit, --context.
+  migrate-rollback  Restore promoted originals to pre_promote_version (dtctl
+                    restore). Default prints commands; --apply executes. Requires
+                    --ids or --all. Flags: --apply, --ids, --all, --context.
   reconcile-metrics Join this tenant's classic keys (discover) to their new
                     equivalents (mapping chain), then check each against the
                     live inventory (discover-metrics). Emits
@@ -550,6 +574,88 @@ async function main(): Promise<void> {
       await runMigrateRefresh({
         outDir,
         trackerPath: getString(args.flags, 'tracker'),
+      });
+      return;
+    }
+    case 'migrate-stage': {
+      const outDir = offlineTenantOut(args.flags);
+      if (!outDir) {
+        throw new Error('migrate-stage: pass --env <id>, --base-url <url>, set DT_BASE_URL, or --out-dir <dir>.');
+      }
+      const idsFlag = getString(args.flags, 'ids');
+      await runMigrateStage({
+        outDir,
+        trackerPath: getString(args.flags, 'tracker'),
+        ids: idsFlag ? idsFlag.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+        limit: getNumber(args.flags, 'limit'),
+        apply: args.flags.get('apply') === true,
+        dtctlBin: getString(args.flags, 'dtctl-bin'),
+        context: getString(args.flags, 'context'),
+        mappingPath: getString(args.flags, 'mapping'),
+        liveMetricsPath: getString(args.flags, 'live-metrics'),
+        minOverrideSeries: getNumber(args.flags, 'min-override-series'),
+      });
+      return;
+    }
+    case 'migrate-pull': {
+      const outDir = offlineTenantOut(args.flags);
+      if (!outDir) throw new Error('migrate-pull: pass --env/--base-url/--out-dir.');
+      const ids = getString(args.flags, 'ids');
+      await runMigratePull({
+        outDir,
+        trackerPath: getString(args.flags, 'tracker'),
+        ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+        limit: getNumber(args.flags, 'limit'),
+        dtctlBin: getString(args.flags, 'dtctl-bin'),
+        context: getString(args.flags, 'context'),
+      });
+      return;
+    }
+    case 'migrate-promote': {
+      const outDir = offlineTenantOut(args.flags);
+      if (!outDir) throw new Error('migrate-promote: pass --env/--base-url/--out-dir.');
+      const ids = getString(args.flags, 'ids');
+      await runMigratePromote({
+        outDir,
+        trackerPath: getString(args.flags, 'tracker'),
+        ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+        limit: getNumber(args.flags, 'limit'),
+        apply: args.flags.get('apply') === true,
+        force: args.flags.get('force') === true,
+        dtctlBin: getString(args.flags, 'dtctl-bin'),
+        context: getString(args.flags, 'context'),
+        mappingPath: getString(args.flags, 'mapping'),
+        liveMetricsPath: getString(args.flags, 'live-metrics'),
+        minOverrideSeries: getNumber(args.flags, 'min-override-series'),
+      });
+      return;
+    }
+    case 'migrate-verify': {
+      const outDir = offlineTenantOut(args.flags);
+      if (!outDir) throw new Error('migrate-verify: pass --env/--base-url/--out-dir.');
+      const ids = getString(args.flags, 'ids');
+      await runMigrateVerify({
+        outDir,
+        trackerPath: getString(args.flags, 'tracker'),
+        ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+        limit: getNumber(args.flags, 'limit'),
+        dtctlBin: getString(args.flags, 'dtctl-bin'),
+        context: getString(args.flags, 'context'),
+      });
+      return;
+    }
+    case 'migrate-rollback': {
+      const outDir = offlineTenantOut(args.flags);
+      if (!outDir) throw new Error('migrate-rollback: pass --env/--base-url/--out-dir.');
+      const ids = getString(args.flags, 'ids');
+      await runMigrateRollback({
+        outDir,
+        trackerPath: getString(args.flags, 'tracker'),
+        ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+        all: args.flags.get('all') === true,
+        apply: args.flags.get('apply') === true,
+        dtctlBin: getString(args.flags, 'dtctl-bin'),
+        context: getString(args.flags, 'context'),
       });
       return;
     }

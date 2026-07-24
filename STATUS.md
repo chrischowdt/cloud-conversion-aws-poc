@@ -11,6 +11,49 @@ Scope has grown beyond dashboards: the same DQL rewriter now also drives
 answers "which metric keys must we add to the new integration?" (see the
 2026-07-23 section).
 
+## 2026-07-24 — placement pipeline (staged publish → review → in-place cutover)
+
+The step that turns "we have rewritten JSON" into "migrated assets are actually
+live, safely." A per-asset **state machine** (`candidate → staged → in-review →
+approved → promoted → verified`, plus `blocked`/`rolled-back`) tracked in a
+shared **`.xlsx`** so reviewers co-author it in O365 and check off progress.
+
+**Confidence + lanes** (`lib/asset-confidence.ts`, pure+tested): each AWS asset
+gets a lane from static scan buckets + empirical `compare-dashboard` parity —
+**fast** (clean rewrite AND parity all-match → cut over directly after approval),
+**review** (soft/mismatch/some-blocked tiles → publish a copy, human fixes),
+**blocked** (nothing auto-converted → manual rebuild). nic55601 seed: 333 AWS
+assets → review 292 / blocked 41 / fast 0 (fast needs a `compare-dashboard` run
+first — parity is what unlocks it).
+
+**Commands** (all `migrate-*`): `migrate-refresh` (read-only; build the tracker),
+`migrate-stage` (publish review copy), `migrate-pull` (fetch the fixed copy),
+`migrate-promote` (in-place cutover, drift-guarded), `migrate-verify`,
+`migrate-rollback`. **Every mutating command defaults to PREPARE mode** — writes
+the `dtctl apply` files + prints the exact `dtctl diff`/`apply` commands with **no
+dtctl needed** — and `--apply` drives dtctl live (`auth can-i` preflight).
+
+**Writes go only through dtctl** (`dynatrace/dtctl.ts`): `apply` (no id=create
+copy, id=in-place update), `get`, `diff`, `history`, `restore` (rollback),
+`can-i`. `lib/dtctl-apply.ts` builds the apply object; `lib/tracker-xlsx.ts`
+(exceljs) updates only tool columns and never the human `decision`/`reviewer`/
+`notes`. `compare-dashboard` now also emits `<base>.compare.json` for the tracker.
+
+**Safety:** review copy is a new doc (original untouched → zero interruption);
+cutover is an in-place content swap on the same id/URL (users see the migrated
+asset seamlessly); drift guard aborts if the original changed since we based on
+it; `pre_promote_version` makes rollback one command; nothing writes without
+`--apply`. Tests 259→272; typecheck clean.
+
+**Prerequisite / open:** dtctl must be installed with a readwrite context + write
+scopes — it was **NOT present in the build environment**, so the live `--apply`
+path (create/cutover/restore) is written to dtctl's documented interface but
+**not yet smoke-tested against a real dtctl**; validate on one low-risk dashboard
+before batch cutovers. Also unconfirmed live: `dtctl apply` accepting our JSON
+apply files, the create-result id shape (`idFromApplyResult`), and `externalId`
+on create (linkage currently lives in the tracker). PREPARE mode + the pure
+builders (`dtctl-apply`, `asset-confidence`, `tracker-xlsx`) are fully validated.
+
 ## 2026-07-23 — metric reconciliation + notebooks & Davis anomaly detectors
 
 **Metric reconciliation (`reconcile-metrics`).** Offline join: a tenant's

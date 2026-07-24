@@ -104,6 +104,13 @@ The user-facing migration loop and its tenant-probing helpers. See CLAUDE.md
 - `discover-fields` / `discover-tags` / `discover-metrics` — probe the tenant for Smartscape field schemas, which AWS tags the new connection enriches (`enriched-tags.json`), and the live new-connection metric inventory (`live-metrics.json`).
 - `discover --by-account` + `reconcile-metrics [--by-account]` — join classic keys → mapped new key → live inventory to decide **which metric keys to add to the new integration** (incl. the Metric Streams case). Emits `metric-reconciliation.csv|.md` (+ `-by-account`).
 
+**Placement pipeline** — put rewritten assets live safely, tracked in a shared `.xlsx`, gated by confidence, with **dtctl** as the only write path (needs dtctl installed + a readwrite context). Every mutating step defaults to a **prepare mode** (writes `dtctl apply` files + prints commands, no dtctl needed); `--apply` executes.
+- `migrate-refresh` — read-only; build/refresh `migration-tracker.xlsx` (confidence + lane per asset).
+- `migrate-stage` — publish a migrated review **copy** (original untouched).
+- `migrate-pull` — fetch the human-fixed copy back.
+- `migrate-promote` — cutover: update the **original in place** (drift-guarded); `--apply`, `--force`.
+- `migrate-verify` / `migrate-rollback` — confirm the cutover / restore the prior version.
+
 `discover-metrics` feeds **dim-variant validation**: when the DAC maps a classic
 key to a `.By.<Dim>` variant that has no series on the tenant, the lookup chain
 swaps in a populated sibling (default: target needs ≥2 series; tune with
@@ -125,13 +132,18 @@ src/
 ├── dynatrace/
 │   ├── dql.ts                   Grail Storage Query client (Bearer auth)
 │   ├── document.ts              Document Service client (dashboards, notebooks)
-│   └── settings.ts              Settings 2.0 client (Davis anomaly detectors)
+│   ├── settings.ts              Settings 2.0 client (Davis anomaly detectors)
+│   └── dtctl.ts                 dtctl CLI wrapper — the only write path (apply/get/restore)
 └── lib/
     ├── dql-rewriter.ts          The multi-pass classic→Smartscape DQL rewriter
     ├── asset-scan.ts            Shared scan core (markers, classifier) — App-portable
     ├── asset-scan-run.ts        Node runner + coverage-report writer
     ├── asset-extractors.ts      Pull DQL out of notebooks / anomaly detectors
     ├── asset-usage.ts           Which documents were opened in the last N days
+    ├── asset-confidence.ts      Roll scan buckets + parity → confidence + lane
+    ├── dtctl-apply.ts           Build the dtctl apply object (create/update)
+    ├── tracker-xlsx.ts          The shared .xlsx migration tracker (exceljs)
+    ├── migrate-support.ts       Shared helpers for the migrate-* commands
     ├── metric-reconcile.ts      Classic→new key reconciliation (add-to-integration)
     ├── dql-parser.ts            timeseries record → TimeSeriesPoint[]
     ├── markdown.ts              Tiny md table helpers

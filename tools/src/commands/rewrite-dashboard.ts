@@ -42,7 +42,7 @@ export interface RewriteDashboardArgs {
 
 const QUERY_FIELD_NAMES = new Set(['query', 'input', 'dqlQuery']);
 
-interface QueryHit {
+export interface QueryHit {
   path: string;
   field: string;
   original: string;
@@ -171,7 +171,7 @@ const STRUCTURED_ARRAY_KEYS = new Set([
  * Without rewriting those, the renderer reports "Invalid data mapping" /
  * "field is no longer available" even though the DQL query is correct.
  */
-function rewriteInPlace(node: unknown, index: RecipeIndex, hits: QueryHit[], path: string): void {
+export function rewriteInPlace(node: unknown, index: RecipeIndex, hits: QueryHit[], path: string): void {
   if (node === null || node === undefined) return;
   if (Array.isArray(node)) {
     node.forEach((v, i) => rewriteInPlace(v, index, hits, `${path}[${i}]`));

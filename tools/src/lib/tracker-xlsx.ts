@@ -39,6 +39,7 @@ export const TOOL_COLUMNS = [
   { key: 'review_copy_id', header: 'review_copy_id', width: 40 },
   { key: 'review_copy_url', header: 'review_copy_url', width: 48 },
   { key: 'based_on_version', header: 'based_on_version', width: 16 },
+  { key: 'pre_promote_version', header: 'pre_promote_version', width: 18 },
   { key: 'staged_at', header: 'staged_at', width: 22 },
   { key: 'promoted_at', header: 'promoted_at', width: 22 },
   { key: 'verified_at', header: 'verified_at', width: 22 },
@@ -73,6 +74,7 @@ export interface TrackerRow {
   review_copy_id?: string;
   review_copy_url?: string;
   based_on_version?: number;
+  pre_promote_version?: number;
   staged_at?: string;
   promoted_at?: string;
   verified_at?: string;
@@ -204,6 +206,31 @@ export async function readExistingIds(path: string, sheetName = DEFAULT_SHEET): 
     if (n === 1) return;
     const id = cellStr(row.getCell(idCol).value).trim();
     if (id) out.add(id);
+  });
+  return out;
+}
+
+/** Read every row's cells as strings, keyed by asset_id (all columns). */
+export async function readRows(
+  path: string,
+  sheetName = DEFAULT_SHEET
+): Promise<Map<string, Record<string, string>>> {
+  const out = new Map<string, Record<string, string>>();
+  if (!existsSync(path)) return out;
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(path);
+  const ws = wb.getWorksheet(sheetName);
+  if (!ws) return out;
+  const header = headerIndex(ws);
+  const idCol = header.get('asset_id');
+  if (!idCol) return out;
+  ws.eachRow((row, n) => {
+    if (n === 1) return;
+    const id = cellStr(row.getCell(idCol).value).trim();
+    if (!id) return;
+    const rec: Record<string, string> = {};
+    for (const [name, col] of header) rec[name] = cellStr(row.getCell(col).value).trim();
+    out.set(id, rec);
   });
   return out;
 }
