@@ -52,15 +52,19 @@ export interface DtctlOptions {
   bin?: string;
   /** dtctl context (tenant). Default: the CLI's current-context. */
   context?: string;
+  /** Per-invocation timeout (ms). Default 120s — avoids an unbounded hang. */
+  timeoutMs?: number;
 }
 
 export class Dtctl {
   private readonly bin: string;
   private readonly context?: string;
+  private readonly timeoutMs: number;
 
   constructor(opts: DtctlOptions = {}) {
     this.bin = opts.bin ?? process.env.DTCTL_BIN ?? 'dtctl';
     this.context = opts.context;
+    this.timeoutMs = opts.timeoutMs ?? 120_000;
   }
 
   /** True if the dtctl binary is on PATH and runnable. */
@@ -77,7 +81,7 @@ export class Dtctl {
     const full = [...args, '--agent'];
     if (this.context) full.push('--context', this.context);
     try {
-      const { stdout } = await pexec(this.bin, full, { maxBuffer: 64 * 1024 * 1024 });
+      const { stdout } = await pexec(this.bin, full, { maxBuffer: 64 * 1024 * 1024, timeout: this.timeoutMs });
       const env = tryParse(stdout);
       // Non-envelope JSON (some verbs) → treat as a successful result.
       if (env && typeof env.ok === 'boolean') return env;
@@ -98,14 +102,15 @@ export class Dtctl {
     return this.run(['auth', 'whoami']);
   }
 
-  /** `dtctl auth can-i <verb> <resource>` → true when permitted. */
-  async canI(verb: string, resource: string): Promise<boolean> {
+  /**
+   * Preflight the write scopes needed to apply `file`, WITHOUT executing — uses
+   * the global `--check-scopes` flag (dtctl 0.35 has no `auth can-i`). Returns
+   * true when the active token has the required scopes.
+   */
+  async canApply(file: string): Promise<boolean> {
     try {
-      const env = await this.run(['auth', 'can-i', verb, resource]);
-      const r = env.result;
-      if (typeof r === 'boolean') return r;
-      if (r && typeof r === 'object' && 'allowed' in r) return Boolean((r as { allowed: unknown }).allowed);
-      return env.ok;
+      await this.run(['apply', '-f', file, '--check-scopes']);
+      return true;
     } catch {
       return false;
     }

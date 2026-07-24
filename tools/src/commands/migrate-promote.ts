@@ -26,7 +26,7 @@ import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { rewriteInPlace, type QueryHit } from './rewrite-dashboard.ts';
 import { buildApply, type AssetType } from '../lib/dtctl-apply.ts';
 import { Dtctl } from '../dynatrace/dtctl.ts';
-import { findOriginal, resourceSingular, resourcePlural, versionFromGet } from '../lib/migrate-support.ts';
+import { findOriginal, resourceSingular, versionFromGet } from '../lib/migrate-support.ts';
 import { readRows, readDecisions, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 
 export interface MigratePromoteArgs {
@@ -86,16 +86,10 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
   console.log(`${args.apply ? 'Promoting (in-place cutover)' : 'Preparing cutover for'} ${candidates.length} approved asset(s)…`);
 
   const dtctl = new Dtctl({ bin: args.dtctlBin, context: args.context });
-  if (args.apply) {
-    if (!(await dtctl.available())) {
-      throw new Error('dtctl not found on PATH (set --dtctl-bin or $DTCTL_BIN). Omit --apply to prepare only.');
-    }
-    for (const res of new Set(candidates.map((c) => resourcePlural(c.type)))) {
-      if (!(await dtctl.canI('update', res))) {
-        throw new Error(`dtctl reports you cannot update ${res} in this context. Check safety level / token scopes.`);
-      }
-    }
+  if (args.apply && !(await dtctl.available())) {
+    throw new Error('dtctl not found on PATH (set --dtctl-bin or $DTCTL_BIN). Omit --apply to prepare only.');
   }
+  let scopesChecked = false;
 
   const mappingPath = args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
   const liveMetricsPath = args.liveMetricsPath ?? liveMetricsPathIfPresent(base);
@@ -175,6 +169,15 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
       continue;
     }
 
+    if (!scopesChecked) {
+      if (!(await dtctl.canApply(applyPath))) {
+        throw new Error(
+          'Token lacks the scopes to update documents (checked via dtctl --check-scopes). ' +
+            'Add document:documents:write (+ :admin to cut over others’ dashboards).'
+        );
+      }
+      scopesChecked = true;
+    }
     await dtctl.diffFile(applyPath); // preview (logged by dtctl); non-fatal
     await dtctl.applyFile(applyPath); // in-place update
     updates.push({

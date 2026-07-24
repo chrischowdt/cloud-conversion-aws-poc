@@ -22,7 +22,7 @@ import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { rewriteInPlace, type QueryHit } from './rewrite-dashboard.ts';
 import { buildApply, type AssetType } from '../lib/dtctl-apply.ts';
 import { Dtctl, idFromApplyResult } from '../dynatrace/dtctl.ts';
-import { findOriginal, resourcePlural } from '../lib/migrate-support.ts';
+import { findOriginal } from '../lib/migrate-support.ts';
 import { readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 
 export interface MigrateStageArgs {
@@ -61,16 +61,10 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
   console.log(`${args.apply ? 'Staging' : 'Preparing'} ${candidates.length} review-lane asset(s)…`);
 
   const dtctl = new Dtctl({ bin: args.dtctlBin, context: args.context });
-  if (args.apply) {
-    if (!(await dtctl.available())) {
-      throw new Error('dtctl not found on PATH (set --dtctl-bin or $DTCTL_BIN). Omit --apply to prepare only.');
-    }
-    for (const res of new Set(candidates.map((c) => resourcePlural(c.type)))) {
-      if (!(await dtctl.canI('create', res))) {
-        throw new Error(`dtctl reports you cannot create ${res} in this context. Check safety level / token scopes.`);
-      }
-    }
+  if (args.apply && !(await dtctl.available())) {
+    throw new Error('dtctl not found on PATH (set --dtctl-bin or $DTCTL_BIN). Omit --apply to prepare only.');
   }
+  let scopesChecked = false;
 
   const mappingPath = args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
   const liveMetricsPath = args.liveMetricsPath ?? liveMetricsPathIfPresent(base);
@@ -119,6 +113,15 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
       continue;
     }
 
+    if (!scopesChecked) {
+      if (!(await dtctl.canApply(applyPath))) {
+        throw new Error(
+          'Token lacks the scopes to create documents (checked via dtctl --check-scopes). ' +
+            'Add document:documents:write to the platform token.'
+        );
+      }
+      scopesChecked = true;
+    }
     const env = await dtctl.applyFile(applyPath);
     const copyId = idFromApplyResult(env);
     updates.push({
