@@ -56,6 +56,7 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
   const trackerPath = args.trackerPath ?? join(base, 'migration-tracker.xlsx');
   const promoteDir = join(base, 'migration', 'promote');
   const reviewedDir = join(base, 'migration', 'reviewed');
+  const prePromoteDir = join(base, 'migration', 'pre-promote');
   await mkdir(promoteDir, { recursive: true });
 
   const rows = await readRows(trackerPath);
@@ -169,6 +170,11 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
       continue;
     }
 
+    // Snapshot the exact pre-cutover doc locally so rollback can re-apply it.
+    // (dtctl `restore` needs server-side snapshots, which don't exist by default.)
+    await mkdir(prePromoteDir, { recursive: true });
+    await writeFile(join(prePromoteDir, `${c.id}.json`), JSON.stringify(liveEnv.result ?? {}, null, 2));
+
     if (!scopesChecked) {
       if (!(await dtctl.canApply(applyPath))) {
         throw new Error(
@@ -178,7 +184,16 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
       }
       scopesChecked = true;
     }
-    await dtctl.diffFile(applyPath); // preview (logged by dtctl); non-fatal
+    // Preview via apply --dry-run (structured, exit-0). Non-fatal — a failed
+    // preview must not abort the cutover. (`dtctl diff` exits non-zero whenever
+    // there ARE differences, so it's unsuitable as an automated gate.)
+    try {
+      const dry = await dtctl.applyFile(applyPath, { dryRun: true });
+      const a = (dry.result ?? {}) as { action?: string; resourceType?: string };
+      console.log(`    preview: would ${a.action ?? 'update'} ${a.resourceType ?? c.type} ${c.id}`);
+    } catch (e) {
+      console.log(`    (dry-run preview unavailable: ${(e as Error).message.slice(0, 80)})`);
+    }
     await dtctl.applyFile(applyPath); // in-place update
     updates.push({
       asset_id: c.id,

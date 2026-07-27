@@ -137,7 +137,9 @@ export class Dtctl {
   }
 
   async restore(resource: string, id: string, version: number): Promise<DtctlEnvelope> {
-    return this.run(['restore', resource, id, '--version', String(version)]);
+    // dtctl 0.35: `restore <resource> <id> <version>` (positional); --force skips
+    // the interactive confirm (we run non-interactively).
+    return this.run(['restore', resource, id, String(version), '--force']);
   }
 
   async delete(resource: string, id: string): Promise<DtctlEnvelope> {

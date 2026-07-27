@@ -55,9 +55,18 @@ back, remove it) — all clean, then reset the tracker row. dtctl 0.35 has **no
 `auth can-i`**; the write preflight now uses the global `--check-scopes` flag
 (commit 43888da), and the wrapper got a 120s timeout.
 
-**Still to exercise live:** the in-place cutover (`migrate-promote --apply`) +
-`migrate-rollback` — they mutate a real original, so validate on one low-usage
-owned dashboard with an immediate rollback before any batch.
+**Full loop validated live (2026-07-24)** on a self-owned dashboard —
+stage → pull → `promote --apply` (in-place cutover) → verify → `rollback --apply`.
+The cutover advanced the document version, rewrote tile content to Smartscape
+form, and **preserved owner + isPrivate** (apply-with-id doesn't clobber
+server-managed metadata). Two more dtctl-0.35 fixes surfaced from this run:
+(1) the promote preview uses `apply --dry-run` — dtctl `diff` exits non-zero
+whenever there ARE differences, so it can't be an automated gate; (2) `dtctl
+restore` takes `<version>` positionally (+`--force`) AND documents have **no
+server snapshots by default** ("No snapshots found"), so **rollback was
+redesigned to re-apply a local pre-cutover snapshot** (`migration/pre-promote/
+<id>.json`, captured by promote from the same drift-guard `get`) rather than
+`dtctl restore` — reliable and self-contained.
 
 **Permission caveat (important for scale):** dtctl acts as the OAuth **user**
 (chris.chow), which is narrower than cct's admin platform token — private
