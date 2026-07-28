@@ -11,6 +11,32 @@ Scope has grown beyond dashboards: the same DQL rewriter now also drives
 answers "which metric keys must we add to the new integration?" (see the
 2026-07-23 section).
 
+## 2026-07-28 — auto-discovery metric impact + team tracker + first real batch
+
+**Auto-discovery (account 351878376352 / STG-CustomerTechnology).** With
+CloudWatch metric auto-discovery on for that account, the tenant's live
+new-integration inventory jumped **579 → 1,252** keys (`discover-metrics`).
+Tenant-wide `reconcile-metrics`: "already collected" **490 → 799** of 1,000;
+must-add list **510 → 201**. **Conversion (rewrite) success is unchanged
+(73.6% AWS-relevant)** — the rewriter maps keys regardless of what's collected,
+so auto-discovery moves the *reconciliation* numbers, not rewrite coverage. The
+residual add-list is increasingly our **unmapped camelCase key tail** (auto-
+discovery likely collects those; the lookup chain just can't map the classic key
+to *confirm* it) — closing that tail (port the skill's normalization chain) is
+now the top lever for both success metrics.
+
+**Team tracker.** `assignee` + `priority` (high/med/low by 90-day usage) columns
++ a `how-to` worksheet (lanes, work-splitting, per-row review workflow, promote
+steps). Commit 7d8ac79.
+
+**Account→dashboard linkage + first real batch.** Dashboards carry neither the
+account id nor its friendly name, but filter by **ApplicationCI**
+(`aws.tags.applicationci`). Account 351878376352 → **19 ApplicationCIs**,
+referenced by 57 dashboards — but only **3 are AWS-migratable** (all "CWE-PNR For
+Seats", ~24 blocked tiles each; the other 54 have no AWS content to convert).
+Staged those 3 as the first real batch (live review copies via `DocumentClient`,
+no dtctl) — the account's AWS-dashboard footprint is genuinely thin.
+
 ## 2026-07-28 — fleet cutover unblocked (admin Document write, not dtctl)
 
 The 2026-07-24 permission wall is **resolved**. Root cause was scopes, not the
