@@ -11,6 +11,38 @@ Scope has grown beyond dashboards: the same DQL rewriter now also drives
 answers "which metric keys must we add to the new integration?" (see the
 2026-07-23 section).
 
+## 2026-07-28 — fleet cutover unblocked (admin Document write, not dtctl)
+
+The 2026-07-24 permission wall is **resolved**. Root cause was scopes, not the
+API: writing a document you don't own needs a token with BOTH
+`document:documents:write` AND `document:documents:admin` (+ `admin-access=true`
+on the request). The earlier tokens each had only one — the cct read token had
+`admin` (read-elevation) but not `write`; the dtctl OAuth had `write` but not
+`admin`. With a token carrying **read+write+admin**, the direct admin write
+works — **no owner-flip needed** (owner is preserved; `:transfer-owner` and
+lesser-token writes all 403, but that path is moot).
+
+Validated **live** on a dashboard owned by *another* user (a0862f28): read →
+rewrite → in-place admin write (version advanced, content→Smartscape, owner
+unchanged) → rollback to classic. Then the full CLI loop (promote → verify →
+rollback) on the same not-owned doc, including the drift guard.
+
+**dtctl can't do this** — `dtctl apply` has no `admin-access`, so it can only
+write your own docs. So the **cutover writes moved off dtctl onto the Document
+API directly**:
+- `dynatrace/document.ts` gained `getDocumentFull` (multipart metadata+content
+  read, admin-access) and `updateContent` (multipart PATCH, admin-access,
+  `optimistic-locking-version`) — the admin write path.
+- `migrate-promote` / `migrate-rollback` / `migrate-verify` now use
+  `DocumentClient` with an **admin token** (DT_BASE_URL + DT_TOKEN) and work for
+  **any owner**. They require the admin token (not dtctl) now.
+- `migrate-stage` / `migrate-pull` still use dtctl — they create/read the
+  operator's *own* review copies, where OAuth is fine.
+
+Net: the placement pipeline works fleet-wide. 272 tests; typecheck clean.
+(dtctl remains a dependency only for stage/pull; a later pass could move those to
+`DocumentClient` too and retire dtctl entirely.)
+
 ## 2026-07-24 — placement pipeline (staged publish → review → in-place cutover)
 
 The step that turns "we have rewritten JSON" into "migrated assets are actually

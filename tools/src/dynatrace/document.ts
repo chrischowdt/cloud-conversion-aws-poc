@@ -228,4 +228,116 @@ export class DocumentClient {
     }
     return { raw: res.text, parsed, contentType: res.contentType };
   }
+
+  /**
+   * Full document (metadata + parsed content) from the multipart representation
+   * at `GET /documents/{id}`. With adminAccess it reads documents owned by
+   * others (needs `document:documents:admin`). Used to capture the current
+   * version (optimistic lock / drift) + a pre-cutover content snapshot.
+   */
+  async getDocumentFull(
+    id: string,
+    adminAccess = true
+  ): Promise<{ metadata: Document; content: unknown; contentRaw: string }> {
+    const res = await this.request(
+      'GET',
+      `/documents/${encodeURIComponent(id)}`,
+      adminAccess ? { 'admin-access': 'true' } : undefined,
+      '*/*'
+    );
+    const boundary = /boundary=(.+)$/.exec(res.contentType ?? '')?.[1];
+    if (!boundary) throw new DocumentApiError(res.status, id, `expected multipart, got ${res.contentType}`);
+    const parts = res.text.split('--' + boundary);
+    const partBody = (name: string): string | null => {
+      const p = parts.find((x) => x.includes(`name="${name}"`));
+      if (!p) return null;
+      const sep = p.indexOf('\r\n\r\n');
+      const i = sep >= 0 ? sep + 4 : p.indexOf('\n\n') + 2;
+      return p.slice(i).replace(/\r\n--\s*$/, '').trim();
+    };
+    const metaRaw = partBody('metadata');
+    const contentRaw = partBody('content') ?? '';
+    const metadata = metaRaw ? (JSON.parse(metaRaw) as Document) : ({} as Document);
+    let content: unknown = contentRaw;
+    try {
+      content = JSON.parse(contentRaw);
+    } catch {
+      /* leave raw */
+    }
+    return { metadata, content, contentRaw };
+  }
+
+  /**
+   * Update a document's content in place (multipart PATCH). With adminAccess +
+   * `document:documents:{write,admin}` this updates documents owned by ANYONE —
+   * the write path our cutover needs (dtctl can't do admin writes). Passes the
+   * current version for optimistic locking; omit `version` to force.
+   */
+  async updateContent(
+    id: string,
+    opts: { name: string; type: string; content: unknown; version?: number; adminAccess?: boolean }
+  ): Promise<{ id: string; version?: number }> {
+    const contentStr = typeof opts.content === 'string' ? opts.content : JSON.stringify(opts.content);
+    const fd = new FormData();
+    fd.append(
+      'metadata',
+      new Blob([JSON.stringify({ name: opts.name, type: opts.type })], { type: 'application/json' })
+    );
+    fd.append('content', new Blob([contentStr], { type: 'application/json' }), 'content.json');
+    const query: Record<string, string> = {};
+    if (opts.adminAccess !== false) query['admin-access'] = 'true';
+    if (opts.version !== undefined) query['optimistic-locking-version'] = String(opts.version);
+    const text = await this.writeMultipart('PATCH', `/documents/${encodeURIComponent(id)}`, query, fd);
+    try {
+      const j = JSON.parse(text) as { id?: string; version?: number };
+      return { id: j.id ?? id, version: j.version };
+    } catch {
+      return { id };
+    }
+  }
+
+  /** Multipart write (POST/PATCH) with Bearer auth + the same retry policy as reads. */
+  private async writeMultipart(
+    method: 'POST' | 'PATCH' | 'PUT',
+    path: string,
+    query: Record<string, string>,
+    body: FormData
+  ): Promise<string> {
+    const url = new URL(`${this.baseUrl}/platform/document/v1${path}`);
+    for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      try {
+        const res = await fetch(url, {
+          method,
+          headers: { Authorization: `Bearer ${this.token}` },
+          body,
+          signal: controller.signal,
+        });
+        const text = await res.text();
+        if (res.ok) return text;
+        if ((res.status === 429 || (res.status >= 502 && res.status <= 504)) && attempt < this.maxRetries) {
+          const delay = Math.min(8000, this.retryBaseMs * 2 ** attempt) + Math.random() * 250;
+          this.onRetry?.({ attempt: attempt + 1, delayMs: delay, reason: `HTTP ${res.status}`, url: url.toString() });
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        throw new DocumentApiError(res.status, url.toString(), text);
+      } catch (err) {
+        lastErr = err;
+        if (err instanceof DocumentApiError) throw err;
+        if (attempt < this.maxRetries) {
+          const delay = Math.min(8000, this.retryBaseMs * 2 ** attempt) + Math.random() * 250;
+          this.onRetry?.({ attempt: attempt + 1, delayMs: delay, reason: (err as Error)?.message ?? 'network', url: url.toString() });
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  }
 }

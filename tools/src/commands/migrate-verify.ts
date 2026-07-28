@@ -1,25 +1,24 @@
 /**
  * migrate-verify — confirm a cutover actually landed: re-read the promoted
- * original via `dtctl get` and check its version advanced past the recorded
- * `pre_promote_version`. Marks the row status=verified.
+ * original (admin Document read) and check its version advanced past the
+ * recorded `pre_promote_version`. Marks the row status=verified.
  *
- * This is a "the update took" check, not a data-parity recheck — for a deeper
- * check, run `compare-dashboard` on the asset. Needs dtctl (read). --ids/--limit.
+ * A "the update took" check, not a data-parity recheck — for deeper validation
+ * run `compare-dashboard` on the asset. --ids/--limit.
  */
 
 import { join } from 'node:path';
 
-import { Dtctl } from '../dynatrace/dtctl.ts';
-import { resourceSingular, versionFromGet } from '../lib/migrate-support.ts';
+import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { readRows, upsertRows, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
 
 export interface MigrateVerifyArgs {
   outDir: string;
+  baseUrl: string;
+  token: string;
   trackerPath?: string;
   ids?: string[];
   limit?: number;
-  dtctlBin?: string;
-  context?: string;
 }
 
 export async function runMigrateVerify(args: MigrateVerifyArgs): Promise<void> {
@@ -43,30 +42,27 @@ export async function runMigrateVerify(args: MigrateVerifyArgs): Promise<void> {
     return;
   }
 
-  const dtctl = new Dtctl({ bin: args.dtctlBin, context: args.context });
-  if (!(await dtctl.available())) {
-    throw new Error('dtctl not found on PATH (set --dtctl-bin or $DTCTL_BIN). migrate-verify reads via dtctl.');
-  }
-
+  const client = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
   const updates: TrackerRow[] = [];
   let verified = 0;
   let suspect = 0;
   for (const t of targets) {
     try {
-      const env = await dtctl.get(resourceSingular(t.type), t.id);
-      const live = versionFromGet(env);
-      const landed = live !== undefined && (t.preVersion === undefined || live > t.preVersion);
+      const live = await client.getDocumentFull(t.id, true);
+      const v = live.metadata.version;
+      const landed = v !== undefined && (t.preVersion === undefined || v > t.preVersion);
       if (landed) {
         updates.push({ asset_id: t.id, asset_type: t.type, name: t.name, status: 'verified', verified_at: new Date().toISOString() });
         verified++;
-        console.log(`  ✓ ${t.id} (${t.name}) — live v${live}${t.preVersion !== undefined ? ` > pre v${t.preVersion}` : ''}`);
+        console.log(`  ✓ ${t.id} (${t.name}) — live v${v}${t.preVersion !== undefined ? ` > pre v${t.preVersion}` : ''}`);
       } else {
         suspect++;
-        console.log(`  ? ${t.id} (${t.name}) — live v${live ?? '?'} did not advance past v${t.preVersion ?? '?'}; check by hand`);
+        console.log(`  ? ${t.id} (${t.name}) — live v${v ?? '?'} did not advance past v${t.preVersion ?? '?'}; check by hand`);
       }
     } catch (e) {
       suspect++;
-      console.log(`  ! ${t.id}: ${(e as Error).message}`);
+      const msg = e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message;
+      console.log(`  ! ${t.id}: ${msg}`);
     }
   }
   if (updates.length) await upsertRows(trackerPath, updates);

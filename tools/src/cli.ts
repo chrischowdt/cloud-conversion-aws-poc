@@ -175,16 +175,18 @@ COMMANDS
   migrate-pull      Fetch the human-fixed review copies (dtctl get) into
                     migration/reviewed/ and mark rows in-review. Needs dtctl.
                     Flags: --ids, --limit, --dtctl-bin, --context, --tracker.
-  migrate-promote   Cutover: update each APPROVED original in place (dtctl apply
-                    with id). Default PREPARE writes apply files + prints diff/
-                    apply commands; --apply drives dtctl with a drift guard
-                    (--force to override). Records pre_promote_version for
-                    rollback. Flags: --apply, --force, --ids, --limit, --context.
-  migrate-verify    Confirm a cutover landed (version advanced). Marks verified.
-                    Needs dtctl. Flags: --ids, --limit, --context.
-  migrate-rollback  Restore promoted originals to pre_promote_version (dtctl
-                    restore). Default prints commands; --apply executes. Requires
-                    --ids or --all. Flags: --apply, --ids, --all, --context.
+  migrate-promote   Cutover: update each APPROVED original IN PLACE via the
+                    Document API with admin-access (any owner). Needs an admin
+                    token (DT_BASE_URL + DT_TOKEN with document:documents:read+
+                    write+admin). Default PREPARE writes the payload; --apply
+                    performs the write with a drift guard (--force to override)
+                    + a pre-cutover snapshot. Flags: --apply, --force, --ids,
+                    --limit.
+  migrate-verify    Confirm a cutover landed (live version advanced). Marks
+                    verified. Needs the admin token. Flags: --ids, --limit.
+  migrate-rollback  Re-apply the pre-cutover snapshot (admin write) to revert a
+                    promoted original. Default prints intent; --apply executes.
+                    Requires --ids or --all. Flags: --apply, --ids, --all.
   reconcile-metrics Join this tenant's classic keys (discover) to their new
                     equivalents (mapping chain), then check each against the
                     live inventory (discover-metrics). Emits
@@ -612,18 +614,19 @@ async function main(): Promise<void> {
       return;
     }
     case 'migrate-promote': {
-      const outDir = offlineTenantOut(args.flags);
-      if (!outDir) throw new Error('migrate-promote: pass --env/--base-url/--out-dir.');
+      // Cutover writes via the Document API with admin-access — needs an admin
+      // token (document:documents:read+write+admin), not dtctl.
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
       const ids = getString(args.flags, 'ids');
       await runMigratePromote({
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
         trackerPath: getString(args.flags, 'tracker'),
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
         apply: args.flags.get('apply') === true,
         force: args.flags.get('force') === true,
-        dtctlBin: getString(args.flags, 'dtctl-bin'),
-        context: getString(args.flags, 'context'),
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),
@@ -631,31 +634,29 @@ async function main(): Promise<void> {
       return;
     }
     case 'migrate-verify': {
-      const outDir = offlineTenantOut(args.flags);
-      if (!outDir) throw new Error('migrate-verify: pass --env/--base-url/--out-dir.');
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
       const ids = getString(args.flags, 'ids');
       await runMigrateVerify({
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
         trackerPath: getString(args.flags, 'tracker'),
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
-        dtctlBin: getString(args.flags, 'dtctl-bin'),
-        context: getString(args.flags, 'context'),
       });
       return;
     }
     case 'migrate-rollback': {
-      const outDir = offlineTenantOut(args.flags);
-      if (!outDir) throw new Error('migrate-rollback: pass --env/--base-url/--out-dir.');
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
       const ids = getString(args.flags, 'ids');
       await runMigrateRollback({
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
         trackerPath: getString(args.flags, 'tracker'),
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         all: args.flags.get('all') === true,
         apply: args.flags.get('apply') === true,
-        dtctlBin: getString(args.flags, 'dtctl-bin'),
-        context: getString(args.flags, 'context'),
       });
       return;
     }

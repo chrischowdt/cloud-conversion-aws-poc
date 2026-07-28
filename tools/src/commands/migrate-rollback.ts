@@ -1,39 +1,34 @@
 /**
  * migrate-rollback — revert a promoted asset by re-applying the exact
  * pre-cutover content that migrate-promote snapshotted to
- * migration/pre-promote/<id>.json (a `dtctl apply` with the original id).
- *
- * We re-apply saved content rather than `dtctl restore <version>` because dtctl
- * snapshots don't exist by default ("No snapshots found"), so version-restore is
- * unreliable — re-applying our own snapshot always works.
+ * migration/pre-promote/<id>.json, via an admin Document write (DocumentClient).
+ * Self-contained (no reliance on server snapshots, which don't exist by default).
  *
  * Default prints what it would do; `--apply` executes. Requires --ids (or --all)
  * so a bulk revert is never accidental.
  */
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { Dtctl } from '../dynatrace/dtctl.ts';
-import { buildApply, type AssetType } from '../lib/dtctl-apply.ts';
-import { readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
+import { readRows, upsertRows, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
 
 export interface MigrateRollbackArgs {
   outDir: string;
+  baseUrl: string;
+  token: string;
   trackerPath?: string;
   ids?: string[];
   all?: boolean;
   apply?: boolean;
-  dtctlBin?: string;
-  context?: string;
 }
 
 export async function runMigrateRollback(args: MigrateRollbackArgs): Promise<void> {
   const base = args.outDir;
   const trackerPath = args.trackerPath ?? join(base, 'migration-tracker.xlsx');
   const prePromoteDir = join(base, 'migration', 'pre-promote');
-  const rollbackDir = join(base, 'migration', 'rollback');
   const rows = await readRows(trackerPath);
 
   const idFilter = args.ids?.length ? new Set(args.ids) : null;
@@ -52,12 +47,7 @@ export async function runMigrateRollback(args: MigrateRollbackArgs): Promise<voi
     return;
   }
 
-  const dtctl = new Dtctl({ bin: args.dtctlBin, context: args.context });
-  if (args.apply && !(await dtctl.available())) {
-    throw new Error('dtctl not found on PATH (set --dtctl-bin or $DTCTL_BIN). Omit --apply to preview.');
-  }
-  await mkdir(rollbackDir, { recursive: true });
-
+  const client = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
   const updates: TrackerRow[] = [];
   let done = 0;
   let missing = 0;
@@ -68,28 +58,22 @@ export async function runMigrateRollback(args: MigrateRollbackArgs): Promise<voi
       missing++;
       continue;
     }
-    const snap = JSON.parse(await readFile(snapPath, 'utf8')) as Record<string, unknown>;
-    const content = (snap['content'] as unknown) ?? snap;
-    const apply = buildApply({
-      wrapper: { metadata: { id: t.id, name: t.name }, content },
-      assetType: t.type,
-      mode: 'update',
-      targetId: t.id,
-    });
-    const applyPath = join(rollbackDir, `${t.id}.apply.json`);
-    await writeFile(applyPath, JSON.stringify(apply, null, 2));
+    const snap = JSON.parse(await readFile(snapPath, 'utf8')) as { content?: unknown };
+    const content = snap.content ?? snap;
 
     if (!args.apply) {
-      console.log(`  dtctl apply -f "${applyPath}"   # restores pre-cutover content of ${t.id}`);
+      console.log(`  would restore ${t.id} (${t.name}) from ${snapPath}`);
       continue;
     }
     try {
-      await dtctl.applyFile(applyPath);
+      const live = await client.getDocumentFull(t.id, true);
+      await client.updateContent(t.id, { name: t.name, type: t.type, content, version: live.metadata.version, adminAccess: true });
       updates.push({ asset_id: t.id, asset_type: t.type, name: t.name, status: 'rolled-back' });
       done++;
       console.log(`  ✓ rolled back ${t.id} (${t.name}) to pre-cutover content`);
     } catch (e) {
-      console.log(`  ! ${t.id}: ${(e as Error).message}`);
+      const msg = e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message;
+      console.log(`  ! ${t.id}: ${msg}`);
     }
   }
   if (args.apply && updates.length) await upsertRows(trackerPath, updates);
@@ -98,6 +82,6 @@ export async function runMigrateRollback(args: MigrateRollbackArgs): Promise<voi
   console.log(
     args.apply
       ? `Rolled back ${done}/${targets.length}; ${missing} missing a snapshot.`
-      : `Prepared ${targets.length - missing} rollback apply file(s). Re-run with --apply to execute.`
+      : `Would roll back ${targets.length - missing} asset(s). Re-run with --apply.`
   );
 }
