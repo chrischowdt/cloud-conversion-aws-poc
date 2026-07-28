@@ -105,6 +105,8 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
       const conf = assetConfidence(scan, parity);
       laneTally[conf.lane] = (laneTally[conf.lane] ?? 0) + 1;
       const mf = manifest.get(r.id);
+      const acc = mf?.accessCount ?? 0;
+      const priority = conf.level === 'blocked' ? 'low' : acc >= 100 ? 'high' : acc >= 10 ? 'medium' : 'low';
       const row: TrackerRow = {
         asset_id: r.id,
         asset_type: type,
@@ -118,6 +120,7 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
         parity: parityVerdict(parity),
         confidence: conf.level,
         lane: conf.lane,
+        priority,
         reasons: conf.reasons.join('; '),
       };
       // Only set status for brand-new assets — never reset workflow progress.

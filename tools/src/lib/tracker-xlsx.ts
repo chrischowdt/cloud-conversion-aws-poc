@@ -34,6 +34,7 @@ export const TOOL_COLUMNS = [
   { key: 'parity', header: 'parity', width: 14 },
   { key: 'confidence', header: 'confidence', width: 11 },
   { key: 'lane', header: 'lane', width: 8 },
+  { key: 'priority', header: 'priority', width: 9 },
   { key: 'status', header: 'status', width: 12 },
   { key: 'reasons', header: 'reasons', width: 48 },
   { key: 'review_copy_id', header: 'review_copy_id', width: 40 },
@@ -46,8 +47,9 @@ export const TOOL_COLUMNS = [
   { key: 'tool_updated', header: 'tool_updated', width: 22 },
 ] as const;
 
-/** Columns the reviewer owns. The tool reads these but never writes them. */
+/** Columns the reviewer owns. The tool reads `decision` but never writes any of these. */
 export const HUMAN_COLUMNS = [
+  { key: 'assignee', header: 'assignee', width: 20 },
   { key: 'decision', header: 'decision', width: 12 },
   { key: 'reviewer', header: 'reviewer', width: 22 },
   { key: 'notes', header: 'notes', width: 60 },
@@ -69,6 +71,7 @@ export interface TrackerRow {
   parity?: string;
   confidence?: string;
   lane?: string;
+  priority?: string;
   status?: string;
   reasons?: string;
   review_copy_id?: string;
@@ -127,6 +130,48 @@ function initHeader(ws: ExcelJS.Worksheet): Map<string, number> {
   return map;
 }
 
+/** Write a human-facing "how to use this tracker" sheet (once). */
+function ensureInstructions(wb: ExcelJS.Workbook): void {
+  if (wb.getWorksheet('how-to')) return;
+  const ws = wb.addWorksheet('how-to');
+  ws.getColumn(1).width = 120;
+  const lines: Array<[string] | string> = [
+    'Migration tracker — how to use it (5-person team)',
+    '',
+    'WHAT THIS IS: one row per AWS dashboard/notebook we can migrate to the new Smartscape integration.',
+    'The tooling owns the grey/left columns (asset info, confidence, lane, status, review-copy link, timestamps).',
+    'YOU own four columns: assignee, decision, reviewer, notes. The tool reads `decision` and never overwrites yours.',
+    '',
+    'LANES (column "lane"):',
+    '  fast    — clean rewrite AND live parity matched; safe to cut over directly after approval.',
+    '  review  — has verify-me warnings or unmatched parity; needs a human to open the copy and fix/verify.',
+    '  blocked — nothing auto-converted (manual rebuild); not staged.',
+    '',
+    'PRIORITY (column "priority"): high / medium / low by how often the dashboard is opened (90-day usage) — do high first.',
+    '',
+    'DIVIDE THE WORK: put your name in "assignee" for the rows you will review (split the review-lane rows across the 5 of you).',
+    '',
+    'REVIEW WORKFLOW (per assigned row):',
+    '  1. Open the review copy — click the link in "review_copy_url" (it is a COPY named "… (migrated — review)"; the original is untouched).',
+    '  2. Check the tiles render and the data looks right; fix anything wrong directly in that copy in the UI.',
+    '  3. When it is correct, put your name in "reviewer", add any "notes", and set "decision" = approve.',
+    '     If it cannot be migrated yet, set "decision" = reject and explain in "notes".',
+    '',
+    'PROMOTING (migration lead): for rows with decision=approve, the lead runs `cct migrate-pull` then `cct migrate-promote --apply`.',
+    '  That updates the ORIGINAL dashboard in place (same URL) with the reviewed content — this is the go-live / "promote to the real dashboard" step.',
+    '  Then `cct migrate-verify`; `cct migrate-rollback --ids <id> --apply` reverts if needed.',
+    '',
+    'STATUS values the tool sets: candidate → staged (copy published) → in-review (copy pulled) → promoted (cut over) → verified. (rolled-back if reverted.)',
+    'Only edit assignee/decision/reviewer/notes. Save + close when done so the tool can read your decisions.',
+  ];
+  lines.forEach((l, i) => {
+    const cell = ws.getRow(i + 1).getCell(1);
+    cell.value = Array.isArray(l) ? l[0] : l;
+    if (i === 0) cell.font = { bold: true, size: 14 };
+    if (/^[A-Z][A-Z ]+:/.test(String(cell.value)) || /WORKFLOW|DIVIDE|PROMOTING/.test(String(cell.value))) cell.font = { bold: true };
+  });
+}
+
 /**
  * Insert/update tool-owned data for each row, joined by asset_id. Existing rows
  * keep their human columns untouched; new asset_ids are appended. Creates the
@@ -156,6 +201,8 @@ export async function upsertRows(
       }
     }
   }
+
+  ensureInstructions(wb);
 
   const idCol = header.get('asset_id')!;
   const idToRow = new Map<string, number>();
