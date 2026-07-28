@@ -170,7 +170,10 @@ COMMANDS
                     asset (original untouched) via the Document API for human
                     review. Needs an admin token (DT_BASE_URL + DT_TOKEN). Default
                     PREPARE writes the create payload; --apply creates the copy
-                    (env-visible) and marks rows staged. Flags: --apply, --ids
+                    (env-visible) and marks rows staged. Converted tiles carry the
+                    original classic query as a // reference comment. --restage
+                    updates already-staged copies in place (re-applies the rewrite)
+                    instead of creating new ones. Flags: --apply, --restage, --ids
                     <a,b>, --limit, --tracker.
   migrate-pull      Fetch the human-fixed review copies (Document API) into
                     migration/reviewed/ and mark rows in-review. Needs the admin
@@ -590,6 +593,7 @@ async function main(): Promise<void> {
         ids: idsFlag ? idsFlag.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
         apply: args.flags.get('apply') === true,
+        restage: args.flags.get('restage') === true,
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),

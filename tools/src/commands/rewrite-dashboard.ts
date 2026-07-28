@@ -42,6 +42,55 @@ export interface RewriteDashboardArgs {
 
 const QUERY_FIELD_NAMES = new Set(['query', 'input', 'dqlQuery']);
 
+/**
+ * Reference-comment fences prepended to a converted query so a reviewer can see
+ * the original classic DQL inline. Distinctive + fixed so `stripOriginalComment`
+ * can remove the block cleanly (e.g. at promote, to keep production clean).
+ * DQL treats `//` as a line comment, so the engine ignores the whole block.
+ */
+const ANNOT_START = '//>>> ORIGINAL CLASSIC QUERY (migration reference — safe to delete) >>>';
+const ANNOT_END = '//<<< END ORIGINAL <<<';
+
+/** Prepend the original query as a `//`-commented reference block. Idempotent. */
+export function commentOriginal(original: string): string {
+  const body = stripOriginalComment(original)
+    .trim()
+    .split('\n')
+    .map((l) => (l.trim().length ? `// ${l}` : '//'))
+    .join('\n');
+  return `${ANNOT_START}\n${body}\n${ANNOT_END}\n`;
+}
+
+/** Remove a leading reference block added by `commentOriginal` (no-op if absent). */
+export function stripOriginalComment(query: string): string {
+  const start = query.indexOf(ANNOT_START);
+  if (start === -1) return query;
+  const end = query.indexOf(ANNOT_END, start);
+  if (end === -1) return query;
+  let after = end + ANNOT_END.length;
+  if (query[after] === '\n') after++;
+  return (query.slice(0, start) + query.slice(after)).replace(/^\n+/, '');
+}
+
+/** Recursively strip any reference blocks from every query field (used at promote). */
+export function stripOriginalCommentsInPlace(node: unknown): void {
+  if (Array.isArray(node)) {
+    node.forEach(stripOriginalCommentsInPlace);
+    return;
+  }
+  if (!node || typeof node !== 'object') return;
+  const obj = node as Record<string, unknown>;
+  for (const [k, v] of Object.entries(obj)) {
+    if (QUERY_FIELD_NAMES.has(k) && typeof v === 'string') obj[k] = stripOriginalComment(v);
+    else if (v && typeof v === 'object') stripOriginalCommentsInPlace(v);
+  }
+}
+
+export interface RewriteInPlaceOpts {
+  /** Prepend the original query as a `//` reference block on every changed query. */
+  annotateOriginal?: boolean;
+}
+
 export interface QueryHit {
   path: string;
   field: string;
@@ -171,10 +220,16 @@ const STRUCTURED_ARRAY_KEYS = new Set([
  * Without rewriting those, the renderer reports "Invalid data mapping" /
  * "field is no longer available" even though the DQL query is correct.
  */
-export function rewriteInPlace(node: unknown, index: RecipeIndex, hits: QueryHit[], path: string): void {
+export function rewriteInPlace(
+  node: unknown,
+  index: RecipeIndex,
+  hits: QueryHit[],
+  path: string,
+  opts: RewriteInPlaceOpts = {}
+): void {
   if (node === null || node === undefined) return;
   if (Array.isArray(node)) {
-    node.forEach((v, i) => rewriteInPlace(v, index, hits, `${path}[${i}]`));
+    node.forEach((v, i) => rewriteInPlace(v, index, hits, `${path}[${i}]`, opts));
     return;
   }
   if (typeof node !== 'object') return;
@@ -189,8 +244,13 @@ export function rewriteInPlace(node: unknown, index: RecipeIndex, hits: QueryHit
     ) {
       const result = rewriteDql(v, index);
       // Only mutate when the rewriter actually changed something — leave
-      // identical strings as-is to keep the diff small.
-      if (result.rewritten !== v) obj[k] = result.rewritten;
+      // identical strings as-is to keep the diff small. When annotating, prepend
+      // the original classic query as a `//` reference block for reviewers.
+      if (result.rewritten !== v) {
+        obj[k] = opts.annotateOriginal
+          ? commentOriginal(result.original) + result.rewritten
+          : result.rewritten;
+      }
       hits.push({
         path,
         field: k,
@@ -229,7 +289,7 @@ export function rewriteInPlace(node: unknown, index: RecipeIndex, hits: QueryHit
       continue;
     }
 
-    if (typeof v === 'object') rewriteInPlace(v, index, hits, childPath);
+    if (typeof v === 'object') rewriteInPlace(v, index, hits, childPath, opts);
   }
 }
 

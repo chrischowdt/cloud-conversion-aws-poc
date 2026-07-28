@@ -25,7 +25,7 @@ import { join } from 'node:path';
 import { REPO_ROOT, SKILL_DAC_AWS_METRICS, SKILL_MANUAL_AWS_METRICS, SKILL_PER_KEY_AWS_METRICS } from '../lib/paths.ts';
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
-import { rewriteInPlace, type QueryHit } from './rewrite-dashboard.ts';
+import { rewriteInPlace, stripOriginalCommentsInPlace, type QueryHit } from './rewrite-dashboard.ts';
 import { buildApply, type AssetType } from '../lib/doc-apply.ts';
 import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { findOriginal } from '../lib/migrate-support.ts';
@@ -130,6 +130,10 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
       rewriteInPlace(clone, index, hits, '');
       content = clone;
     }
+
+    // Strip any migration reference comments (added at stage) so the promoted
+    // production dashboard carries only the clean migrated query.
+    stripOriginalCommentsInPlace(content);
 
     // buildApply(update) restores the original (unsuffixed) name + mirrors it
     // into content.settings.name for dashboards.

@@ -33,6 +33,8 @@ export interface MigrateStageArgs {
   ids?: string[];
   limit?: number;
   apply?: boolean;
+  /** Update already-staged copies in place (re-rewrite from original) instead of creating new ones. */
+  restage?: boolean;
   mappingPath?: string;
   liveMetricsPath?: string;
   minOverrideSeries?: number;
@@ -51,16 +53,31 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
   if (rows.size === 0) throw new Error(`Empty/absent tracker ${trackerPath}. Run \`cct migrate-refresh\` first.`);
 
   const idFilter = args.ids && args.ids.length ? new Set(args.ids) : null;
+  // Default: stage fresh copies from candidate rows. `--restage`: update the
+  // copies already published (status=staged, with a review_copy_id) in place —
+  // e.g. to re-apply an improved rewrite to review dashboards already out there.
+  const wantStatus = args.restage ? 'staged' : 'candidate';
   let candidates = [...rows.entries()]
-    .filter(([id, r]) => r['lane'] === 'review' && r['status'] === 'candidate' && (!idFilter || idFilter.has(id)))
-    .map(([id, r]) => ({ id, type: (r['asset_type'] as AssetType) ?? 'dashboard', name: r['name'] ?? id }));
+    .filter(([id, r]) => r['lane'] === 'review' && r['status'] === wantStatus && (!idFilter || idFilter.has(id)))
+    .map(([id, r]) => ({
+      id,
+      type: (r['asset_type'] as AssetType) ?? 'dashboard',
+      name: r['name'] ?? id,
+      copyId: (r['review_copy_id'] as string | undefined) || undefined,
+    }));
+  if (args.restage) candidates = candidates.filter((c) => c.copyId);
   if (args.limit) candidates = candidates.slice(0, args.limit);
 
   if (candidates.length === 0) {
-    console.log('No review-lane candidates to stage (need lane=review, status=candidate).');
+    console.log(
+      args.restage
+        ? 'No staged review copies to restage (need lane=review, status=staged, review_copy_id set).'
+        : 'No review-lane candidates to stage (need lane=review, status=candidate).'
+    );
     return;
   }
-  console.log(`${args.apply ? 'Staging' : 'Preparing'} ${candidates.length} review-lane asset(s)…`);
+  const verb = args.restage ? (args.apply ? 'Restaging' : 'Preparing restage of') : args.apply ? 'Staging' : 'Preparing';
+  console.log(`${verb} ${candidates.length} review-lane asset(s)…`);
 
   const client = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
   const mappingPath = args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
@@ -92,12 +109,15 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
     const content = typeof wrapper.content === 'string' ? JSON.parse(wrapper.content) : wrapper.content;
     const clone = structuredClone(content);
     const hits: QueryHit[] = [];
-    rewriteInPlace(clone, index, hits, '');
+    // Annotate converted tiles with their original classic query (a `//`
+    // reference block) so reviewers can eyeball the before/after inline. Stripped
+    // again at promote so the production dashboard stays clean.
+    rewriteInPlace(clone, index, hits, '', { annotateOriginal: true });
 
     const apply = buildApply({
       wrapper: { metadata: wrapper.metadata, content: clone },
       assetType: c.type,
-      mode: 'create',
+      mode: 'create', // copies keep the [MIGRATION REVIEW] prefix in both modes
     });
 
     if (!args.apply) {
@@ -107,27 +127,42 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
     }
 
     try {
-      const created = await client.createDocument({ name: apply.name, type: c.type, content: apply.content, isPrivate: false });
-      try {
-        await client.shareEnvironment(created.id, 'read-write');
-      } catch (se) {
-        console.log(`    (couldn't env-share ${created.id}: ${(se as Error).message.slice(0, 80)} — share manually)`);
+      if (args.restage) {
+        // Update the existing copy in place — no new document, keeps its id/url + shares.
+        const live = await client.getDocumentFull(c.copyId!, true);
+        await client.updateContent(c.copyId!, {
+          name: apply.name,
+          type: c.type,
+          content: apply.content,
+          version: live.metadata.version,
+          adminAccess: true,
+        });
+        updates.push({ asset_id: c.id, asset_type: c.type, name: c.name, status: 'staged', staged_at: new Date().toISOString() });
+        staged++;
+        console.log(`  ✓ restaged ${c.id} → copy ${c.copyId} (in place)`);
+      } else {
+        const created = await client.createDocument({ name: apply.name, type: c.type, content: apply.content, isPrivate: false });
+        try {
+          await client.shareEnvironment(created.id, 'read-write');
+        } catch (se) {
+          console.log(`    (couldn't env-share ${created.id}: ${(se as Error).message.slice(0, 80)} — share manually)`);
+        }
+        updates.push({
+          asset_id: c.id,
+          asset_type: c.type,
+          name: c.name,
+          status: 'staged',
+          review_copy_id: created.id,
+          review_copy_url: uiUrl(args.baseUrl, c.type, created.id),
+          based_on_version: wrapper.metadata?.version,
+          staged_at: new Date().toISOString(),
+        });
+        staged++;
+        console.log(`  ✓ staged ${c.id} → copy ${created.id}`);
       }
-      updates.push({
-        asset_id: c.id,
-        asset_type: c.type,
-        name: c.name,
-        status: 'staged',
-        review_copy_id: created.id,
-        review_copy_url: uiUrl(args.baseUrl, c.type, created.id),
-        based_on_version: wrapper.metadata?.version,
-        staged_at: new Date().toISOString(),
-      });
-      staged++;
-      console.log(`  ✓ staged ${c.id} → copy ${created.id}`);
     } catch (e) {
       const msg = e instanceof DocumentApiError ? `HTTP ${e.status}: ${e.body.slice(0, 100)}` : (e as Error).message;
-      console.log(`  ! ${c.id} (${c.name}) — create failed: ${msg}`);
+      console.log(`  ! ${c.id} (${c.name}) — ${args.restage ? 'restage' : 'create'} failed: ${msg}`);
       missing++;
     }
   }
@@ -136,8 +171,13 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
 
   console.log('');
   if (args.apply) {
-    console.log(`Staged ${staged} review copies (env-shared read-write); ${missing} skipped.`);
-    console.log('Reviewers can open + edit the copies (named "[MIGRATION REVIEW] …"). Then `cct migrate-pull` + `cct migrate-promote`.');
+    if (args.restage) {
+      console.log(`Restaged ${staged} review copies in place; ${missing} failed.`);
+      console.log('Converted tiles now carry the original classic query as a `//` reference comment.');
+    } else {
+      console.log(`Staged ${staged} review copies (env-shared read-write); ${missing} skipped.`);
+      console.log('Reviewers can open + edit the copies (named "[MIGRATION REVIEW] …"). Then `cct migrate-pull` + `cct migrate-promote`.');
+    }
   } else {
     console.log(`Prepared ${prepared} create payload(s) in ${stagedDir}; ${missing} skipped. No writes made. Re-run with --apply.`);
   }
