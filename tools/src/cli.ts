@@ -173,8 +173,10 @@ COMMANDS
                     (env-visible) and marks rows staged. Converted tiles carry the
                     original classic query as a // reference comment. --restage
                     updates already-staged copies in place (re-applies the rewrite)
-                    instead of creating new ones. Flags: --apply, --restage, --ids
-                    <a,b>, --limit, --tracker.
+                    instead of creating new ones. --share-group <id> shares each
+                    copy read-write with an access group (default: environment-wide).
+                    Flags: --apply, --restage, --share-group <id>, --ids <a,b>,
+                    --limit, --tracker.
   migrate-pull      Fetch the human-fixed review copies (Document API) into
                     migration/reviewed/ and mark rows in-review. Needs the admin
                     token. Flags: --ids, --limit, --tracker.
@@ -594,6 +596,7 @@ async function main(): Promise<void> {
         limit: getNumber(args.flags, 'limit'),
         apply: args.flags.get('apply') === true,
         restage: args.flags.get('restage') === true,
+        shareGroupId: getString(args.flags, 'share-group'),
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),

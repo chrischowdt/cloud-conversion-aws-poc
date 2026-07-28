@@ -35,6 +35,8 @@ export interface MigrateStageArgs {
   apply?: boolean;
   /** Update already-staged copies in place (re-rewrite from original) instead of creating new ones. */
   restage?: boolean;
+  /** Share each new copy read-write with this group id (direct-share). If unset, falls back to an environment-wide share. */
+  shareGroupId?: string;
   mappingPath?: string;
   liveMetricsPath?: string;
   minOverrideSeries?: number;
@@ -143,9 +145,10 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
       } else {
         const created = await client.createDocument({ name: apply.name, type: c.type, content: apply.content, isPrivate: false });
         try {
-          await client.shareEnvironment(created.id, 'read-write');
+          if (args.shareGroupId) await client.shareWithGroup(created.id, args.shareGroupId, 'read-write');
+          else await client.shareEnvironment(created.id, 'read-write');
         } catch (se) {
-          console.log(`    (couldn't env-share ${created.id}: ${(se as Error).message.slice(0, 80)} — share manually)`);
+          console.log(`    (couldn't share ${created.id}: ${(se as Error).message.slice(0, 80)} — share manually)`);
         }
         updates.push({
           asset_id: c.id,
@@ -175,7 +178,8 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
       console.log(`Restaged ${staged} review copies in place; ${missing} failed.`);
       console.log('Converted tiles now carry the original classic query as a `//` reference comment.');
     } else {
-      console.log(`Staged ${staged} review copies (env-shared read-write); ${missing} skipped.`);
+      const shareNote = args.shareGroupId ? `shared read-write with group ${args.shareGroupId}` : 'env-shared read-write';
+      console.log(`Staged ${staged} review copies (${shareNote}); ${missing} skipped.`);
       console.log('Reviewers can open + edit the copies (named "[MIGRATION REVIEW] …"). Then `cct migrate-pull` + `cct migrate-promote`.');
     }
   } else {

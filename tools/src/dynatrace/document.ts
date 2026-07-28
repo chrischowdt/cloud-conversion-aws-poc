@@ -333,6 +333,47 @@ export class DocumentClient {
     throw new DocumentApiError(res.status, url, await res.text());
   }
 
+  /**
+   * Share a document with a specific group (or user) via a direct share.
+   * `POST /direct-shares {documentId, access, recipients:[{id,type}]}`. Default
+   * `read-write`. Needs `document:direct-shares:write`. 409 (already shared) is OK.
+   */
+  async shareWithGroup(
+    id: string,
+    groupId: string,
+    access: 'read' | 'read-write' = 'read-write'
+  ): Promise<void> {
+    const url = `${this.baseUrl}/platform/document/v1/direct-shares`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ documentId: id, access, recipients: [{ id: groupId, type: 'group' }] }),
+    });
+    if (res.ok || res.status === 409) return;
+    throw new DocumentApiError(res.status, url, await res.text());
+  }
+
+  /** List the shares of one kind (`direct-shares` | `environment-shares`) for a document. */
+  async listShares(
+    kind: 'direct-shares' | 'environment-shares',
+    documentId: string
+  ): Promise<Array<{ id: string; access: string[] }>> {
+    const url = new URL(`${this.baseUrl}/platform/document/v1/${kind}`);
+    url.searchParams.set('filter', `documentId=='${documentId}'`);
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${this.token}` } });
+    if (!res.ok) throw new DocumentApiError(res.status, url.toString(), await res.text());
+    const j = JSON.parse(await res.text()) as Record<string, Array<{ id: string; access: string[] }>>;
+    return j[kind] ?? [];
+  }
+
+  /** Remove an environment-wide share by its share id (no-op on 404). */
+  async deleteEnvironmentShare(shareId: string): Promise<void> {
+    const url = `${this.baseUrl}/platform/document/v1/environment-shares/${encodeURIComponent(shareId)}`;
+    const res = await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${this.token}` } });
+    if (res.ok || res.status === 404) return;
+    throw new DocumentApiError(res.status, url, await res.text());
+  }
+
   /** Delete (trash) a document. Requires the current version. */
   async deleteDocument(id: string, version: number, adminAccess = true): Promise<void> {
     const query: Record<string, string> = { 'optimistic-locking-version': String(version) };
