@@ -1,13 +1,13 @@
 /**
  * migrate-stage — review lane: publish a migrated *copy* of each review-lane
  * asset so a human can review/fix it before any cutover. The original is never
- * touched.
+ * touched. Copies are created via the Document API (DocumentClient) with the
+ * platform token — no dtctl.
  *
- * Default is PREPARE mode (no dtctl needed): rewrite the downloaded original,
- * write the dtctl apply file per asset, and print the exact `dtctl apply`
- * command. With `--apply` it drives dtctl live (create → new review copy),
- * records the copy id + the original's version (`based_on_version`, for the
- * later drift guard), and sets status=`staged`.
+ * Default PREPARE mode (no writes): rewrite the downloaded original and write
+ * the create payload to migration/staged/<id>.json for inspection. `--apply`
+ * creates the copy (env-visible), records the copy id/url + the original's
+ * version (`based_on_version`, for the later drift guard), sets status=staged.
  *
  * Selects tracker rows with lane=review and status=candidate (fast-lane assets
  * skip staging; they cut over directly at promote). Filter with --ids / --limit.
@@ -20,24 +20,26 @@ import { REPO_ROOT, SKILL_DAC_AWS_METRICS, SKILL_MANUAL_AWS_METRICS, SKILL_PER_K
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { rewriteInPlace, type QueryHit } from './rewrite-dashboard.ts';
-import { buildApply, type AssetType } from '../lib/dtctl-apply.ts';
-import { Dtctl, idFromApplyResult } from '../dynatrace/dtctl.ts';
+import { buildApply, type AssetType } from '../lib/doc-apply.ts';
+import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { findOriginal } from '../lib/migrate-support.ts';
 import { readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 
 export interface MigrateStageArgs {
   outDir: string;
+  baseUrl: string;
+  token: string;
   trackerPath?: string;
   ids?: string[];
   limit?: number;
-  /** Actually invoke dtctl (create the copies). Default false = prepare only. */
   apply?: boolean;
-  dtctlBin?: string;
-  context?: string;
   mappingPath?: string;
   liveMetricsPath?: string;
   minOverrideSeries?: number;
 }
+
+const uiUrl = (baseUrl: string, type: AssetType, id: string) =>
+  `${baseUrl.replace(/\/+$/, '')}/ui/apps/dynatrace.${type === 'dashboard' ? 'dashboards/dashboard' : 'notebooks/notebook'}/${id}`;
 
 export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
   const base = args.outDir;
@@ -60,12 +62,7 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
   }
   console.log(`${args.apply ? 'Staging' : 'Preparing'} ${candidates.length} review-lane asset(s)…`);
 
-  const dtctl = new Dtctl({ bin: args.dtctlBin, context: args.context });
-  if (args.apply && !(await dtctl.available())) {
-    throw new Error('dtctl not found on PATH (set --dtctl-bin or $DTCTL_BIN). Omit --apply to prepare only.');
-  }
-  let scopesChecked = false;
-
+  const client = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
   const mappingPath = args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
   const liveMetricsPath = args.liveMetricsPath ?? liveMetricsPathIfPresent(base);
   const index = await loadRecipeIndex(mappingPath, {
@@ -77,7 +74,6 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
   });
 
   const updates: TrackerRow[] = [];
-  const commands: string[] = [];
   let prepared = 0;
   let staged = 0;
   let missing = 0;
@@ -103,50 +99,41 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
       assetType: c.type,
       mode: 'create',
     });
-    const applyPath = join(stagedDir, `${c.id}.apply.json`);
-    await writeFile(applyPath, JSON.stringify(apply, null, 2));
-    prepared++;
 
     if (!args.apply) {
-      const ctx = args.context ? ` --context ${args.context}` : '';
-      commands.push(`dtctl apply -f "${applyPath}"${ctx}`);
+      await writeFile(join(stagedDir, `${c.id}.json`), JSON.stringify({ name: apply.name, type: c.type, content: apply.content }, null, 2));
+      prepared++;
       continue;
     }
 
-    if (!scopesChecked) {
-      if (!(await dtctl.canApply(applyPath))) {
-        throw new Error(
-          'Token lacks the scopes to create documents (checked via dtctl --check-scopes). ' +
-            'Add document:documents:write to the platform token.'
-        );
-      }
-      scopesChecked = true;
+    try {
+      const created = await client.createDocument({ name: apply.name, type: c.type, content: apply.content, isPrivate: false });
+      updates.push({
+        asset_id: c.id,
+        asset_type: c.type,
+        name: c.name,
+        status: 'staged',
+        review_copy_id: created.id,
+        review_copy_url: uiUrl(args.baseUrl, c.type, created.id),
+        based_on_version: wrapper.metadata?.version,
+        staged_at: new Date().toISOString(),
+      });
+      staged++;
+      console.log(`  ✓ staged ${c.id} → copy ${created.id}`);
+    } catch (e) {
+      const msg = e instanceof DocumentApiError ? `HTTP ${e.status}: ${e.body.slice(0, 100)}` : (e as Error).message;
+      console.log(`  ! ${c.id} (${c.name}) — create failed: ${msg}`);
+      missing++;
     }
-    const env = await dtctl.applyFile(applyPath);
-    const copyId = idFromApplyResult(env);
-    updates.push({
-      asset_id: c.id,
-      asset_type: c.type,
-      name: c.name,
-      status: 'staged',
-      review_copy_id: copyId ?? '',
-      based_on_version: wrapper.metadata?.version,
-      staged_at: new Date().toISOString(),
-    });
-    staged++;
-    console.log(`  ✓ staged ${c.id} → copy ${copyId ?? '(id not parsed — check dtctl output)'}`);
   }
 
   if (args.apply && updates.length) await upsertRows(trackerPath, updates);
 
   console.log('');
   if (args.apply) {
-    console.log(`Staged ${staged} review copies (apply files in ${stagedDir}); ${missing} skipped.`);
-    console.log('Reviewers can now open + fix the copies; then run `cct migrate-pull` and `cct migrate-promote`.');
+    console.log(`Staged ${staged} review copies; ${missing} skipped.`);
+    console.log('Copies are env-visible; share read-write with reviewers if needed. Then `cct migrate-pull` + `cct migrate-promote`.');
   } else {
-    console.log(`Prepared ${prepared} apply file(s) in ${stagedDir}; ${missing} skipped. No writes made.`);
-    console.log('Review the files, then either re-run with --apply, or run the printed commands:');
-    for (const cmd of commands.slice(0, 50)) console.log(`  ${cmd}`);
-    if (commands.length > 50) console.log(`  … and ${commands.length - 50} more (one per staged asset).`);
+    console.log(`Prepared ${prepared} create payload(s) in ${stagedDir}; ${missing} skipped. No writes made. Re-run with --apply.`);
   }
 }

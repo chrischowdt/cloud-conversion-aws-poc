@@ -39,9 +39,17 @@ API directly**:
 - `migrate-stage` / `migrate-pull` still use dtctl — they create/read the
   operator's *own* review copies, where OAuth is fine.
 
-Net: the placement pipeline works fleet-wide. 272 tests; typecheck clean.
-(dtctl remains a dependency only for stage/pull; a later pass could move those to
-`DocumentClient` too and retire dtctl entirely.)
+Net: the placement pipeline works fleet-wide. **dtctl is now fully retired** —
+stage/pull moved onto `DocumentClient` too (`createDocument`, `getDocumentFull`,
+`updateContent`, `deleteDocument`), so the *entire* pipeline is one admin
+platform token + the Document API, no external CLI/OAuth context. (`dtctl-apply.ts`
+→ `doc-apply.ts`; `dynatrace/dtctl.ts` + the dtctl-envelope helpers deleted.)
+266 tests; typecheck clean.
+
+**One deferred nicety:** programmatic env-share of the staged review copies —
+the `:share` endpoint rejected the POST/PUT shapes tried, so copies are created
+env-visible (`isPrivate:false`) and read-write sharing to reviewers is a UI/group
+step for now. Doesn't block publish→review→promote.
 
 ## 2026-07-24 — placement pipeline (staged publish → review → in-place cutover)
 

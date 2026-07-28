@@ -26,7 +26,7 @@ import { REPO_ROOT, SKILL_DAC_AWS_METRICS, SKILL_MANUAL_AWS_METRICS, SKILL_PER_K
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { rewriteInPlace, type QueryHit } from './rewrite-dashboard.ts';
-import { buildApply, type AssetType } from '../lib/dtctl-apply.ts';
+import { buildApply, type AssetType } from '../lib/doc-apply.ts';
 import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { findOriginal } from '../lib/migrate-support.ts';
 import { readRows, readDecisions, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';

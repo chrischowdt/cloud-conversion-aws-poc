@@ -1,5 +1,5 @@
 /**
- * dtctl-apply — build the object handed to `dtctl apply` from a downloaded /
+* doc-apply — build the Document-API apply object (name/type/content[/id]) from a downloaded /
  * rewritten document wrapper. Pure (no I/O), so it's fully testable without
  * dtctl installed.
  *

@@ -296,12 +296,40 @@ export class DocumentClient {
     }
   }
 
-  /** Multipart write (POST/PATCH) with Bearer auth + the same retry policy as reads. */
+  /**
+   * Create a new document. `POST /documents?name=&type=` with a `content` part.
+   * Returns the created id (+ version). Created private + owned by the token
+   * principal; share it separately for team review.
+   */
+  async createDocument(opts: {
+    name: string;
+    type: string;
+    content: unknown;
+    isPrivate?: boolean;
+  }): Promise<{ id: string; version?: number }> {
+    const contentStr = typeof opts.content === 'string' ? opts.content : JSON.stringify(opts.content);
+    const fd = new FormData();
+    fd.append('content', new Blob([contentStr], { type: 'application/json' }), 'content.json');
+    const query: Record<string, string> = { name: opts.name, type: opts.type };
+    if (opts.isPrivate === false) query['isPrivate'] = 'false';
+    const text = await this.writeMultipart('POST', '/documents', query, fd);
+    const j = JSON.parse(text) as { id: string; version?: number };
+    return { id: j.id, version: j.version };
+  }
+
+  /** Delete (trash) a document. Requires the current version. */
+  async deleteDocument(id: string, version: number, adminAccess = true): Promise<void> {
+    const query: Record<string, string> = { 'optimistic-locking-version': String(version) };
+    if (adminAccess) query['admin-access'] = 'true';
+    await this.writeMultipart('DELETE', `/documents/${encodeURIComponent(id)}`, query);
+  }
+
+  /** Multipart/bodyless write (POST/PATCH/DELETE) with Bearer auth + read retry policy. */
   private async writeMultipart(
-    method: 'POST' | 'PATCH' | 'PUT',
+    method: 'POST' | 'PATCH' | 'PUT' | 'DELETE',
     path: string,
     query: Record<string, string>,
-    body: FormData
+    body?: FormData
   ): Promise<string> {
     const url = new URL(`${this.baseUrl}/platform/document/v1${path}`);
     for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
@@ -313,7 +341,7 @@ export class DocumentClient {
         const res = await fetch(url, {
           method,
           headers: { Authorization: `Bearer ${this.token}` },
-          body,
+          ...(body ? { body } : {}),
           signal: controller.signal,
         });
         const text = await res.text();

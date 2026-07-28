@@ -1,8 +1,8 @@
 /**
  * migrate-pull — fetch the current content of each staged review copy (after a
- * human has fixed it) so promote can cut it over. Reads from the tenant via
- * `dtctl get` (needs dtctl); saves to <base>/migration/reviewed/<originalId>.json
- * and moves the row to status=in-review.
+ * human has fixed it) so promote can cut it over. Reads via the Document API
+ * (DocumentClient, admin-access); saves to
+ * <base>/migration/reviewed/<originalId>.json and sets status=in-review.
  *
  * Selects rows with status=staged and a review_copy_id. Filter with --ids/--limit.
  */
@@ -10,17 +10,16 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { Dtctl } from '../dynatrace/dtctl.ts';
-import { resourceSingular } from '../lib/migrate-support.ts';
+import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { readRows, upsertRows, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
 
 export interface MigratePullArgs {
   outDir: string;
+  baseUrl: string;
+  token: string;
   trackerPath?: string;
   ids?: string[];
   limit?: number;
-  dtctlBin?: string;
-  context?: string;
 }
 
 export async function runMigratePull(args: MigratePullArgs): Promise<void> {
@@ -37,7 +36,7 @@ export async function runMigratePull(args: MigratePullArgs): Promise<void> {
       id,
       type: (r['asset_type'] as AssetType) ?? 'dashboard',
       name: r['name'] ?? id,
-      copyId: r['review_copy_id'],
+      copyId: r['review_copy_id']!,
     }));
   if (args.limit) staged = staged.slice(0, args.limit);
 
@@ -46,22 +45,19 @@ export async function runMigratePull(args: MigratePullArgs): Promise<void> {
     return;
   }
 
-  const dtctl = new Dtctl({ bin: args.dtctlBin, context: args.context });
-  if (!(await dtctl.available())) {
-    throw new Error('dtctl not found on PATH (set --dtctl-bin or $DTCTL_BIN). migrate-pull reads copies via dtctl.');
-  }
-
+  const client = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
   const updates: TrackerRow[] = [];
   let pulled = 0;
   for (const s of staged) {
     try {
-      const env = await dtctl.get(resourceSingular(s.type), s.copyId!);
-      await writeFile(join(reviewedDir, `${s.id}.json`), JSON.stringify(env.result ?? {}, null, 2));
+      const full = await client.getDocumentFull(s.copyId, true);
+      await writeFile(join(reviewedDir, `${s.id}.json`), JSON.stringify({ content: full.content }, null, 2));
       updates.push({ asset_id: s.id, asset_type: s.type, name: s.name, status: 'in-review' });
       pulled++;
       console.log(`  ✓ pulled copy ${s.copyId} → migration/reviewed/${s.id}.json`);
     } catch (e) {
-      console.log(`  ! ${s.id}: ${(e as Error).message}`);
+      const msg = e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message;
+      console.log(`  ! ${s.id}: ${msg}`);
     }
   }
   if (updates.length) await upsertRows(trackerPath, updates);

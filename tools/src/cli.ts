@@ -167,14 +167,14 @@ COMMANDS
                     (fast/review/blocked) and preserves human decision/notes.
                     Flags: --env/--base-url/--out-dir, --tracker <path>.
   migrate-stage     Review lane: publish a migrated COPY of each review-lane
-                    asset (original untouched) for human review. Default PREPARE
-                    mode writes dtctl apply files + prints commands (no dtctl
-                    needed); --apply drives dtctl live and marks rows staged.
-                    Flags: --apply, --ids <a,b>, --limit, --dtctl-bin, --context,
-                    --tracker, --env/--base-url/--out-dir.
-  migrate-pull      Fetch the human-fixed review copies (dtctl get) into
-                    migration/reviewed/ and mark rows in-review. Needs dtctl.
-                    Flags: --ids, --limit, --dtctl-bin, --context, --tracker.
+                    asset (original untouched) via the Document API for human
+                    review. Needs an admin token (DT_BASE_URL + DT_TOKEN). Default
+                    PREPARE writes the create payload; --apply creates the copy
+                    (env-visible) and marks rows staged. Flags: --apply, --ids
+                    <a,b>, --limit, --tracker.
+  migrate-pull      Fetch the human-fixed review copies (Document API) into
+                    migration/reviewed/ and mark rows in-review. Needs the admin
+                    token. Flags: --ids, --limit, --tracker.
   migrate-promote   Cutover: update each APPROVED original IN PLACE via the
                     Document API with admin-access (any owner). Needs an admin
                     token (DT_BASE_URL + DT_TOKEN with document:documents:read+
@@ -580,19 +580,16 @@ async function main(): Promise<void> {
       return;
     }
     case 'migrate-stage': {
-      const outDir = offlineTenantOut(args.flags);
-      if (!outDir) {
-        throw new Error('migrate-stage: pass --env <id>, --base-url <url>, set DT_BASE_URL, or --out-dir <dir>.');
-      }
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
       const idsFlag = getString(args.flags, 'ids');
       await runMigrateStage({
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
         trackerPath: getString(args.flags, 'tracker'),
         ids: idsFlag ? idsFlag.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
         apply: args.flags.get('apply') === true,
-        dtctlBin: getString(args.flags, 'dtctl-bin'),
-        context: getString(args.flags, 'context'),
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),
@@ -600,16 +597,15 @@ async function main(): Promise<void> {
       return;
     }
     case 'migrate-pull': {
-      const outDir = offlineTenantOut(args.flags);
-      if (!outDir) throw new Error('migrate-pull: pass --env/--base-url/--out-dir.');
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
       const ids = getString(args.flags, 'ids');
       await runMigratePull({
-        outDir,
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
         trackerPath: getString(args.flags, 'tracker'),
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
-        dtctlBin: getString(args.flags, 'dtctl-bin'),
-        context: getString(args.flags, 'context'),
       });
       return;
     }

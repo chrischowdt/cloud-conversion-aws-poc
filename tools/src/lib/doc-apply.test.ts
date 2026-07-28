@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildApply, stripMigrationSuffix, REVIEW_SUFFIX } from './dtctl-apply.ts';
+import { buildApply, stripMigrationSuffix, REVIEW_SUFFIX } from './doc-apply.ts';
 
 describe('stripMigrationSuffix', () => {
   it('removes review / rewritten markers, leaves clean names', () => {
