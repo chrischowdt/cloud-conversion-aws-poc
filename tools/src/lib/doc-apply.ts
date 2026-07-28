@@ -28,12 +28,20 @@ export interface DocWrapper {
   content: unknown;
 }
 
+/** Prominent prefix so review copies are unmistakable + sort together in lists. */
+export const REVIEW_PREFIX = '[MIGRATION REVIEW] ';
+/** @deprecated legacy trailing marker; still stripped on promote for old copies. */
 export const REVIEW_SUFFIX = ' (migrated — review)';
 
-/** Remove a trailing migration marker so we don't stack suffixes / restore the original title. */
-export function stripMigrationSuffix(name: string): string {
-  return name.replace(/\s*\((?:migrated\s*—\s*review|migrated - review|rewritten)\)\s*$/i, '').trim();
+/** Strip any migration marker (new prefix or legacy suffix) to restore the original title. */
+export function stripMigrationMarker(name: string): string {
+  return name
+    .replace(/^\s*\[migration review\]\s*/i, '')
+    .replace(/\s*\((?:migrated\s*—\s*review|migrated - review|rewritten)\)\s*$/i, '')
+    .trim();
 }
+/** @deprecated use stripMigrationMarker. */
+export const stripMigrationSuffix = stripMigrationMarker;
 
 function parseContent(content: unknown): Record<string, unknown> {
   const obj = typeof content === 'string' ? JSON.parse(content) : content;
@@ -42,8 +50,8 @@ function parseContent(content: unknown): Record<string, unknown> {
 }
 
 /**
- * Build a dtctl apply object. `create` produces a review copy (no id, suffixed
- * name); `update` targets an existing id with the original (unsuffixed) name.
+ * Build a Document apply object. `create` produces a review copy (no id, prefixed
+ * name); `update` targets an existing id with the original (unmarked) name.
  */
 export function buildApply(opts: {
   wrapper: DocWrapper;
@@ -51,8 +59,8 @@ export function buildApply(opts: {
   mode: 'create' | 'update';
   /** Required for `update` — the id to overwrite in place. */
   targetId?: string;
-  /** Suffix for review copies (default `REVIEW_SUFFIX`). */
-  reviewSuffix?: string;
+  /** Prefix for review copies (default `REVIEW_PREFIX`). */
+  reviewPrefix?: string;
 }): ApplyObject {
   const { wrapper, assetType, mode } = opts;
   const content = parseContent(wrapper.content);
@@ -62,8 +70,8 @@ export function buildApply(opts: {
     wrapper.metadata?.name ??
     (assetType === 'dashboard' ? (settings?.['name'] as string | undefined) : undefined) ??
     'Untitled';
-  const base = stripMigrationSuffix(rawName);
-  const displayName = mode === 'create' ? `${base}${opts.reviewSuffix ?? REVIEW_SUFFIX}` : base;
+  const base = stripMigrationMarker(rawName);
+  const displayName = mode === 'create' ? `${opts.reviewPrefix ?? REVIEW_PREFIX}${base}` : base;
 
   if (assetType === 'dashboard') {
     content['settings'] = { ...(settings ?? {}), name: displayName };

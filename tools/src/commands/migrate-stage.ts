@@ -108,6 +108,11 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
 
     try {
       const created = await client.createDocument({ name: apply.name, type: c.type, content: apply.content, isPrivate: false });
+      try {
+        await client.shareEnvironment(created.id, 'read-write');
+      } catch (se) {
+        console.log(`    (couldn't env-share ${created.id}: ${(se as Error).message.slice(0, 80)} — share manually)`);
+      }
       updates.push({
         asset_id: c.id,
         asset_type: c.type,
@@ -131,8 +136,8 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
 
   console.log('');
   if (args.apply) {
-    console.log(`Staged ${staged} review copies; ${missing} skipped.`);
-    console.log('Copies are env-visible; share read-write with reviewers if needed. Then `cct migrate-pull` + `cct migrate-promote`.');
+    console.log(`Staged ${staged} review copies (env-shared read-write); ${missing} skipped.`);
+    console.log('Reviewers can open + edit the copies (named "[MIGRATION REVIEW] …"). Then `cct migrate-pull` + `cct migrate-promote`.');
   } else {
     console.log(`Prepared ${prepared} create payload(s) in ${stagedDir}; ${missing} skipped. No writes made. Re-run with --apply.`);
   }

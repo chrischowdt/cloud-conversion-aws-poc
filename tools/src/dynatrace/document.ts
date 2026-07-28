@@ -317,6 +317,22 @@ export class DocumentClient {
     return { id: j.id, version: j.version };
   }
 
+  /**
+   * Share a document with everyone in the environment. `POST /environment-shares
+   * {documentId, access}`. Default `read-write` (editable by anyone). Needs
+   * `document:environment-shares:write`. A 409 (already shared) is treated as OK.
+   */
+  async shareEnvironment(id: string, access: 'read' | 'read-write' = 'read-write'): Promise<void> {
+    const url = `${this.baseUrl}/platform/document/v1/environment-shares`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ documentId: id, access }),
+    });
+    if (res.ok || res.status === 409) return;
+    throw new DocumentApiError(res.status, url, await res.text());
+  }
+
   /** Delete (trash) a document. Requires the current version. */
   async deleteDocument(id: string, version: number, adminAccess = true): Promise<void> {
     const query: Record<string, string> = { 'optimistic-locking-version': String(version) };
