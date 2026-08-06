@@ -273,6 +273,21 @@ describe('rewriteDql — reviewer-feedback fixes (entity.name / tags / region)',
     assert.match(r.rewritten, /contains\(getNodeName\(dt\.smartscape\.aws_elasticloadbalancingv2_loadbalancer\), "aap"\)/);
   });
 
+  it('dangling dt.smartscape.aws_account column → account.name (credential collapse)', () => {
+    const r = rewriteDql(
+      'timeseries avg = avg(cloud.aws.lambda.invocations_sum), by:{dt.entity.custom_device = dt.source_entity}\n| fieldsAdd dt.entity.aws_credentials = entityAttr(dt.entity.custom_device, "accessible_by")[dt.entity.aws_credentials][0]\n| fieldsAdd awsAccount = lower(entityName(dt.entity.aws_credentials))\n| fields name, dt.entity.custom_device, dt.entity.aws_credentials',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /\| fields name, dt\.smartscape\.aws_lambda_function, account\.name/);
+    assert.doesNotMatch(r.rewritten, /dt\.smartscape\.aws_account/);
+  });
+
+  it('leaves dt.smartscape.aws_account alone when no account-name column is resolvable', () => {
+    // No AWS_ACCOUNT lookup / account.name in the query → can't resolve → no-op.
+    const r = rewriteDql('timeseries {avg(x)}, by:{ dt.entity.aws_credentials }\n| fields dt.entity.aws_credentials', buildIndex([]));
+    assert.match(r.rewritten, /dt\.smartscape\.aws_account/);
+  });
+
   it('dt.smartscape.X.tags field-access + [AWS] filter → getNodeField tags:aws key compare', () => {
     const r = rewriteDql(
       'timeseries requests = avg(dt.cloud.aws.alb.requests), by:{dt.entity.aws_application_load_balancer}\n| filter in(concat("[AWS]ApplicationCI:", $ApplicationCI), dt.entity.aws_application_load_balancer.tags)',

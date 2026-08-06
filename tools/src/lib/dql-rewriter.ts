@@ -727,6 +727,10 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // just restructured fetches — dominant in by-grouped timeseries tiles).
   rewritten = rewriteDimEntityName(rewritten, transforms);
 
+  // Pass 2.72: dangling dt.smartscape.aws_account column → account.name (from
+  // the credential collapse). Runs after the dim swap that created the dangler.
+  rewritten = rewriteLeftoverAccountColumn(rewritten, transforms);
+
   // Pass 2.65: classic source-entity signal fields → Smartscape source fields.
   // Per dt-migration/references/dql-function-migration.md event-fields table:
   //   dt.source_entity.type → dt.smartscape_source.type
@@ -1877,6 +1881,40 @@ function rewriteDimTags(input: string, transforms: Transform[]): string {
     transforms.push({ kind: 'entity-dim', before: full, after: repl, detail: 'dt.smartscape.X.tags → getNodeField(X, "tags:aws")' });
     return repl;
   });
+}
+
+// ─── Pass 2.72: dangling dt.smartscape.aws_account column → account.name ──
+//
+// The classic `dt.entity.aws_credentials` used as a COLUMN (in a fields list, or
+// getNodeName(...)) dim-swaps to `dt.smartscape.aws_account`, which is not a real
+// column — there's no account dim on the series. When the credential collapse
+// (Pass 0.5–0.7) ran it produced the account NAME under a prefixed lookup field
+// (`account.name` via `prefix:"account."`), so point the dangling reference at
+// that. Reviewer-confirmed (they hand-replaced it with the local account field);
+// ~950 tiles on the corpus. No-op if we can't resolve the account-name column,
+// or if `dt.smartscape.aws_account` is itself assigned (a self-defined column).
+const ACCOUNT_LOOKUP_NAME_RE =
+  /lookup\s*\[\s*smartscapeNodes\s+AWS_ACCOUNT\b[^\]]*\bname\b[^\]]*\][^|]*?prefix\s*:\s*"([^"]+)"/;
+function rewriteLeftoverAccountColumn(input: string, transforms: Transform[]): string {
+  if (!/\bdt\.smartscape\.aws_account\b/.test(input)) return input;
+  // Skip if it's assigned somewhere (`dt.smartscape.aws_account = …`) — then it's
+  // a (self-defined) column and its refs are valid; don't touch.
+  if (/\bdt\.smartscape\.aws_account\s*=(?!=)/.test(input)) return input;
+  const m = ACCOUNT_LOOKUP_NAME_RE.exec(input);
+  const acctCol = m ? `${m[1]}name` : /\baccount\.name\b/.test(input) ? 'account.name' : null;
+  if (!acctCol) return input; // account-name column not resolvable → leave as-is
+  let out = input;
+  // getNodeName(dt.smartscape.aws_account) → the name column directly.
+  out = out.replace(/getNodeName\(\s*dt\.smartscape\.aws_account\s*\)/g, () => {
+    transforms.push({ kind: 'entity-dim', before: 'getNodeName(dt.smartscape.aws_account)', after: acctCol, detail: 'dangling credential/account ref → account-name lookup field' });
+    return acctCol;
+  });
+  // Bare column reference (not an assignment LHS) → the account-name column.
+  out = out.replace(/\bdt\.smartscape\.aws_account\b(?!\s*=(?!=))/g, () => {
+    transforms.push({ kind: 'entity-dim', before: 'dt.smartscape.aws_account', after: acctCol, detail: 'dangling credential column → account-name lookup field (no account dim on the series)' });
+    return acctCol;
+  });
+  return out;
 }
 
 // ─── Pass 2.57: classic AWS tag FILTER idiom → tag-record key compare ──────
