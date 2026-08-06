@@ -282,6 +282,34 @@ describe('rewriteDql — reviewer-feedback fixes (entity.name / tags / region)',
     assert.doesNotMatch(r.rewritten, /dt\.smartscape\.aws_account/);
   });
 
+  it('dedupes a duplicate grouping dim in a by:{} clause (FIELD_SPECIFIED_TWICE)', () => {
+    const r = rewriteDql(
+      'timeseries {avg(x)}, by:{ dt.entity.dynamo_db_table }\n| summarize sum(y), by:{Table, dt.entity.dynamo_db_table, dt.entity.dynamo_db_table}',
+      buildIndex([])
+    );
+    const by = r.rewritten.match(/by:\{([^}]*)\}/g)?.pop() ?? '';
+    assert.equal((by.match(/dt\.smartscape\.aws_dynamodb_table/g) ?? []).length, 1);
+  });
+
+  it('names a bare getNodeName/getNodeField fieldsAdd operand (was nameless → invalid)', () => {
+    const r = rewriteDql(
+      'timeseries {avg(x)}, by:{dt.entity.aws_application_load_balancer}\n| fieldsAdd dt.entity.aws_application_load_balancer.tags, dt.entity.aws_application_load_balancer.entity.name',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /`dt\.smartscape\.aws_elasticloadbalancingv2_loadbalancer\.tags` = getNodeField\([^)]*"tags:aws"\)/);
+    assert.match(r.rewritten, /`dt\.smartscape\.aws_elasticloadbalancingv2_loadbalancer\.name` = getNodeName\(/);
+    // no bare function-call operand remains (fieldsAdd ... getNodeField without =)
+    assert.doesNotMatch(r.rewritten, /fieldsAdd\s+getNodeField/);
+  });
+
+  it('leaves an already-named fieldsAdd operand untouched', () => {
+    const r = rewriteDql(
+      'timeseries {avg(x)}, by:{dt.entity.aws_lambda_function}\n| fieldsAdd nm = entityName(dt.entity.aws_lambda_function)',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /fieldsAdd nm = getNodeName\(dt\.smartscape\.aws_lambda_function\)/);
+  });
+
   it('leaves dt.smartscape.aws_account alone when no account-name column is resolvable', () => {
     // No AWS_ACCOUNT lookup / account.name in the query → can't resolve → no-op.
     const r = rewriteDql('timeseries {avg(x)}, by:{ dt.entity.aws_credentials }\n| fields dt.entity.aws_credentials', buildIndex([]));

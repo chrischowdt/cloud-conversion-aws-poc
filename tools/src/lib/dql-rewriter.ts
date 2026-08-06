@@ -926,9 +926,12 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     }
   }
 
-  // Late cleanup: drop duplicate columns a collapse may have produced in a
-  // fields/fieldsKeep clause. Runs last so it sees the final column names.
+  // Late cleanup: name any bare getNodeName/getNodeField fieldsAdd operand (a
+  // classic bare dim-field ref that auto-named its column), then drop duplicate
+  // columns/dims a collapse may have produced in a fields/by:{} clause.
+  rewritten = nameBareEntityOperands(rewritten, transforms);
   rewritten = dedupeFieldsClauses(rewritten, transforms);
+  rewritten = dedupeByClauses(rewritten, transforms);
 
   return { original, rewritten, transforms, warnings };
 }
@@ -1998,5 +2001,86 @@ function dedupeFieldsClauses(input: string, transforms: Transform[]): string {
       detail: 'removed duplicate column(s) from a fields clause (two classic entities collapsed to one node type)',
     });
     return `${head}${kept.join(', ')}`;
+  });
+}
+
+/** Split on top-level commas only (ignore commas nested in ()/[]/{}). */
+function splitTopLevel(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of s) {
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth--;
+    if (ch === ',' && depth === 0) {
+      out.push(cur);
+      cur = '';
+    } else cur += ch;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
+}
+
+// A classic bare field ref used as a `fieldsAdd` operand — `dt.entity.X.tags`,
+// `dt.entity.X.entity.name` — auto-names its column. Our entity passes rewrite it
+// to a function call (getNodeField/getNodeName), which as a bare fieldsAdd operand
+// is invalid (FIELD_DOES_NOT_EXIST / needs a name). Reconstruct the classic
+// auto-name so the column (and any viz ref to it) still resolves.
+function autoNameFor(operand: string): string | null {
+  let m = /^getNodeName\(\s*(.+?)\s*\)$/.exec(operand);
+  if (m) return `${m[1]}.name`;
+  m = /^getNodeField\(\s*(.+?)\s*,\s*"([^"]+)"\s*\)$/.exec(operand);
+  if (m) return `${m[1]}.${m[2]!.split(':')[0]}`; // "tags:aws" → tags
+  return null;
+}
+function nameBareEntityOperands(input: string, transforms: Transform[]): string {
+  return input.replace(/(\|\s*fieldsAdd\s+)([^|]+)/g, (full, head: string, body: string) => {
+    const parts = splitTopLevel(body);
+    const seen = new Set<string>();
+    let changed = false;
+    const out = parts.map((p) => {
+      const t = p.trim();
+      if (/^[^=]+=(?!=)/.test(t)) return p; // already `name = …`
+      const nm = autoNameFor(t);
+      if (!nm) return p;
+      changed = true;
+      let name = nm;
+      let i = 2;
+      while (seen.has(name)) name = `${nm}_${i++}`;
+      seen.add(name);
+      return ` \`${name}\` = ${t}`;
+    });
+    if (!changed) return full;
+    transforms.push({ kind: 'entity-dim', before: 'fieldsAdd <bare entity fn>', after: 'named', detail: 'named a bare getNodeName/getNodeField fieldsAdd operand (classic auto-named the column)' });
+    return `${head}${out.join(',')}`;
+  });
+}
+
+// Same collapse can duplicate a grouping dim inside a `by:{…}` clause (timeseries
+// or summarize), which DQL rejects (FIELD_SPECIFIED_TWICE). Dedupe exact-duplicate
+// simple dims per by-clause. Skips assignment/expr items (`X = …`, calls).
+function dedupeByClauses(input: string, transforms: Transform[]): string {
+  return input.replace(/\bby\s*:\s*\{([^}]*)\}/g, (full, body: string) => {
+    const parts = body.split(',').map((p) => p.trim()).filter((p) => p.length > 0);
+    const seen = new Set<string>();
+    const kept: string[] = [];
+    let dropped = 0;
+    for (const p of parts) {
+      const isSimple = !/[=(]/.test(p);
+      if (isSimple && seen.has(p)) {
+        dropped++;
+        continue;
+      }
+      if (isSimple) seen.add(p);
+      kept.push(p);
+    }
+    if (dropped === 0) return full;
+    transforms.push({
+      kind: 'entity-dim',
+      before: 'by:{ …duplicate dim }',
+      after: 'deduped',
+      detail: 'removed duplicate grouping dim from a by-clause (two classic entities collapsed to one node type)',
+    });
+    return `by:{${kept.join(', ')}}`;
   });
 }
