@@ -330,6 +330,15 @@ describe('rewriteDql — reviewer-feedback fixes (entity.name / tags / region)',
     assert.match(r.rewritten, /splitString\(other, ":"\)\[3\]/);
   });
 
+  it('region from a lookup-prefixed device.customProperties[REGION_NAME] → node aws.region', () => {
+    const r = rewriteDql(
+      'timeseries {sum(x)}, by:{dt.entity.dynamo_db_table = dt.source_entity}\n| lookup [fetch dt.entity.dynamo_db_table | fields name, id], sourceField:dt.entity.dynamo_db_table, lookupField:id, prefix:"device."\n| fieldsAdd region = device.customProperties[REGION_NAME]',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /region = getNodeField\(dt\.smartscape\.aws_dynamodb_table, "aws\.region"\)/);
+    assert.doesNotMatch(r.rewritten, /customProperties/);
+  });
+
   it('region from customProperties[REGION_NAME] → aws.region field', () => {
     const r = rewriteDql(
       'timeseries max(x), by:{ dt.entity.aws_lambda_function }\n| fieldsAdd region = entityAttr(dt.entity.aws_lambda_function, "customProperties")[REGION_NAME]',

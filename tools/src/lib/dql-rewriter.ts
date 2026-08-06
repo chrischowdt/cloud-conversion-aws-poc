@@ -1744,18 +1744,35 @@ function rewriteTagExtraction(input: string, transforms: Transform[]): string {
 // on DWR/FBS/EIF: "we can simply use aws.region … on new AWS metrics".)
 const CUSTOM_PROP_REGION_RE =
   /getNodeField\(\s*([^,()]+?)\s*,\s*"customProperties"\s*\)\s*\[\s*([A-Za-z_]*REGION[A-Za-z_]*)\s*\]/gi;
+// A lookup-prefixed customProperties region read: `device.customProperties[REGION_NAME]`.
+// The `device.` prefix comes from a `lookup […], sourceField:<node>, …, prefix:"device."`,
+// so the node's region is getNodeField(<node>, "aws.region"). customProperties isn't
+// selected by the lookup (so it reads null) — repoint to the node's aws.region.
+const LOOKUP_PREFIX_RE =
+  /lookup\s*\[[^\]]*\]\s*,\s*sourceField\s*:\s*([^\s,]+)\s*,[^|]*?prefix\s*:\s*"([^".]+)\."/g;
+const PREFIX_PROP_REGION_RE =
+  /\b([A-Za-z_]\w*)\.customProperties\s*\[\s*([A-Za-z_]*REGION[A-Za-z_]*)\s*\]/gi;
 
 function rewriteAwsRegionField(input: string, transforms: Transform[]): string {
-  return input.replace(CUSTOM_PROP_REGION_RE, (full, arg: string) => {
+  let out = input.replace(CUSTOM_PROP_REGION_RE, (full, arg: string) => {
     const repl = `getNodeField(${arg}, "aws.region")`;
-    transforms.push({
-      kind: 'entity-dim',
-      before: full,
-      after: repl,
-      detail: 'region from customProperties → aws.region field (carried on every AWS node)',
-    });
+    transforms.push({ kind: 'entity-dim', before: full, after: repl, detail: 'region from customProperties → aws.region field (carried on every AWS node)' });
     return repl;
   });
+
+  // Map lookup prefixes → their source node, then repoint <prefix>.customProperties[REGION].
+  const prefixNode = new Map<string, string>();
+  for (let m = LOOKUP_PREFIX_RE.exec(out); m; m = LOOKUP_PREFIX_RE.exec(out)) prefixNode.set(m[2]!, m[1]!);
+  if (prefixNode.size > 0) {
+    out = out.replace(PREFIX_PROP_REGION_RE, (full, prefix: string) => {
+      const node = prefixNode.get(prefix);
+      if (!node || !/^dt\.smartscape\./.test(node)) return full; // only when the prefix maps to a smartscape node
+      const repl = `getNodeField(${node}, "aws.region")`;
+      transforms.push({ kind: 'entity-dim', before: full, after: repl, detail: `region from ${prefix}.customProperties (lookup prefix) → node aws.region` });
+      return repl;
+    });
+  }
+  return out;
 }
 
 // ─── Pass 2.58: ARN-split idioms → the denormalized aws.* fields ──────────
