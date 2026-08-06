@@ -695,6 +695,9 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // Pass 2.56: region-derivation (customProperties[REGION*]) → aws.region field.
   rewritten = rewriteAwsRegionField(rewritten, transforms);
 
+  // Pass 2.58: region-from-ARN (splitString(arn, ":")[3]) → aws.region field.
+  rewritten = rewriteArnRegion(rewritten, transforms);
+
   // Pass 2.57: classic AWS tag FILTER idiom (in(tags,"[AWS]Key:val")) → tags[Key] == val.
   rewritten = rewriteAwsTagFilters(rewritten, transforms);
 
@@ -1734,6 +1737,79 @@ function rewriteAwsRegionField(input: string, transforms: Transform[]): string {
     });
     return repl;
   });
+}
+
+// ─── Pass 2.58: region-from-ARN idiom → the aws.region field ──────────────
+//
+// An ARN is `arn:aws:<svc>:<region>:<account>:<resource>`, so `splitString(arn,
+// ":")[3]` is definitionally the region. Classic dashboards commonly derive
+// region that way from `<v> = entityAttr(x,"arn")` (Pass 2.5 → getNodeField(x,
+// "arn")). On the new side `arn` reads null, so the split yields nothing —
+// replace the whole `splitString(<arn>, ":")[3]` with `getNodeField(<node>,
+// "aws.region")`. Handles both the inline `getNodeField(node,"arn")` form and a
+// named var assigned from it (traced within the query). A leftover unused `arn`
+// fieldsAdd is harmless; we don't remove it (it may be referenced elsewhere).
+const ARN_VAR_ASSIGN_RE = /\b(\w+)\s*=\s*getNodeField\(\s*([^,()]+?)\s*,\s*"arn"\s*\)/g;
+const ARN_REGION_INLINE_RE =
+  /splitString\(\s*getNodeField\(\s*([^,()]+?)\s*,\s*"arn"\s*\)\s*,\s*":"\s*\)\s*\[\s*3\s*\]/g;
+const ARN_REGION_VAR_RE = /splitString\(\s*(\w+)\s*,\s*":"\s*\)\s*\[\s*3\s*\]/g;
+
+function rewriteArnRegion(input: string, transforms: Transform[]): string {
+  // Map each arn-holding var to the node it was read from.
+  const arnVarNode = new Map<string, string>();
+  for (let m = ARN_VAR_ASSIGN_RE.exec(input); m; m = ARN_VAR_ASSIGN_RE.exec(input)) {
+    arnVarNode.set(m[1]!, m[2]!);
+  }
+
+  const note = (full: string, repl: string): string => {
+    transforms.push({
+      kind: 'entity-dim',
+      before: full,
+      after: repl,
+      detail: 'region parsed from ARN ([3]) → aws.region field (carried on every AWS node)',
+    });
+    return repl;
+  };
+
+  // Inline: splitString(getNodeField(node,"arn"), ":")[3]
+  let out = input.replace(ARN_REGION_INLINE_RE, (full, node: string) =>
+    note(full, `getNodeField(${node}, "aws.region")`)
+  );
+  // Via a traced arn var: splitString(<arnVar>, ":")[3]. Record which vars we
+  // free (their region-parse use is gone) — only those are removal candidates.
+  const freed = new Set<string>();
+  out = out.replace(ARN_REGION_VAR_RE, (full, varName: string) => {
+    const node = arnVarNode.get(varName);
+    if (!node) return full;
+    freed.add(varName);
+    return note(full, `getNodeField(${node}, "aws.region")`);
+  });
+
+  // Clean up an arn var we just freed: if replacing its region parse left it
+  // unreferenced AND its assignment is a STANDALONE `| fieldsAdd <var> =
+  // getNodeField(...,"arn")` stage, drop the stage (arn reads null on the new
+  // side → a dead column). Only vars freed above are eligible, so an arn field
+  // that was already dead in the classic (and the reviewer kept) is preserved.
+  // Multi-assign stages are left alone (too fiddly to split).
+  for (const v of freed) {
+    // Only the STANDALONE `| fieldsAdd v = getNodeField(...,"arn")` stage (followed
+    // by another stage or end — not a comma, which would be a multi-assign).
+    const standalone = new RegExp(
+      `\\s*\\|\\s*fieldsAdd\\s+${escapeRegExp(v)}\\s*=\\s*getNodeField\\([^()]*,\\s*"arn"\\)(?=\\s*\\||\\s*$)`
+    );
+    const without = out.replace(standalone, '');
+    if (without === out) continue; // no standalone assignment (e.g. multi-assign) → keep
+    // Dead only if v isn't referenced anywhere in the remainder.
+    if (new RegExp(`\\b${escapeRegExp(v)}\\b`).test(without)) continue;
+    out = without;
+    transforms.push({
+      kind: 'entity-dim',
+      before: `| fieldsAdd ${v} = getNodeField(x, "arn")`,
+      after: '(removed)',
+      detail: 'removed now-unused arn field (its only consumer was the region parse, now aws.region)',
+    });
+  }
+  return out;
 }
 
 // ─── Pass 2.57: classic AWS tag FILTER idiom → tag-record key compare ──────

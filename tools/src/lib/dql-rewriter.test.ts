@@ -222,6 +222,37 @@ describe('rewriteDql — reviewer-feedback fixes (entity.name / tags / region)',
     assert.match(r.rewritten, /in\(tags, "\[AWS\]ApplicationCI:fbs"\)/); // unchanged
   });
 
+  it('region from ARN split (splitString(arn,":")[3]) → aws.region field', () => {
+    const r = rewriteDql(
+      'timeseries {avg(x)}, by:{ dt.entity.dynamo_db_table }\n| fieldsAdd arn=entityAttr(dt.entity.dynamo_db_table, "arn")\n| fieldsAdd region = splitString(arn, ":")[3]',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /region = getNodeField\(dt\.smartscape\.aws_dynamodb_table, "aws\.region"\)/);
+    assert.doesNotMatch(r.rewritten, /splitString\(arn, ":"\)\[3\]/);
+  });
+
+  it('drops the now-dead arn fieldsAdd once region uses aws.region (standalone stage)', () => {
+    const r = rewriteDql(
+      'timeseries {avg(x)}, by:{ dt.entity.dynamo_db_table }\n| fieldsAdd arn=entityAttr(dt.entity.dynamo_db_table, "arn")\n| fieldsAdd region = splitString(arn, ":")[3]\n| filter in(region,$Region)',
+      buildIndex([])
+    );
+    assert.doesNotMatch(r.rewritten, /"arn"/); // arn fieldsAdd removed
+    assert.match(r.rewritten, /region = getNodeField\(dt\.smartscape\.aws_dynamodb_table, "aws\.region"\)/);
+  });
+
+  it('keeps the arn fieldsAdd when arn is still referenced elsewhere', () => {
+    const r = rewriteDql(
+      'timeseries {avg(x)}, by:{ dt.entity.dynamo_db_table }\n| fieldsAdd arn=entityAttr(dt.entity.dynamo_db_table, "arn")\n| fieldsAdd region = splitString(arn, ":")[3]\n| fields arn, region',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /arn=getNodeField\(dt\.smartscape\.aws_dynamodb_table, "arn"\)/);
+  });
+
+  it('does NOT touch splitString(x,":")[3] when x is not a traced ARN var (safety)', () => {
+    const r = rewriteDql('fetch dt.entity.aws_lambda_function | fieldsAdd region = splitString(other, ":")[3]', buildIndex([]));
+    assert.match(r.rewritten, /splitString\(other, ":"\)\[3\]/);
+  });
+
   it('region from customProperties[REGION_NAME] → aws.region field', () => {
     const r = rewriteDql(
       'timeseries max(x), by:{ dt.entity.aws_lambda_function }\n| fieldsAdd region = entityAttr(dt.entity.aws_lambda_function, "customProperties")[REGION_NAME]',
