@@ -695,8 +695,16 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // Pass 2.56: region-derivation (customProperties[REGION*]) → aws.region field.
   rewritten = rewriteAwsRegionField(rewritten, transforms);
 
-  // Pass 2.58: region-from-ARN (splitString(arn, ":")[3]) → aws.region field.
+  // Pass 2.58: ARN-split (splitString(arn, ":")[3|4]) → aws.region / aws.account.id.
   rewritten = rewriteArnRegion(rewritten, transforms);
+
+  // Pass 2.59: generic field renames (arn → aws.arn, awsVpcName → aws.vpc.id).
+  // AFTER the ARN-split pass, which still needs the "arn" field.
+  rewritten = rewriteAwsFieldRenames(rewritten, transforms);
+
+  // Pass 2.56b: dt.smartscape.X.tags field-access → getNodeField(X,"tags:aws").
+  // BEFORE the tag-filter pass so it can rewrite filters around the result.
+  rewritten = rewriteDimTags(rewritten, transforms);
 
   // Pass 2.57: classic AWS tag FILTER idiom (in(tags,"[AWS]Key:val")) → tags[Key] == val.
   rewritten = rewriteAwsTagFilters(rewritten, transforms);
@@ -714,6 +722,10 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
       return 'name';
     });
   }
+
+  // Pass 2.6b: <dt.smartscape.X>.entity.name → getNodeName(X) (any context, not
+  // just restructured fetches — dominant in by-grouped timeseries tiles).
+  rewritten = rewriteDimEntityName(rewritten, transforms);
 
   // Pass 2.65: classic source-entity signal fields → Smartscape source fields.
   // Per dt-migration/references/dql-function-migration.md event-fields table:
@@ -1739,20 +1751,21 @@ function rewriteAwsRegionField(input: string, transforms: Transform[]): string {
   });
 }
 
-// ─── Pass 2.58: region-from-ARN idiom → the aws.region field ──────────────
+// ─── Pass 2.58: ARN-split idioms → the denormalized aws.* fields ──────────
 //
 // An ARN is `arn:aws:<svc>:<region>:<account>:<resource>`, so `splitString(arn,
-// ":")[3]` is definitionally the region. Classic dashboards commonly derive
-// region that way from `<v> = entityAttr(x,"arn")` (Pass 2.5 → getNodeField(x,
-// "arn")). On the new side `arn` reads null, so the split yields nothing —
-// replace the whole `splitString(<arn>, ":")[3]` with `getNodeField(<node>,
-// "aws.region")`. Handles both the inline `getNodeField(node,"arn")` form and a
-// named var assigned from it (traced within the query). A leftover unused `arn`
-// fieldsAdd is harmless; we don't remove it (it may be referenced elsewhere).
+// ":")[3]` is definitionally the region and `[4]` the account id. Classic
+// dashboards derive both that way from `<v> = entityAttr(x,"arn")` (Pass 2.5 →
+// getNodeField(x,"arn")). On the new side `arn` reads null (the field is
+// `aws.arn`), so the split yields nothing — replace `splitString(<arn>,":")[3|4]`
+// with the denormalized `getNodeField(<node>, "aws.region" | "aws.account.id")`
+// (both carried on every AWS node — tenant-probed). Handles the inline
+// getNodeField(node,"arn") form and a named var traced within the query.
+const ARN_SPLIT_FIELD: Record<string, string> = { '3': 'aws.region', '4': 'aws.account.id' };
 const ARN_VAR_ASSIGN_RE = /\b(\w+)\s*=\s*getNodeField\(\s*([^,()]+?)\s*,\s*"arn"\s*\)/g;
-const ARN_REGION_INLINE_RE =
-  /splitString\(\s*getNodeField\(\s*([^,()]+?)\s*,\s*"arn"\s*\)\s*,\s*":"\s*\)\s*\[\s*3\s*\]/g;
-const ARN_REGION_VAR_RE = /splitString\(\s*(\w+)\s*,\s*":"\s*\)\s*\[\s*3\s*\]/g;
+const ARN_SPLIT_INLINE_RE =
+  /splitString\(\s*getNodeField\(\s*([^,()]+?)\s*,\s*"arn"\s*\)\s*,\s*":"\s*\)\s*\[\s*([34])\s*\]/g;
+const ARN_SPLIT_VAR_RE = /splitString\(\s*(\w+)\s*,\s*":"\s*\)\s*\[\s*([34])\s*\]/g;
 
 function rewriteArnRegion(input: string, transforms: Transform[]): string {
   // Map each arn-holding var to the node it was read from.
@@ -1761,28 +1774,28 @@ function rewriteArnRegion(input: string, transforms: Transform[]): string {
     arnVarNode.set(m[1]!, m[2]!);
   }
 
-  const note = (full: string, repl: string): string => {
+  const note = (full: string, node: string, idx: string): string => {
+    const field = ARN_SPLIT_FIELD[idx]!;
+    const repl = `getNodeField(${node}, "${field}")`;
     transforms.push({
       kind: 'entity-dim',
       before: full,
       after: repl,
-      detail: 'region parsed from ARN ([3]) → aws.region field (carried on every AWS node)',
+      detail: `parsed from ARN ([${idx}]) → ${field} field (denormalized on every AWS node)`,
     });
     return repl;
   };
 
-  // Inline: splitString(getNodeField(node,"arn"), ":")[3]
-  let out = input.replace(ARN_REGION_INLINE_RE, (full, node: string) =>
-    note(full, `getNodeField(${node}, "aws.region")`)
-  );
-  // Via a traced arn var: splitString(<arnVar>, ":")[3]. Record which vars we
-  // free (their region-parse use is gone) — only those are removal candidates.
+  // Inline: splitString(getNodeField(node,"arn"), ":")[3|4]
+  let out = input.replace(ARN_SPLIT_INLINE_RE, (full, node: string, idx: string) => note(full, node, idx));
+  // Via a traced arn var: splitString(<arnVar>, ":")[3|4]. Record which vars we
+  // free (their ARN-parse use is gone) — only those are removal candidates.
   const freed = new Set<string>();
-  out = out.replace(ARN_REGION_VAR_RE, (full, varName: string) => {
+  out = out.replace(ARN_SPLIT_VAR_RE, (full, varName: string, idx: string) => {
     const node = arnVarNode.get(varName);
     if (!node) return full;
     freed.add(varName);
-    return note(full, `getNodeField(${node}, "aws.region")`);
+    return note(full, node, idx);
   });
 
   // Clean up an arn var we just freed: if replacing its region parse left it
@@ -1810,6 +1823,60 @@ function rewriteArnRegion(input: string, transforms: Transform[]): string {
     });
   }
   return out;
+}
+
+// ─── Pass 2.59: generic AWS field renames (getNodeField field arg) ────────
+//
+// Fields renamed/namespaced on the new AWS node schema (tenant-probed on
+// nic55601): bare `arn` reads null — the ARN is on `aws.arn`; the classic VPC
+// name field is now `aws.vpc.id`. Runs AFTER the ARN-split pass so region/account
+// derivations still find the `"arn"` field first.
+const GETNODEFIELD_RENAME: Record<string, string> = {
+  arn: 'aws.arn',
+  awsVpcName: 'aws.vpc.id',
+};
+function rewriteAwsFieldRenames(input: string, transforms: Transform[]): string {
+  return input.replace(
+    /getNodeField\(\s*([^,()]+?)\s*,\s*"([^"]+)"\s*\)/g,
+    (full, arg: string, field: string) => {
+      const nf = GETNODEFIELD_RENAME[field];
+      if (!nf) return full;
+      const repl = `getNodeField(${arg}, "${nf}")`;
+      transforms.push({ kind: 'entity-dim', before: full, after: repl, detail: `field "${field}" → "${nf}" (new AWS node schema)` });
+      return repl;
+    }
+  );
+}
+
+// ─── Pass 2.6b: <dt.smartscape.X>.entity.name → getNodeName(X) ─────────────
+//
+// After the dim swap a classic `<dim>.entity.name` field path survives as
+// `dt.smartscape.X.entity.name`, which is not a field — the node name comes from
+// getNodeName(). Reviewer-confirmed; dominant across the corpus (388 tiles). The
+// negative lookahead skips an assignment LHS (`… .entity.name = …`), keeping
+// comparisons (`==`) and reads.
+const DIM_ENTITY_NAME_RE = /\b(dt\.smartscape\.[a-z0-9_]+)\.entity\.name\b(?!\s*=(?!=))/g;
+function rewriteDimEntityName(input: string, transforms: Transform[]): string {
+  return input.replace(DIM_ENTITY_NAME_RE, (full, dim: string) => {
+    const repl = `getNodeName(${dim})`;
+    transforms.push({ kind: 'entity-dim', before: full, after: repl, detail: 'dt.smartscape.X.entity.name → getNodeName(X)' });
+    return repl;
+  });
+}
+
+// ─── Pass 2.56b: <dt.smartscape.X>.tags field-access → tags:aws record ────
+//
+// A classic `<dim>.tags` field access survives the dim swap as
+// `dt.smartscape.X.tags`, but the AWS tag record is `tags:aws` (read via
+// getNodeField). Convert to `getNodeField(dt.smartscape.X, "tags:aws")` — which
+// then lets the tag-FILTER pass (2.57) rewrite any `in(…"[AWS]Key:"…)` around it.
+const DIM_TAGS_RE = /\b(dt\.smartscape\.[a-z0-9_]+)\.tags\b(?!:)/g;
+function rewriteDimTags(input: string, transforms: Transform[]): string {
+  return input.replace(DIM_TAGS_RE, (full, dim: string) => {
+    const repl = `getNodeField(${dim}, "tags:aws")`;
+    transforms.push({ kind: 'entity-dim', before: full, after: repl, detail: 'dt.smartscape.X.tags → getNodeField(X, "tags:aws")' });
+    return repl;
+  });
 }
 
 // ─── Pass 2.57: classic AWS tag FILTER idiom → tag-record key compare ──────

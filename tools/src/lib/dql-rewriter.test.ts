@@ -240,12 +240,46 @@ describe('rewriteDql — reviewer-feedback fixes (entity.name / tags / region)',
     assert.match(r.rewritten, /region = getNodeField\(dt\.smartscape\.aws_dynamodb_table, "aws\.region"\)/);
   });
 
-  it('keeps the arn fieldsAdd when arn is still referenced elsewhere', () => {
+  it('keeps the arn fieldsAdd (renamed to aws.arn) when arn is still referenced elsewhere', () => {
     const r = rewriteDql(
       'timeseries {avg(x)}, by:{ dt.entity.dynamo_db_table }\n| fieldsAdd arn=entityAttr(dt.entity.dynamo_db_table, "arn")\n| fieldsAdd region = splitString(arn, ":")[3]\n| fields arn, region',
       buildIndex([])
     );
-    assert.match(r.rewritten, /arn=getNodeField\(dt\.smartscape\.aws_dynamodb_table, "arn"\)/);
+    assert.match(r.rewritten, /arn=getNodeField\(dt\.smartscape\.aws_dynamodb_table, "aws\.arn"\)/);
+  });
+
+  it('renames getNodeField(x,"arn") → "aws.arn" (bare arn reads null on new side)', () => {
+    const r = rewriteDql(
+      'timeseries {avg(x)}, by:{ dt.entity.aws_lambda_function }\n| fieldsAdd a = entityAttr(dt.entity.aws_lambda_function, "arn")\n| fields a',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /getNodeField\(dt\.smartscape\.aws_lambda_function, "aws\.arn"\)/);
+    assert.doesNotMatch(r.rewritten, /"arn"\)/);
+  });
+
+  it('splitString(arn,":")[4] → aws.account.id field', () => {
+    const r = rewriteDql(
+      'timeseries {avg(x)}, by:{ dt.entity.aws_lambda_function }\n| fieldsAdd arn = entityAttr(dt.entity.aws_lambda_function,"arn")\n| fieldsAdd account = splitString(arn, ":")[4]',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /account = getNodeField\(dt\.smartscape\.aws_lambda_function, "aws\.account\.id"\)/);
+  });
+
+  it('dt.smartscape.X.entity.name (dim field path) → getNodeName(X)', () => {
+    const r = rewriteDql(
+      'timeseries {avg(x)}, by:{ dt.entity.aws_application_load_balancer }\n| filter contains(dt.entity.aws_application_load_balancer.entity.name, "aap")',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /contains\(getNodeName\(dt\.smartscape\.aws_elasticloadbalancingv2_loadbalancer\), "aap"\)/);
+  });
+
+  it('dt.smartscape.X.tags field-access + [AWS] filter → getNodeField tags:aws key compare', () => {
+    const r = rewriteDql(
+      'timeseries requests = avg(dt.cloud.aws.alb.requests), by:{dt.entity.aws_application_load_balancer}\n| filter in(concat("[AWS]ApplicationCI:", $ApplicationCI), dt.entity.aws_application_load_balancer.tags)',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /getNodeField\(dt\.smartscape\.aws_elasticloadbalancingv2_loadbalancer, "tags:aws"\)\[ApplicationCI\] == \$ApplicationCI/);
+    assert.doesNotMatch(r.rewritten, /\.tags\b(?!:)/);
   });
 
   it('does NOT touch splitString(x,":")[3] when x is not a traced ARN var (safety)', () => {
