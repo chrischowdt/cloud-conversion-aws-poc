@@ -64,5 +64,5 @@ export async function runMigratePull(args: MigratePullArgs): Promise<void> {
 
   console.log('');
   console.log(`Pulled ${pulled}/${staged.length} review copies into ${reviewedDir}.`);
-  console.log('Set `decision` = approve in the tracker for the ones ready, then run `cct migrate-promote`.');
+  console.log('Set `decision` = "Ready To Publish" in the tracker for the ones ready, then run `cct migrate-promote`.');
 }

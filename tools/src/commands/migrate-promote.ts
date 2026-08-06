@@ -1,5 +1,5 @@
 /**
- * migrate-promote — the cutover. For approved assets, update the ORIGINAL
+ * migrate-promote — the cutover. For rows marked "Ready To Publish", update the ORIGINAL
  * document in place with the migrated content (same id/URL → users see the
  * migrated asset seamlessly, no interruption).
  *
@@ -29,7 +29,7 @@ import { rewriteInPlace, stripOriginalCommentsInPlace, type QueryHit } from './r
 import { buildApply, type AssetType } from '../lib/doc-apply.ts';
 import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { findOriginal } from '../lib/migrate-support.ts';
-import { readRows, readDecisions, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { readRows, readDecisions, upsertRows, isReadyToPublish, isPublished, PUBLISHED, type TrackerRow } from '../lib/tracker-xlsx.ts';
 
 export interface MigratePromoteArgs {
   outDir: string;
@@ -68,10 +68,11 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
   const idFilter = args.ids?.length ? new Set(args.ids) : null;
   let candidates: Candidate[] = [...rows.entries()]
     .filter(([id, r]) => {
-      const approved = decisions.get(id)?.decision === 'approve';
-      const done = r['status'] === 'promoted' || r['status'] === 'verified';
+      const dec = decisions.get(id)?.decision;
+      const ready = isReadyToPublish(dec);
+      const done = isPublished(dec) || r['status'] === 'promoted' || r['status'] === 'verified';
       const lane = r['lane'];
-      return approved && !done && (lane === 'fast' || lane === 'review') && (!idFilter || idFilter.has(id));
+      return ready && !done && (lane === 'fast' || lane === 'review') && (!idFilter || idFilter.has(id));
     })
     .map(([id, r]) => ({
       id,
@@ -83,10 +84,10 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
   if (args.limit) candidates = candidates.slice(0, args.limit);
 
   if (candidates.length === 0) {
-    console.log('No approved assets to promote (need decision=approve and status not promoted/verified).');
+    console.log('No assets to publish (need decision="Ready To Publish" and not already Published/promoted).');
     return;
   }
-  console.log(`${args.apply ? 'Promoting (in-place cutover)' : 'Preparing cutover for'} ${candidates.length} approved asset(s)…`);
+  console.log(`${args.apply ? 'Publishing (in-place cutover)' : 'Preparing cutover for'} ${candidates.length} ready asset(s)…`);
 
   const client = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
   const mappingPath = args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
@@ -186,6 +187,7 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
       asset_type: c.type,
       name: c.name,
       status: 'promoted',
+      decision: PUBLISHED, // stamp the team-facing lifecycle value in column V
       pre_promote_version: liveVersion,
       promoted_at: new Date().toISOString(),
     });

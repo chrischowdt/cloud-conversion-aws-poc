@@ -5,7 +5,10 @@
  * The tool owns the TOOL_COLUMNS (asset metadata, confidence, lane, status,
  * review-copy links, timestamps) and rewrites them on every `upsertRows`. The
  * HUMAN_COLUMNS (`decision`, `reviewer`, `notes`) are the reviewer's — the tool
- * READS them (`readDecisions`) but NEVER writes them, joining by `asset_id`.
+ * READS them (`readDecisions`) and joins by `asset_id`. The ONE exception: the
+ * automation stamps `decision = "Published"` on rows it has just cut over (that
+ * lifecycle transition is the tool's to record); it never touches any other
+ * decision value a human set.
  *
  * Caveat: this is a whole-file read-modify-write via exceljs, so it's
  * last-writer-wins if the tool saves while someone is live-editing. Run tool
@@ -19,6 +22,33 @@ import { existsSync } from 'node:fs';
 import ExcelJS from 'exceljs';
 
 export type AssetType = 'dashboard' | 'notebook';
+
+/**
+ * The team's shared `decision` vocabulary (column V). Reviewers pick from the
+ * first four; the automation sets `Published` itself after a successful cutover.
+ */
+export const DECISION_STATES = [
+  'Descope', // exclude from any automated conversion
+  'Needs Review', // has a conversion blocker
+  'In Progress', // someone is actively reviewing
+  'Ready To Publish', // automation may cut the review copy over the original
+  'Published', // set BY the automation after cutover
+] as const;
+export type DecisionState = (typeof DECISION_STATES)[number];
+
+/** The decision value that authorizes the automation to publish a row. */
+export const READY_TO_PUBLISH = 'Ready To Publish';
+/** The decision value the automation writes back after a successful cutover. */
+export const PUBLISHED = 'Published';
+
+/** True when a (raw, any-case) decision cell means "ready to publish". */
+export function isReadyToPublish(decision: string | undefined): boolean {
+  return (decision ?? '').trim().toLowerCase() === READY_TO_PUBLISH.toLowerCase();
+}
+/** True when a (raw, any-case) decision cell means "already published". */
+export function isPublished(decision: string | undefined): boolean {
+  return (decision ?? '').trim().toLowerCase() === PUBLISHED.toLowerCase();
+}
 
 /** Columns the tool owns and overwrites. `asset_id` is the join key. */
 export const TOOL_COLUMNS = [
@@ -82,6 +112,11 @@ export interface TrackerRow {
   promoted_at?: string;
   verified_at?: string;
   tool_updated?: string;
+  /**
+   * Human column, normally reviewer-owned. The automation MAY set this to
+   * `Published` after a cutover (see module header); no other tool path sets it.
+   */
+  decision?: string;
 }
 
 export interface Decision {
@@ -130,20 +165,20 @@ function initHeader(ws: ExcelJS.Worksheet): Map<string, number> {
   return map;
 }
 
-/** Write a human-facing "how to use this tracker" sheet (once). */
+/** (Re)write the human-facing "how to use this tracker" sheet to match the code. */
 function ensureInstructions(wb: ExcelJS.Workbook): void {
-  if (wb.getWorksheet('how-to')) return;
-  const ws = wb.addWorksheet('how-to');
+  const ws = wb.getWorksheet('how-to') ?? wb.addWorksheet('how-to');
+  ws.spliceRows(1, ws.rowCount); // clear stale guidance, then rewrite
   ws.getColumn(1).width = 120;
   const lines: Array<[string] | string> = [
     'Migration tracker — how to use it (5-person team)',
     '',
     'WHAT THIS IS: one row per AWS dashboard/notebook we can migrate to the new Smartscape integration.',
     'The tooling owns the grey/left columns (asset info, confidence, lane, status, review-copy link, timestamps).',
-    'YOU own four columns: assignee, decision, reviewer, notes. The tool reads `decision` and never overwrites yours.',
+    'YOU own: assignee, decision, reviewer, notes. The tool reads "decision"; the only value it WRITES is "Published" (after it cuts a row over).',
     '',
     'LANES (column "lane"):',
-    '  fast    — clean rewrite AND live parity matched; safe to cut over directly after approval.',
+    '  fast    — clean rewrite AND live parity matched; safe to cut over directly.',
     '  review  — has verify-me warnings or unmatched parity; needs a human to open the copy and fix/verify.',
     '  blocked — nothing auto-converted (manual rebuild); not staged.',
     '',
@@ -151,24 +186,33 @@ function ensureInstructions(wb: ExcelJS.Workbook): void {
     '',
     'DIVIDE THE WORK: put your name in "assignee" for the rows you will review (split the review-lane rows across the 5 of you).',
     '',
+    'DECISION (column V) — pick one from the dropdown:',
+    '  Descope          — exclude this dashboard from any automated conversion (whatever the reason).',
+    '  Needs Review     — has a conversion blocker; not ready.',
+    '  In Progress      — you are actively reviewing it right now (tells the team it is taken).',
+    '  Ready To Publish — reviewed + correct; the automation MAY cut the review copy over the original.',
+    '  Published        — set BY the automation after it has cut the row over. Do not set this yourself.',
+    '',
     'REVIEW WORKFLOW (per assigned row):',
-    '  1. Open the review copy — click the link in "review_copy_url" (it is a COPY named "… (migrated — review)"; the original is untouched).',
-    '  2. Check the tiles render and the data looks right; fix anything wrong directly in that copy in the UI.',
-    '  3. When it is correct, put your name in "reviewer", add any "notes", and set "decision" = approve.',
-    '     If it cannot be migrated yet, set "decision" = reject and explain in "notes".',
+    '  1. Set decision = In Progress so others know it is taken.',
+    '  2. Open the review copy — click "review_copy_url" (a COPY named "[MIGRATION REVIEW] …"; the original is untouched).',
+    '     Each converted tile shows the ORIGINAL classic query as a // comment above the migrated one, for reference.',
+    '  3. Check the tiles render and the data looks right; fix anything wrong directly in that copy in the UI.',
+    '  4. When correct, put your name in "reviewer", add any "notes", and set decision = Ready To Publish.',
+    '     If it cannot be migrated yet, set decision = Needs Review (or Descope) and explain in "notes".',
     '',
-    'PROMOTING (migration lead): for rows with decision=approve, the lead runs `cct migrate-pull` then `cct migrate-promote --apply`.',
-    '  That updates the ORIGINAL dashboard in place (same URL) with the reviewed content — this is the go-live / "promote to the real dashboard" step.',
-    '  Then `cct migrate-verify`; `cct migrate-rollback --ids <id> --apply` reverts if needed.',
+    'PUBLISHING (migration lead): for rows with decision = Ready To Publish, run `cct migrate-pull` then `cct migrate-promote --apply`',
+    '  (pass --tracker "<this file>"). That updates the ORIGINAL dashboard in place (same URL) with the reviewed content —',
+    '  the go-live step — then stamps decision = Published. `cct migrate-verify`; `cct migrate-rollback --ids <id> --apply` reverts.',
     '',
-    'STATUS values the tool sets: candidate → staged (copy published) → in-review (copy pulled) → promoted (cut over) → verified. (rolled-back if reverted.)',
-    'Only edit assignee/decision/reviewer/notes. Save + close when done so the tool can read your decisions.',
+    'STATUS values the tool sets (column M): candidate → staged (copy published) → in-review (copy pulled) → promoted (cut over) → verified.',
+    'Only edit assignee / decision / reviewer / notes. Save + close when done so the tool can read your decisions.',
   ];
   lines.forEach((l, i) => {
     const cell = ws.getRow(i + 1).getCell(1);
     cell.value = Array.isArray(l) ? l[0] : l;
     if (i === 0) cell.font = { bold: true, size: 14 };
-    if (/^[A-Z][A-Z ]+:/.test(String(cell.value)) || /WORKFLOW|DIVIDE|PROMOTING/.test(String(cell.value))) cell.font = { bold: true };
+    if (/^[A-Z][A-Z ]+ ?\(|^[A-Z][A-Z ]+:/.test(String(cell.value)) || /WORKFLOW|DIVIDE|PUBLISHING/.test(String(cell.value))) cell.font = { bold: true };
   });
 }
 
@@ -227,7 +271,9 @@ export async function upsertRows(
     }
     const row = ws.getRow(rowNum);
     for (const [key, val] of Object.entries(withStamp)) {
-      if (!TOOL_KEYS.has(key as (typeof TOOL_COLUMNS)[number]['key'])) continue; // never touch human cols
+      // Tool columns are always writable; `decision` is writable ONLY so the
+      // automation can stamp its lifecycle value (Published). No other human col.
+      if (!TOOL_KEYS.has(key as (typeof TOOL_COLUMNS)[number]['key']) && key !== 'decision') continue;
       if (val === undefined) continue;
       const col = header.get(key);
       if (col) row.getCell(col).value = val as ExcelJS.CellValue;
@@ -235,8 +281,31 @@ export async function upsertRows(
     row.commit();
   }
 
+  applyDecisionDropdown(ws, header);
   await wb.xlsx.writeFile(path);
   return { updated, added };
+}
+
+/**
+ * Attach a data-validation dropdown of DECISION_STATES to every data row's
+ * `decision` cell, so the whole team picks from the same list. Idempotent.
+ */
+function applyDecisionDropdown(ws: ExcelJS.Worksheet, header: Map<string, number>): void {
+  const col = header.get('decision');
+  if (!col) return;
+  const formulae = [`"${DECISION_STATES.join(',')}"`];
+  const last = Math.max(ws.rowCount, 2);
+  for (let r = 2; r <= last; r++) {
+    ws.getCell(r, col).dataValidation = {
+      type: 'list',
+      allowBlank: true,
+      formulae,
+      showErrorMessage: true,
+      errorStyle: 'warning',
+      error: 'Pick one of: ' + DECISION_STATES.join(', '),
+      errorTitle: 'Migration decision',
+    };
+  }
 }
 
 /** asset_ids already present in the tracker (so a refresh won't reset status). */
