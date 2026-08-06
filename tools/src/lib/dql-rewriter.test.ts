@@ -187,6 +187,61 @@ describe('rewriteDql — entity dimension swap', () => {
   });
 });
 
+describe('rewriteDql — reviewer-feedback fixes (entity.name / tags / region)', () => {
+  it('entityAttr(x,"entity.name") → getNodeName(x), not getNodeField', () => {
+    const r = rewriteDql(
+      'timeseries { count(some_metric) }, by:{ dt.entity.aws_application_load_balancer }, filter: { matchesValue(entityAttr(dt.entity.aws_application_load_balancer, "entity.name"), "*ccl*") }',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /matchesValue\(getNodeName\(dt\.smartscape\.aws_elasticloadbalancingv2_loadbalancer\), "\*ccl\*"\)/);
+    assert.doesNotMatch(r.rewritten, /getNodeField\([^)]*"entity\.name"\)/);
+  });
+
+  it('AWS tag literal filter in(tags,"[AWS]Key:val") → tags[Key] == "val"', () => {
+    const r = rewriteDql(
+      'timeseries { avg(x) }, by:{ dt.entity.dynamo_db_table }, filter: in(entityAttr(dt.entity.dynamo_db_table, "tags"), "[AWS]ApplicationCI:fbs")',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /getNodeField\(dt\.smartscape\.aws_dynamodb_table, "tags:aws"\)\[ApplicationCI\] == "fbs"/);
+    assert.doesNotMatch(r.rewritten, /in\(getNodeField/);
+  });
+
+  it('AWS tag concat filter via a tags var → tags[Key] == $Var (both arg orders)', () => {
+    const r = rewriteDql(
+      'timeseries requests = avg(x), by:{dt.entity.aws_application_load_balancer}\n| fieldsAdd tags = entityAttr(dt.entity.aws_application_load_balancer, "tags")\n| filter in(concat("[AWS]ApplicationCI:", $ApplicationCI), tags) and in(tags, concat("[AWS]env:", $Env))',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /tags\[ApplicationCI\] == \$ApplicationCI/);
+    assert.match(r.rewritten, /tags\[env\] == \$Env/);
+    assert.doesNotMatch(r.rewritten, /in\(concat/);
+  });
+
+  it('does NOT touch a bare `tags` not sourced from an AWS tag record (span safety)', () => {
+    const q = 'fetch spans | filter in(tags, "[AWS]ApplicationCI:fbs")';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /in\(tags, "\[AWS\]ApplicationCI:fbs"\)/); // unchanged
+  });
+
+  it('region from customProperties[REGION_NAME] → aws.region field', () => {
+    const r = rewriteDql(
+      'timeseries max(x), by:{ dt.entity.aws_lambda_function }\n| fieldsAdd region = entityAttr(dt.entity.aws_lambda_function, "customProperties")[REGION_NAME]',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /region = getNodeField\(dt\.smartscape\.aws_lambda_function, "aws\.region"\)/);
+    assert.doesNotMatch(r.rewritten, /customProperties/);
+  });
+
+  it('dedupes a duplicate column when two classic entities collapse to one node type', () => {
+    const r = rewriteDql(
+      'timeseries {avg(x)}, by:{ dt.entity.dynamo_db_table }\n| fields timeframe, dt.entity.dynamo_db_table, dt.entity.dynamo_db_table, appci',
+      buildIndex([])
+    );
+    const matches = r.rewritten.match(/dt\.smartscape\.aws_dynamodb_table/g) ?? [];
+    // one in the by-clause + exactly one left in the fields clause (dup removed)
+    assert.equal(matches.length, 2);
+  });
+});
+
 describe('rewriteDql — flags constructs needing manual migration', () => {
   it('flags classicEntitySelector', () => {
     const idx = buildIndex([cpuEntry]);

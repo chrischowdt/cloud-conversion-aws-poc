@@ -692,6 +692,12 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // value-extraction idiom to a direct record read `<tags>[Key]` (tags:aws).
   rewritten = rewriteTagExtraction(rewritten, transforms);
 
+  // Pass 2.56: region-derivation (customProperties[REGION*]) → aws.region field.
+  rewritten = rewriteAwsRegionField(rewritten, transforms);
+
+  // Pass 2.57: classic AWS tag FILTER idiom (in(tags,"[AWS]Key:val")) → tags[Key] == val.
+  rewritten = rewriteAwsTagFilters(rewritten, transforms);
+
   // Pass 2.6: when we rewrote `fetch dt.entity.X` to `smartscapeNodes`,
   // any `entity.name` field reference inside should become bare `name`.
   if (fetchContext.didRewriteFetch) {
@@ -900,6 +906,10 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
       warnings.push({ kind: fp.kind, text: fp.text, reference: fp.reference, match: m[0] });
     }
   }
+
+  // Late cleanup: drop duplicate columns a collapse may have produced in a
+  // fields/fieldsKeep clause. Runs last so it sees the final column names.
+  rewritten = dedupeFieldsClauses(rewritten, transforms);
 
   return { original, rewritten, transforms, warnings };
 }
@@ -1634,6 +1644,14 @@ function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
     (full, arg: string, field: string) => {
       // Leave entityAttr on a non-AWS entity classic (matches the untouched entity).
       if (argRefsNonAwsEntity(arg)) return full;
+      // The node NAME is not a readable field on Smartscape — it's a function.
+      // entityAttr(x, "entity.name" | "name") → getNodeName(x). (Reviewers hit
+      // `getNodeField(x,"entity.name")` failing; the name comes from getNodeName.)
+      if (field === '"entity.name"' || field === '"name"') {
+        const repl = `getNodeName(${arg})`;
+        transforms.push({ kind: 'entity-dim', before: full, after: repl, detail: `entityAttr(x, ${field}) → getNodeName(x)` });
+        return repl;
+      }
       // Classic "tags" maps to the provider-namespaced "tags:aws" record on the
       // new side (verified on tenant — getNodeField(x,"tags") also returns a
       // record, but "tags:aws" is the AWS-scoped, KB-recommended form, and is
@@ -1691,5 +1709,113 @@ function rewriteTagExtraction(input: string, transforms: Transform[]): string {
       detail: `classic tag string-parse → record read ${repl} (tags:aws by key)`,
     });
     return repl;
+  });
+}
+
+// ─── Pass 2.56: region-derivation idiom → the aws.region field ────────────
+//
+// Every AWS Smartscape node carries `aws.region`. Classic dashboards derived the
+// region indirectly — most commonly from the custom-device custom properties:
+//   entityAttr(x, "customProperties")[REGION_NAME]   (Pass 2.5 → getNodeField(x,"customProperties")[REGION_NAME])
+// which returns null on the new side. Collapse any such customProperties region
+// read to a direct `getNodeField(x, "aws.region")`. (Verified in reviewer fixes
+// on DWR/FBS/EIF: "we can simply use aws.region … on new AWS metrics".)
+const CUSTOM_PROP_REGION_RE =
+  /getNodeField\(\s*([^,()]+?)\s*,\s*"customProperties"\s*\)\s*\[\s*([A-Za-z_]*REGION[A-Za-z_]*)\s*\]/gi;
+
+function rewriteAwsRegionField(input: string, transforms: Transform[]): string {
+  return input.replace(CUSTOM_PROP_REGION_RE, (full, arg: string) => {
+    const repl = `getNodeField(${arg}, "aws.region")`;
+    transforms.push({
+      kind: 'entity-dim',
+      before: full,
+      after: repl,
+      detail: 'region from customProperties → aws.region field (carried on every AWS node)',
+    });
+    return repl;
+  });
+}
+
+// ─── Pass 2.57: classic AWS tag FILTER idiom → tag-record key compare ──────
+//
+// Classic filters test the serialized tag string for a "[AWS]<Key>:<value>"
+// substring, e.g.  in(entityAttr(x,"tags"), "[AWS]ApplicationCI:fbs")  or
+// in(concat("[AWS]env:", $Env), tags). After Pass 2.5 the tags source is the
+// AWS tag RECORD (getNodeField(x,"tags:aws") or a var holding it), so the
+// substring test is invalid ("field tags doesn't support …"). Rewrite to a
+// direct record-key compare: <tags>[<Key>] == <value>. Scoped to AWS tag
+// sources only (getNodeField(…,"tags:aws") or a var assigned from it) so span /
+// non-AWS `tags` usage is never touched (reviewer caught an over-reach on spans).
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function rewriteAwsTagFilters(input: string, transforms: Transform[]): string {
+  // Vars assigned an AWS tag record become additional safe tag sources.
+  const tagVars = new Set<string>();
+  const assignRe = /\b([A-Za-z_]\w*)\s*=\s*getNodeField\([^()]*,\s*"tags:aws"\)/g;
+  for (let m = assignRe.exec(input); m; m = assignRe.exec(input)) tagVars.add(m[1]!);
+
+  const gnf = 'getNodeField\\([^()]*,\\s*"tags:aws"\\)';
+  const varAlt = [...tagVars].map(escapeRegExp).join('|');
+  const tags = varAlt ? `(?:${gnf}|${varAlt})` : gnf;
+  const K = '([^:"\\]]+)'; // tag key (no [AWS] prefix, no colon)
+
+  let out = input;
+  const eq = (full: string, te: string, key: string, value: string): string => {
+    const repl = `${te.trim()}[${key.trim()}] == ${value.trim()}`;
+    transforms.push({
+      kind: 'entity-dim',
+      before: full,
+      after: repl,
+      detail: `AWS tag filter → tag-record key compare (${key.trim()}); verify placement if inside a timeseries filter:{} block`,
+    });
+    return repl;
+  };
+
+  // in(<tags>, "[AWS]Key:literal")  /  reversed
+  out = out.replace(new RegExp(`\\bin\\(\\s*(${tags})\\s*,\\s*"\\[AWS\\]${K}:([^"]*)"\\s*\\)`, 'g'),
+    (full, te, key, val) => eq(full, te, key, `"${val}"`));
+  out = out.replace(new RegExp(`\\bin\\(\\s*"\\[AWS\\]${K}:([^"]*)"\\s*,\\s*(${tags})\\s*\\)`, 'g'),
+    (full, key, val, te) => eq(full, te, key, `"${val}"`));
+  // in(<tags>, concat("[AWS]Key:", <expr>))  /  reversed
+  out = out.replace(new RegExp(`\\bin\\(\\s*(${tags})\\s*,\\s*concat\\(\\s*"\\[AWS\\]${K}:"\\s*,\\s*([^()]+?)\\)\\s*\\)`, 'g'),
+    (full, te, key, expr) => eq(full, te, key, expr));
+  out = out.replace(new RegExp(`\\bin\\(\\s*concat\\(\\s*"\\[AWS\\]${K}:"\\s*,\\s*([^()]+?)\\)\\s*,\\s*(${tags})\\s*\\)`, 'g'),
+    (full, key, expr, te) => eq(full, te, key, expr));
+  return out;
+}
+
+// ─── Late cleanup: drop duplicate columns in a fields / fieldsKeep clause ──
+//
+// When two distinct classic entities (e.g. custom_device AND a concrete type)
+// collapse to the SAME Smartscape node type, a `fields …, A, …, A` list ends up
+// with the identical column twice → the renderer errors. Dedupe exact-duplicate
+// bare column tokens within each fields/fieldsKeep clause, keeping first order.
+function dedupeFieldsClauses(input: string, transforms: Transform[]): string {
+  return input.replace(/(\|\s*fields(?:Keep)?\s+)([^|]+)/g, (full, head: string, body: string) => {
+    const parts = body.split(',').map((p) => p.trim());
+    const seen = new Set<string>();
+    const kept: string[] = [];
+    let dropped = 0;
+    for (const p of parts) {
+      // Only dedupe simple column refs (no assignment / call), keep everything else.
+      const isSimple = p.length > 0 && !/[=(]/.test(p);
+      const dupKey = p;
+      if (isSimple && seen.has(dupKey)) {
+        dropped++;
+        continue;
+      }
+      if (isSimple) seen.add(dupKey);
+      kept.push(p);
+    }
+    if (dropped === 0) return full;
+    transforms.push({
+      kind: 'entity-dim',
+      before: `fields …${dropped} duplicate column(s)`,
+      after: 'deduped',
+      detail: 'removed duplicate column(s) from a fields clause (two classic entities collapsed to one node type)',
+    });
+    return `${head}${kept.join(', ')}`;
   });
 }
