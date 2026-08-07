@@ -26,6 +26,7 @@ import {
   type LiveMetricsIndex,
 } from './live-metrics.ts';
 import { builtinToDqlClassic } from './schema-transforms.ts';
+import { correctServiceNamespace } from './service-namespace-corrections.ts';
 
 export type Aggregation = 'avg' | 'sum' | 'max' | 'min' | 'count';
 export type NewAggMode = 'raw' | 'per_second';
@@ -143,6 +144,9 @@ export async function loadRecipeIndex(
   for (const svc of file.serviceMappings ?? []) {
     for (const bm of svc.builtinMetricMappings ?? []) {
       const entry: MappingEntry = { ...bm, service: svc.service };
+      // Correct DAC "recommended" service namespaces the new pipeline never emits
+      // (e.g. emr_ec2 → elasticmapreduce). Tenant-proven; see the corrections module.
+      if (entry.newDtMetricKey) entry.newDtMetricKey = correctServiceNamespace(entry.newDtMetricKey);
       byClassicId.set(bm.classicMetricId, entry);
       const dqlKey = builtinToDqlClassic(bm.classicMetricId);
       if (dqlKey) byDqlClassicKey.set(dqlKey, entry);
@@ -243,10 +247,11 @@ export function lookupClassicKey(
   if (index.extra) {
     const extra = lookupInExtraWithNormalization(index.extra, classicMetricId);
     if (extra) {
+      const newKey = correctServiceNamespace(extra.newKey);
       const synthetic: MappingEntry = {
-        service: serviceFromNewKey(extra.newKey),
+        service: serviceFromNewKey(newKey),
         classicMetricId,
-        newDtMetricKey: extra.newKey,
+        newDtMetricKey: newKey,
         notes:
           `Resolved via ${extra.source === 'manual' ? 'manual-metric-mappings' : 'per-key-mappings'} ` +
           `(${extra.availability}). ` +
@@ -270,7 +275,7 @@ export function lookupClassicKey(
         service: dac.cloudwatchNamespace.replace(/^AWS\//, ''),
         classicMetricId,
         cloudwatchName: dac.cloudwatchMetricName,
-        newDtMetricKey: dac.newDtMetricKey,
+        newDtMetricKey: correctServiceNamespace(dac.newDtMetricKey),
         newDimensions: dac.cloudwatchDimensions,
         notes:
           `Resolved via DAC (${dac.availability}).${eolNote} ` +
