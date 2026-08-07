@@ -321,9 +321,12 @@ export class DocumentClient {
    * Share a document with everyone in the environment. `POST /environment-shares
    * {documentId, access}`. Default `read-write` (editable by anyone). Needs
    * `document:environment-shares:write`. A 409 (already shared) is treated as OK.
+   *
+   * `notify` maps to the `send-notification` query param (API default: true). We
+   * default it to FALSE — bulk-staging migration copies shouldn't email the team.
    */
-  async shareEnvironment(id: string, access: 'read' | 'read-write' = 'read-write'): Promise<void> {
-    const url = `${this.baseUrl}/platform/document/v1/environment-shares`;
+  async shareEnvironment(id: string, access: 'read' | 'read-write' = 'read-write', notify = false): Promise<void> {
+    const url = `${this.baseUrl}/platform/document/v1/environment-shares?send-notification=${notify}`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
@@ -337,13 +340,17 @@ export class DocumentClient {
    * Share a document with a specific group (or user) via a direct share.
    * `POST /direct-shares {documentId, access, recipients:[{id,type}]}`. Default
    * `read-write`. Needs `document:direct-shares:write`. 409 (already shared) is OK.
+   *
+   * `notify` maps to the `send-notification` query param (API default: true). We
+   * default it to FALSE so bulk staging doesn't spam the review team with emails.
    */
   async shareWithGroup(
     id: string,
     groupId: string,
-    access: 'read' | 'read-write' = 'read-write'
+    access: 'read' | 'read-write' = 'read-write',
+    notify = false
   ): Promise<void> {
-    const url = `${this.baseUrl}/platform/document/v1/direct-shares`;
+    const url = `${this.baseUrl}/platform/document/v1/direct-shares?send-notification=${notify}`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
