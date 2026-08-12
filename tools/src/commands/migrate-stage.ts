@@ -139,9 +139,19 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
           version: live.metadata.version,
           adminAccess: true,
         });
-        updates.push({ asset_id: c.id, asset_type: c.type, name: c.name, status: 'staged', staged_at: new Date().toISOString() });
+        // Re-base based_on_version to the (possibly re-downloaded) original's
+        // version, so a subsequent promote's drift guard compares against the
+        // content we actually rewrote — not the version staged the first time.
+        updates.push({
+          asset_id: c.id,
+          asset_type: c.type,
+          name: c.name,
+          status: 'staged',
+          based_on_version: wrapper.metadata?.version,
+          staged_at: new Date().toISOString(),
+        });
         staged++;
-        console.log(`  ✓ restaged ${c.id} → copy ${c.copyId} (in place)`);
+        console.log(`  ✓ restaged ${c.id} → copy ${c.copyId} (in place, based on v${wrapper.metadata?.version ?? '?'})`);
       } else {
         const created = await client.createDocument({ name: apply.name, type: c.type, content: apply.content, isPrivate: false });
         try {
