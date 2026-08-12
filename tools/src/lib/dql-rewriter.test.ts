@@ -1394,6 +1394,41 @@ describe('rewriteDql — credential→account-id lookup (Pass 0.7)', () => {
   });
 });
 
+describe('rewriteDql — metric-less custom_device list idiom (Pass 0.8)', () => {
+  it('rewrites a collectArray(id) variable to smartscapeNodes "AWS*" + native fields', () => {
+    const r = rewriteDql(
+      'fetch dt.entity.custom_device\n| filter matchesValue(tags, concat("[AWS]ApplicationCI:", $appci)) and matchesValue(tags, concat("[AWS]env:", $env))\n| filter in(customProperties[REGION_NAME], $region)\n| summarize custom_device_ids = collectArray(id)',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /smartscapeNodes "AWS\*"/);
+    assert.match(r.rewritten, /in\(`tags:aws`\[ApplicationCI\], array\(\$appci\)\)/);
+    assert.match(r.rewritten, /in\(`tags:aws`\[env\], array\(\$env\)\)/);
+    assert.match(r.rewritten, /in\(aws\.region, \$region\)/);
+    assert.match(r.rewritten, /summarize custom_device_ids = collectArray\(id\)/);
+    assert.doesNotMatch(r.rewritten, /dt\.entity\.custom_device|customProperties/);
+  });
+
+  it('rewrites the region-picker variant (fields region)', () => {
+    const r = rewriteDql(
+      'fetch dt.entity.custom_device\n| filter in(tags, concat("[AWS]ApplicationCI:", $appci))\n| fieldsAdd region = customProperties[REGION_NAME]\n| dedup region | fields region',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /smartscapeNodes "AWS\*"/);
+    assert.match(r.rewritten, /fieldsAdd region = aws\.region/);
+    assert.match(r.rewritten, /dedup region \| fields region/);
+  });
+
+  it('does NOT touch a custom_device query that has a metric (handled by other passes)', () => {
+    const r = rewriteDql('timeseries avg(cloud.aws.lambda.duration), by:{dt.entity.custom_device}', buildIndex([]));
+    assert.doesNotMatch(r.rewritten, /smartscapeNodes "AWS\*"/);
+  });
+
+  it('does NOT touch a non-AWS custom_device list (no [AWS]/customProperties markers)', () => {
+    const r = rewriteDql('fetch dt.entity.custom_device\n| filter something == "x"\n| summarize ids = collectArray(id)', buildIndex([]));
+    assert.match(r.rewritten, /fetch dt\.entity\.custom_device/);
+  });
+});
+
 describe('rewriteDql — credential/account fieldsAdd idiom (Pass 0.6)', () => {
   it('resolves the account name via the native aws.account.name dimension (no lookups)', () => {
     const idx = buildIndex([]);

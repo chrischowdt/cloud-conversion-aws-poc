@@ -301,6 +301,12 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // to that field (custom_device → smartscapeNodes is handled by Pass 1.55).
   input = rewriteCredentialAccountLookup(input, transforms, warnings);
 
+  // Pass 0.8: the metric-LESS custom_device list idiom (dashboard variables /
+  // region pickers). With no metric key there's no service to disambiguate
+  // custom_device to one node type, so query ALL AWS nodes via smartscapeNodes
+  // "AWS*" and read tags/region as native fields.
+  input = rewriteCustomDeviceTopologyList(input, transforms, warnings);
+
   // Pre-pass: bail out if the query contains a `lookup [fetch
   // dt.entity.<not-planned-type>]` chain (e.g. `custom_device`,
   // `host_group`, `process_group`). The lookup's output prefixes downstream
@@ -1345,6 +1351,53 @@ const CUSTOM_DEVICE_ENTITY_TYPE_RE = /\bentity\.type\b\s*==\s*"(cloud:aws:[a-z0-
  * classic credential/account traversal — so high-confidence conversions (e.g. a
  * Lambda `by:{dt.entity.custom_device}`) can reach clean.
  */
+// Pass 0.8 — metric-less custom_device list/topology idiom (dashboard variables).
+// `fetch dt.entity.custom_device | <[AWS] tag / customProperties filters> |
+// summarize <v> = collectArray(id)` (or `| fields region`). No metric key → no
+// service to disambiguate custom_device, so the fetch pass leaves it classic and
+// the variable silently returns nothing. Reviewer-confirmed rebuild: query ALL
+// AWS nodes via `smartscapeNodes "AWS*"` and read tags/region as native fields.
+// ~23 dashboards on the corpus use this shape for their $custom_device_ids /
+// $region variables. Scoped to metric-less, [AWS]-tagged custom_device lists.
+function rewriteCustomDeviceTopologyList(
+  input: string,
+  transforms: Transform[],
+  warnings: Warning[]
+): string {
+  if (!/\bfetch\s+`?dt\.entity\.custom_device`?/.test(input)) return input;
+  if (/(?:dt\.|builtin:|ext:)?cloud\.aws\.[a-z0-9_]+\./.test(input)) return input; // metric query → other passes
+  if (!/\[AWS\]|customProperties/.test(input)) return input; // not clearly an AWS resource list
+
+  let out = input.replace(/\bfetch\s+`?dt\.entity\.custom_device`?/g, 'smartscapeNodes "AWS*"');
+  // tag string-match filters → tags:aws record-key filter:
+  //   (matchesValue|in)(tags, concat("[AWS]<Key>:", <expr>)) → in(`tags:aws`[<Key>], array(<expr>))
+  out = out.replace(
+    /\b(?:matchesValue|in)\(\s*tags\s*,\s*concat\(\s*"\[AWS\]([^:"]+):"\s*,\s*([^()]+?)\)\s*\)/g,
+    (_full, key: string, expr: string) => `in(\`tags:aws\`[${key.trim()}], array(${expr.trim()}))`
+  );
+  // customProperties[REGION*] (bare) → the native aws.region field.
+  out = out.replace(/\bcustomProperties\s*\[\s*[A-Za-z_]*REGION[A-Za-z_]*\s*\]/g, 'aws.region');
+  // resource-name accessors → the native `name` field.
+  out = out.replace(/\bentityName\(\s*`?dt\.entity\.custom_device`?\s*\)/g, 'name');
+  out = out.replace(/`?dt\.entity\.custom_device`?\.name\b/g, 'name');
+
+  if (out === input) return input;
+  transforms.push({
+    kind: 'entity-dim',
+    before: 'fetch dt.entity.custom_device (metric-less list)',
+    after: 'smartscapeNodes "AWS*" + tags:aws / aws.region',
+    detail: 'custom_device topology-list idiom → smartscapeNodes "AWS*" (no metric to disambiguate a single node type)',
+  });
+  if (/dt\.entity\.custom_device/.test(out)) {
+    warnings.push({
+      kind: 'entity-relationship-traversal',
+      text: 'Converted a custom_device topology-list to smartscapeNodes "AWS*"; verify any remaining dt.entity.custom_device references by hand.',
+      reference: SKILL_REFS.specialCases,
+    });
+  }
+  return out;
+}
+
 function rewriteCustomDeviceViaService(
   input: string,
   transforms: Transform[],
