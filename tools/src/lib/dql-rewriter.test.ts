@@ -285,6 +285,25 @@ describe('rewriteDql — reviewer-feedback fixes (entity.name / tags / region)',
     assert.doesNotMatch(r.rewritten, /(?<!aws\.)\baccount\.name\b/);
   });
 
+  it('casts a smartscape ID dim in an in() filter to toString (compares vs string values)', () => {
+    const r = rewriteDql(
+      'timeseries sum(cloud.aws.sqs.number_of_empty_receives_sum), by:{ dt.entity.custom_device }, filter: in(dt.entity.custom_device, $custom_device_ids)',
+      buildIndex([])
+    );
+    // grouping dim untouched; filter dim cast
+    assert.match(r.rewritten, /by:\{ dt\.smartscape\.aws_sqs_queue \}/);
+    assert.match(r.rewritten, /filter: in\(toString\(dt\.smartscape\.aws_sqs_queue\), \$custom_device_ids\)/);
+  });
+
+  it('does NOT cast the classicEntitySelector value form (manual migration)', () => {
+    const r = rewriteDql(
+      'timeseries avg(cloud.aws.ec2.cpu.usage), by:{ dt.entity.ec2_instance }, filter: in(dt.entity.ec2_instance, classicEntitySelector("type(EC2_INSTANCE)"))',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /in\(dt\.smartscape\.aws_ec2_instance, classicEntitySelector/);
+    assert.doesNotMatch(r.rewritten, /toString/);
+  });
+
   it('dedupes a duplicate grouping dim in a by:{} clause (FIELD_SPECIFIED_TWICE)', () => {
     const r = rewriteDql(
       'timeseries {avg(x)}, by:{ dt.entity.dynamo_db_table }\n| summarize sum(y), by:{Table, dt.entity.dynamo_db_table, dt.entity.dynamo_db_table}',

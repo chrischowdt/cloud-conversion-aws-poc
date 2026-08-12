@@ -926,9 +926,11 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     }
   }
 
-  // Late cleanup: name any bare getNodeName/getNodeField fieldsAdd operand (a
-  // classic bare dim-field ref that auto-named its column), then drop duplicate
-  // columns/dims a collapse may have produced in a fields/by:{} clause.
+  // Late cleanup: cast smartscape ID dims used in `in(...)` filters to string,
+  // name any bare getNodeName/getNodeField fieldsAdd operand (a classic bare
+  // dim-field ref that auto-named its column), then drop duplicate columns/dims a
+  // collapse may have produced in a fields/by:{} clause.
+  rewritten = rewriteSmartscapeIdFilter(rewritten, transforms);
   rewritten = nameBareEntityOperands(rewritten, transforms);
   rewritten = dedupeFieldsClauses(rewritten, transforms);
   rewritten = dedupeByClauses(rewritten, transforms);
@@ -2115,6 +2117,27 @@ function nameBareEntityOperands(input: string, transforms: Transform[]): string 
     if (!changed) return full;
     transforms.push({ kind: 'entity-dim', before: 'fieldsAdd <bare entity fn>', after: 'named', detail: 'named a bare getNodeName/getNodeField fieldsAdd operand (classic auto-named the column)' });
     return `${head}${out.join(',')}`;
+  });
+}
+
+// Filtering a smartscape ID dim against string values needs an explicit cast:
+// `in(dt.smartscape.X, <values>)` → `in(toString(dt.smartscape.X), <values>)`.
+// The dim is an ID type, so comparing it to string literals / a variable list
+// silently returns nothing without toString. (Reviewer-confirmed on SQS +
+// custom_device_ids variables.) Skips the classicEntitySelector value form
+// (flagged for manual migration) and never touches `by:{…}` grouping.
+const SMARTSCAPE_IN_FILTER_RE = /\bin\(\s*(dt\.smartscape\.[a-z0-9_]+)\s*,/g;
+function rewriteSmartscapeIdFilter(input: string, transforms: Transform[]): string {
+  return input.replace(SMARTSCAPE_IN_FILTER_RE, (full, dim: string, offset: number) => {
+    const rest = input.slice(offset + full.length).trimStart();
+    if (rest.startsWith('classicEntitySelector')) return full; // manual-migration path
+    transforms.push({
+      kind: 'entity-dim',
+      before: full,
+      after: `in(toString(${dim}),`,
+      detail: 'filter on a smartscape ID dim → toString() cast (compares against string values)',
+    });
+    return `in(toString(${dim}),`;
   });
 }
 
