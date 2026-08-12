@@ -273,13 +273,16 @@ describe('rewriteDql — reviewer-feedback fixes (entity.name / tags / region)',
     assert.match(r.rewritten, /contains\(getNodeName\(dt\.smartscape\.aws_elasticloadbalancingv2_loadbalancer\), "aap"\)/);
   });
 
-  it('dangling dt.smartscape.aws_account column → account.name (credential collapse)', () => {
+  it('dangling dt.smartscape.aws_account column → the account-name column (credential collapse)', () => {
     const r = rewriteDql(
       'timeseries avg = avg(cloud.aws.lambda.invocations_sum), by:{dt.entity.custom_device = dt.source_entity}\n| fieldsAdd dt.entity.aws_credentials = entityAttr(dt.entity.custom_device, "accessible_by")[dt.entity.aws_credentials][0]\n| fieldsAdd awsAccount = lower(entityName(dt.entity.aws_credentials))\n| fields name, dt.entity.custom_device, dt.entity.aws_credentials',
       buildIndex([])
     );
-    assert.match(r.rewritten, /\| fields name, dt\.smartscape\.aws_lambda_function, account\.name/);
+    // Native-dim path (Pass 0.6): the dangling credential column resolves to the
+    // native aws.account.name dim, not a nonexistent bare account.name.
+    assert.match(r.rewritten, /\| fields name, dt\.smartscape\.aws_lambda_function, aws\.account\.name/);
     assert.doesNotMatch(r.rewritten, /dt\.smartscape\.aws_account/);
+    assert.doesNotMatch(r.rewritten, /(?<!aws\.)\baccount\.name\b/);
   });
 
   it('dedupes a duplicate grouping dim in a by:{} clause (FIELD_SPECIFIED_TWICE)', () => {
@@ -1373,32 +1376,43 @@ describe('rewriteDql — credential→account-id lookup (Pass 0.7)', () => {
 });
 
 describe('rewriteDql — credential/account fieldsAdd idiom (Pass 0.6)', () => {
-  it('rewrites the entityAttr(accessible_by)[aws_credentials] field-read to an AWS_ACCOUNT join', () => {
+  it('resolves the account name via the native aws.account.name dimension (no lookups)', () => {
     const idx = buildIndex([]);
     const input =
       'timeseries avg(cloud.aws.lambda.invocations_sum), by:{dt.entity.custom_device}\n' +
       '| fieldsAdd dt.entity.aws_credentials = entityAttr(dt.entity.custom_device, "accessible_by")[dt.entity.aws_credentials][0]\n' +
       '| fieldsAdd awsAccount = lower(entityName(dt.entity.aws_credentials))';
     const r = rewriteDql(input, idx);
-    // No traversal toward AWS_ACCOUNT (there's no such edge) — a join instead.
     assert.doesNotMatch(r.rewritten, /accessible_by/);
     assert.doesNotMatch(r.rewritten, /entityName\(/);
-    assert.match(r.rewritten, /lookup \[smartscapeNodes AWS_LAMBDA_FUNCTION \| fields name, id, aws\.account\.id\], sourceField:dt\.smartscape\.aws_lambda_function/);
-    assert.match(r.rewritten, /lookup \[smartscapeNodes AWS_ACCOUNT \| fields name, aws\.account\.id\], sourceField:device\.aws\.account\.id/);
-    assert.match(r.rewritten, /fieldsAdd awsAccount = lower\(account\.name\)/);
-    // Surfaces the credential-vs-account breadth caveat.
+    assert.doesNotMatch(r.rewritten, /lookup \[/); // native dim — no lookups
+    assert.match(r.rewritten, /by:\{dt\.smartscape\.aws_lambda_function, aws\.account\.name\}/);
+    assert.match(r.rewritten, /fieldsAdd awsAccount = lower\(aws\.account\.name\)/);
+    // Still surfaces the credential-vs-account breadth caveat.
     assert.ok(r.warnings.some((w) => /BROADER than the classic single-credential/.test(w.text)));
   });
 
-  it('preserves a non-lower account assignment', () => {
+  it('preserves a non-lower account assignment (native dim)', () => {
     const idx = buildIndex([]);
     const input =
       'timeseries avg(cloud.aws.dynamodb.x), by:{dt.entity.custom_device}\n' +
       '| fieldsAdd dt.entity.aws_credentials = entityAttr(dt.entity.custom_device, "accessible_by")[dt.entity.aws_credentials][0]\n' +
       '| fieldsAdd acct = entityName(dt.entity.aws_credentials)';
     const r = rewriteDql(input, idx);
-    assert.match(r.rewritten, /fieldsAdd acct = account\.name/);
-    assert.match(r.rewritten, /smartscapeNodes AWS_DYNAMODB_TABLE/);
+    assert.match(r.rewritten, /fieldsAdd acct = aws\.account\.name/);
+    assert.match(r.rewritten, /by:\{dt\.smartscape\.aws_dynamodb_table, aws\.account\.name\}/);
+  });
+
+  it('falls back to the AWS_ACCOUNT join when the by-clause has no resource to split on', () => {
+    const idx = buildIndex([]);
+    // by-clause groups only the source id (no custom_device) → can't inject the dim.
+    const input =
+      'timeseries avg(cloud.aws.lambda.invocations_sum), by:{dt.source_entity}\n' +
+      '| fieldsAdd dt.entity.aws_credentials = entityAttr(dt.entity.custom_device, "accessible_by")[dt.entity.aws_credentials][0]\n' +
+      '| fieldsAdd awsAccount = lower(entityName(dt.entity.aws_credentials))';
+    const r = rewriteDql(input, idx);
+    assert.match(r.rewritten, /lookup \[smartscapeNodes AWS_ACCOUNT \| fields name, aws\.account\.id\]/);
+    assert.match(r.rewritten, /fieldsAdd awsAccount = lower\(account\.name\)/);
   });
 });
 

@@ -1164,6 +1164,23 @@ function rewriteCredentialLookupChain(
 const CREDENTIAL_FIELDSADD_RE =
   /\|\s*fieldsAdd\s+dt\.entity\.aws_credentials\s*=\s*entityAttr\(\s*dt\.entity\.custom_device\s*,\s*"accessible_by"\)\s*\[\s*dt\.entity\.aws_credentials\s*\]\s*\[\s*0\s*\]\s*\r?\n\s*\|\s*fieldsAdd\s+(\w+)\s*=\s*(lower\(\s*)?entityName\(\s*dt\.entity\.aws_credentials\s*\)\s*(\))?/g;
 
+/**
+ * Add `aws.account.name` to each resource by-clause (one grouping custom_device),
+ * so the native account-name dimension is available without a lookup. Returns
+ * ok=false when there's no such by-clause to inject into (caller falls back).
+ * The native dim equals the AWS_ACCOUNT node name (tenant-verified on nic55601).
+ */
+function injectAccountNameDim(input: string): { text: string; ok: boolean } {
+  let ok = false;
+  const text = input.replace(/\bby\s*:\s*\{([^}]*)\}/g, (full, body: string) => {
+    if (!/custom_device/.test(body)) return full; // only the resource's grouping
+    ok = true;
+    if (/\baws\.account\.name\b/.test(body)) return full; // already present
+    return `by:{${body.trim()}, aws.account.name}`;
+  });
+  return { text, ok };
+}
+
 function rewriteCredentialFieldsAdd(
   input: string,
   transforms: Transform[],
@@ -1176,25 +1193,43 @@ function rewriteCredentialFieldsAdd(
   if (!service || !nodeType) return input; // unresolved → leave for generic passes
   const dim = smartscapeDimForNodeType(nodeType);
 
+  // Preferred: the native `aws.account.name` dimension (== AWS_ACCOUNT node name,
+  // tenant-verified) — split the resource's by-clause on it, no lookups. Falls
+  // back to the AWS_ACCOUNT join if the by-clause can't take the dim.
+  const inj = injectAccountNameDim(input);
   CREDENTIAL_FIELDSADD_RE.lastIndex = 0;
-  let out = input.replace(
-    CREDENTIAL_FIELDSADD_RE,
-    (_full, acctVar: string, lowerOpen: string | undefined, lowerClose: string | undefined) =>
-      `| lookup [smartscapeNodes ${nodeType} | fields name, id, aws.account.id], ` +
-      `sourceField:${dim}, lookupField:id, prefix:"device."\n` +
-      `| lookup [smartscapeNodes AWS_ACCOUNT | fields name, aws.account.id], ` +
-      `sourceField:device.aws.account.id, lookupField:aws.account.id, prefix:"account."\n` +
-      `| fieldsAdd ${acctVar} = ${lowerOpen ?? ''}account.name${lowerClose ?? ''}`
-  );
+  let out: string;
+  if (inj.ok) {
+    out = inj.text.replace(
+      CREDENTIAL_FIELDSADD_RE,
+      (_full, acctVar: string, lowerOpen: string | undefined, lowerClose: string | undefined) =>
+        `| fieldsAdd ${acctVar} = ${lowerOpen ?? ''}aws.account.name${lowerClose ?? ''}`
+    );
+    transforms.push({
+      kind: 'entity-dim',
+      before: 'fieldsAdd dt.entity.aws_credentials = entityAttr(custom_device,"accessible_by")[…] → entityName(…)',
+      after: `by:{…, aws.account.name} → ${'lower(aws.account.name)'} (native account dimension, no lookups)`,
+      detail: `credential field-read collapsed to the native aws.account.name dim; custom_device → ${nodeType} via service "${service}"`,
+    });
+  } else {
+    out = input.replace(
+      CREDENTIAL_FIELDSADD_RE,
+      (_full, acctVar: string, lowerOpen: string | undefined, lowerClose: string | undefined) =>
+        `| lookup [smartscapeNodes ${nodeType} | fields name, id, aws.account.id], ` +
+        `sourceField:${dim}, lookupField:id, prefix:"device."\n` +
+        `| lookup [smartscapeNodes AWS_ACCOUNT | fields name, aws.account.id], ` +
+        `sourceField:device.aws.account.id, lookupField:aws.account.id, prefix:"account."\n` +
+        `| fieldsAdd ${acctVar} = ${lowerOpen ?? ''}account.name${lowerClose ?? ''}`
+    );
+    transforms.push({
+      kind: 'entity-dim',
+      before: 'fieldsAdd dt.entity.aws_credentials = entityAttr(custom_device,"accessible_by")[…] → entityName(…)',
+      after: `lookup [smartscapeNodes ${nodeType} … aws.account.id] → lookup [smartscapeNodes AWS_ACCOUNT …] → account.name`,
+      detail: `credential field-read collapsed; custom_device disambiguated to ${nodeType} via metric service "${service}"`,
+    });
+  }
   // Align remaining custom_device refs (by-clause, entityAttr(…,"arn"), etc.).
   out = out.replace(/`?dt\.entity\.custom_device`?/g, dim);
-
-  transforms.push({
-    kind: 'entity-dim',
-    before: 'fieldsAdd dt.entity.aws_credentials = entityAttr(custom_device,"accessible_by")[…] → entityName(…)',
-    after: `lookup [smartscapeNodes ${nodeType} … aws.account.id] → lookup [smartscapeNodes AWS_ACCOUNT …] → account.name`,
-    detail: `credential field-read collapsed; custom_device disambiguated to ${nodeType} via metric service "${service}"`,
-  });
   warnings.push({
     kind: 'credential-collapsed',
     text:
@@ -1920,8 +1955,18 @@ function rewriteLeftoverAccountColumn(input: string, transforms: Transform[]): s
   // Skip if it's assigned somewhere (`dt.smartscape.aws_account = …`) — then it's
   // a (self-defined) column and its refs are valid; don't touch.
   if (/\bdt\.smartscape\.aws_account\s*=(?!=)/.test(input)) return input;
+  // Resolve which column holds the account name: the native `aws.account.name`
+  // dim (Pass 0.6 native path) wins; else the AWS_ACCOUNT lookup's prefixed
+  // `<p>.name`; else a bare `account.name` — but NOT `aws.account.name` as a
+  // substring (the `(?<!aws\.)` guard), which would emit a nonexistent field.
   const m = ACCOUNT_LOOKUP_NAME_RE.exec(input);
-  const acctCol = m ? `${m[1]}name` : /\baccount\.name\b/.test(input) ? 'account.name' : null;
+  const acctCol = /\baws\.account\.name\b/.test(input)
+    ? 'aws.account.name'
+    : m
+      ? `${m[1]}name`
+      : /(?<!aws\.)\baccount\.name\b/.test(input)
+        ? 'account.name'
+        : null;
   if (!acctCol) return input; // account-name column not resolvable → leave as-is
   let out = input;
   // getNodeName(dt.smartscape.aws_account) → the name column directly.
