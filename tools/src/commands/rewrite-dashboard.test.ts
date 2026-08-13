@@ -1,7 +1,43 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { commentOriginal, stripOriginalComment, stripOriginalCommentsInPlace } from './rewrite-dashboard.ts';
+import { commentOriginal, stripOriginalComment, stripOriginalCommentsInPlace, rewriteInPlace } from './rewrite-dashboard.ts';
+import type { RecipeIndex } from '../lib/recipe-lookup.ts';
+
+/** Minimal index mapping one bare classic key to a new key (mapped-no-recipe). */
+function miniIndex(): RecipeIndex {
+  const byDqlClassicKey = new Map<string, any>([
+    ['cloud.aws.lambda.duration', { classicMetricId: 'builtin:cloud.aws.lambda.duration', service: 'lambda', newDtMetricKey: 'cloud.aws.lambda.Duration.By.FunctionName' }],
+  ]);
+  return { byClassicId: new Map(), byDqlClassicKey } as unknown as RecipeIndex;
+}
+
+describe('rewriteInPlace — shadow/visualization metric-key mapping', () => {
+  it('updates the classic key across ALL shadow fields (stateful-regex regression)', () => {
+    // Two+ shadow fields must BOTH convert — the module-level BARE_METRIC_KEY_RE
+    // (`g` flag) previously left lastIndex advanced, dropping every field after
+    // the first.
+    const dash = {
+      tiles: [{
+        queryConfig: { subQueries: [{ metric: { key: 'cloud.aws.lambda.duration' } }] },
+        visualizationSettings: {
+          chartSettings: { categoricalBarChartSettings: { categoryAxisLabel: 'cloud.aws.lambda.duration', categoryAxis: ['cloud.aws.lambda.duration'] }, leftYAxisSettings: { label: 'cloud.aws.lambda.duration' } },
+          honeycomb: { displayedFields: ['cloud.aws.lambda.duration'] },
+        },
+      }],
+    };
+    rewriteInPlace(dash, miniIndex(), [], '');
+    const t = dash.tiles[0] as any;
+    const NEW = 'cloud.aws.lambda.Duration.By.FunctionName';
+    assert.equal(t.queryConfig.subQueries[0].metric.key, NEW);
+    assert.equal(t.visualizationSettings.chartSettings.categoricalBarChartSettings.categoryAxisLabel, NEW);
+    assert.equal(t.visualizationSettings.chartSettings.categoricalBarChartSettings.categoryAxis[0], NEW);
+    assert.equal(t.visualizationSettings.chartSettings.leftYAxisSettings.label, NEW);
+    assert.equal(t.visualizationSettings.honeycomb.displayedFields[0], NEW);
+  });
+});
+
+
 
 describe('commentOriginal / stripOriginalComment', () => {
   it('prepends the original as a // reference block that DQL treats as comments', () => {

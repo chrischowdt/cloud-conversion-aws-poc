@@ -122,11 +122,14 @@ export interface QueryHit {
  *
  * Returns `null` if nothing changed (caller can leave the value alone).
  */
+// The bare `cloud.aws.<svc>.<metric…>` form allows MULTIPLE lowercase metric
+// segments (`cloud.aws.dynamo.capacity_units.consumed.write`) — `(?:\.[a-z]\w*)+`.
+// The `[a-z]` first-char stops it before a new-form `.By.<PascalCase>` suffix.
 const AGG_CALL_COLUMN_RE =
-  /\b(avg|sum|max|min|count|percentile|median)\(\s*((?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+\.[a-z][\w]*)\s*\)/g;
+  /\b(avg|sum|max|min|count|percentile|median)\(\s*((?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+(?:\.[a-z][\w]*)+)\s*\)/g;
 
 const BARE_METRIC_KEY_RE =
-  /\b((?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+\.[a-z][\w]*)\b/g;
+  /\b((?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+(?:\.[a-z][\w]*)+)\b/g;
 
 const BARE_ENTITY_DIM_RE = /\bdt\.entity\.([\w:]+)\b/g;
 
@@ -153,6 +156,11 @@ function rewriteStructuredString(input: string, index: RecipeIndex): string | nu
   // 2. Bare classic metric key (e.g. in `queryConfig.subQueries[].metric.key`).
   //    Replace ONLY when the entire string is the key — partial matches would
   //    double-rewrite the agg-call form already swapped above.
+  //    Reset lastIndex BEFORE the test: the regex is module-level with the `g`
+  //    flag, so a prior field's `.exec()` leaves lastIndex advanced and an
+  //    un-reset `.test()` would start mid-string and miss (dropped conversions
+  //    on every field processed after the first — the shadow-mapping gap).
+  BARE_METRIC_KEY_RE.lastIndex = 0;
   if (BARE_METRIC_KEY_RE.test(s.trim())) {
     BARE_METRIC_KEY_RE.lastIndex = 0;
     const wholeMatch = BARE_METRIC_KEY_RE.exec(s.trim());
@@ -194,6 +202,11 @@ function rewriteStructuredString(input: string, index: RecipeIndex): string | nu
 const STRUCTURED_FIELD_KEYS = new Set([
   'key', // queryConfig.subQueries[].metric.key
   'filter', // queryConfig.subQueries[].filter
+  // Chart labels/refs that carry a metric key or agg-column ref — the renderer
+  // reads these; leaving the classic key here → "Invalid data mapping".
+  'categoryAxisLabel', // categoricalBarChartSettings.categoryAxisLabel
+  'label', // *AxisSettings.label
+  'recordField', // single-field references
 ]);
 
 /**
@@ -205,6 +218,9 @@ const STRUCTURED_ARRAY_KEYS = new Set([
   'leftAxisValues', // viz fieldMapping.leftAxisValues[]
   'hiddenLegendFields', // viz chartSettings.hiddenLegendFields[]
   'fields', // viz table.columnTypeOverrides[].fields[]
+  'displayedFields', // viz honeycomb.displayedFields[]
+  'categoryAxis', // viz categoricalBarChartSettings.categoryAxis[]
+  'hiddenColumns', // viz table.hiddenColumns[]
 ]);
 
 /**
