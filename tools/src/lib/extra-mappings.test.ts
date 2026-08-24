@@ -223,8 +223,21 @@ describe('classicSnakeCandidates', () => {
     assert.ok(c.some((x) => x.startsWith('ext:cloud.aws.apigateway.')));
   });
 
-  it('returns nothing for already-camelCase / new-form keys (no underscore)', () => {
+  it('returns nothing for new-form keys and AWS Metric Streams keys', () => {
+    // new-connection shape — already migrated, nothing to normalize
     assert.deepEqual(classicSnakeCandidates('cloud.aws.lambda.Invocations.By.FunctionName'), []);
-    assert.deepEqual(classicSnakeCandidates('ext:cloud.aws.sqs.approximateAgeOfOldestMessage'), []);
+    // Metric Streams (camel metric + By + 2+ concatenated dims) has no equivalent;
+    // normalizing would fabricate a bogus match.
+    assert.deepEqual(classicSnakeCandidates('cloud.aws.kafka.maxOffsetLagByAccountIdClusterNameRegion'), []);
+    // all-lowercase single segment carries no camelCase signal
+    assert.deepEqual(classicSnakeCandidates('cloud.aws.sqs.invocations'), []);
+  });
+
+  it('normalizes a camelCase metric segment to its snake form (EMR reviewer finding)', () => {
+    // Reviewers hit `cloud.aws.emr.mrActiveNodesSum` as unknown-metric; the maps
+    // only carry the snake shape.
+    const c = classicSnakeCandidates('cloud.aws.emr.mrActiveNodesSum');
+    assert.ok(c.includes('cloud.aws.emr.mr_active_nodes_sum'));
+    assert.ok(c.includes('cloud.aws.emr.mr_active_nodes'));
   });
 });

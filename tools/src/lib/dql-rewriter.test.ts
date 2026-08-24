@@ -382,15 +382,45 @@ describe('rewriteDql — reviewer-feedback fixes (entity.name / tags / region)',
 });
 
 describe('rewriteDql — flags constructs needing manual migration', () => {
-  it('flags classicEntitySelector', () => {
+  it('translates a complete classicEntitySelector tag filter and flags it NON-blocking', () => {
     const idx = buildIndex([cpuEntry]);
     const r = rewriteDql(
       'timeseries avg(builtin:cloud.aws.ec2.cpu.usage), filter:{ in(dt.entity.ec2_instance, classicEntitySelector("type(ec2_instance),tag(env:prod)")) }',
       idx
     );
-    const w = r.warnings.find((w) => w.kind === 'classic-entity-selector');
-    assert.ok(w);
-    assert.match(w.reference ?? '', /mass-data-filtering/);
+    // The tag predicate translated (complete) → getNodeField tags:aws clause.
+    assert.match(r.rewritten, /getNodeField\(dt\.smartscape\.aws_ec2_instance, "tags:aws"\)\[env\] == "prod"/);
+    assert.doesNotMatch(r.rewritten, /classicEntitySelector/);
+    // The "assumed aws context" advisory is emitted as a NON-blocking note, not
+    // a blocking classic-entity-selector.
+    const note = r.warnings.find((w) => w.kind === 'classic-selector-note');
+    assert.ok(note);
+    assert.match(note.reference ?? '', /mass-data-filtering/);
+    assert.ok(!r.warnings.some((w) => w.kind === 'classic-entity-selector'));
+    assert.ok(!isBlockingWarning('classic-selector-note'));
+  });
+
+  it('disambiguates a custom_device classicEntitySelector via the metric service', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries sum(cloud.aws.rds.database_connections_sum), filter:{in(dt.entity.custom_device,classicEntitySelector("type(custom_device),tag(\\"[AWS]ApplicationCI:dys\\")"))}, by:{dt.entity.custom_device}',
+      idx
+    );
+    // custom_device resolves to the RDS instance node via the cloud.aws.rds.* key.
+    assert.match(r.rewritten, /getNodeField\(dt\.smartscape\.aws_rds_dbinstance, "tags:aws"\)\[ApplicationCI\] == "dys"/);
+    assert.doesNotMatch(r.rewritten, /classicEntitySelector/);
+    // Explicit [AWS] context → no advisory note, and definitely not blocking.
+    assert.ok(!r.warnings.some((w) => w.kind === 'classic-entity-selector'));
+  });
+
+  it('keeps an INCOMPLETE classicEntitySelector (dropped predicate) blocking', () => {
+    const idx = buildIndex([cpuEntry]);
+    // entityId() has no Smartscape equivalent → dropped → filter incomplete.
+    const r = rewriteDql(
+      'timeseries avg(builtin:cloud.aws.ec2.cpu.usage), filter:{ in(dt.entity.ec2_instance, classicEntitySelector("type(ec2_instance),entityId(\\"EC2_INSTANCE-ABC\\")")) }',
+      idx
+    );
+    assert.ok(r.warnings.some((w) => w.kind === 'classic-entity-selector'));
   });
 
   it('translates entityName(x) to getNodeName(x) for an AWS entity', () => {
@@ -1499,5 +1529,45 @@ describe('isBlockingWarning classification', () => {
     for (const k of ['mapped-no-recipe','recipe-aggregation-mismatch','verdict-not-exact','dim-variant-override','custom-device-disambiguated','credential-collapsed','end-of-life-service'] as const) {
       assert.equal(isBlockingWarning(k), false, k);
     }
+  });
+});
+
+describe('reviewer-reported regressions (UA migration team)', () => {
+  it('preserves percentile() when the call carries positional parameters', () => {
+    // EZE EKS Overview / EA EKS: "converting percentile() timeseries to avg()
+    // but keeping the percentile parameters, breaking the query".
+    const idx = buildIndex([netRxEntry]); // recipe maps avg -> sum
+    const r = rewriteDql('timeseries p = percentile(builtin:cloud.aws.ec2.net.rx, 95)', idx);
+    assert.ok(r.rewritten.includes('percentile('), 'aggregation must stay percentile');
+    assert.ok(r.rewritten.includes(', 95)'), 'positional parameter must survive');
+    assert.ok(!r.rewritten.includes('avg('), 'must not swap to avg with positional args');
+  });
+
+  it('still swaps the aggregation when the trailing args are a named filter:{}', () => {
+    const idx = buildIndex([netRxEntry]);
+    const r = rewriteDql('timeseries v = avg(builtin:cloud.aws.ec2.net.rx, filter:{ x == 1 })', idx);
+    assert.ok(r.rewritten.includes('sum('), 'named filter args compose with any aggregation');
+  });
+
+  it('does not shear function arguments in a fields clause (if() keeps its result branch)', () => {
+    // EZE EKS Overview: "improperly changing an if() statement ... dropping the
+    // result if true portion, breaking the function".
+    const idx = buildIndex([]);
+    const q = 'fetch dt.entity.ec2_instance | fields a = if(x == 1, "same"), b = if(y == 2, "same")';
+    const r = rewriteDql(q, idx);
+    assert.ok(r.rewritten.includes('b = if(y == 2, "same")'), r.rewritten);
+  });
+
+  it('does not shear function arguments in a by-clause', () => {
+    const idx = buildIndex([cpuEntry]);
+    const r = rewriteDql('timeseries v=avg(builtin:cloud.aws.ec2.cpu.usage), by:{ f=coalesce(a, "x"), g=coalesce(b, "x") }', idx);
+    assert.ok(r.rewritten.includes('g=coalesce(b, "x")'), r.rewritten);
+  });
+
+  it('still dedupes genuinely duplicated bare columns', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql('fetch dt.entity.ec2_instance | fields dt.entity.ec2_instance, dt.entity.ec2_instance', idx);
+    const m = r.rewritten.match(/dt[.]smartscape[.]aws_ec2_instance/g) ?? [];
+    assert.equal(m.length, 1);
   });
 });

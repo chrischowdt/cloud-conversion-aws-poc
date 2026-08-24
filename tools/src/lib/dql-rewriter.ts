@@ -51,6 +51,7 @@ export interface Warning {
     | 'mapped-no-recipe'
     | 'composite-formula-needed'
     | 'classic-entity-selector'
+    | 'classic-selector-note'
     | 'entity-relationship-traversal'
     | 'unmapped-entity-type'
     | 'entity-name-attr'
@@ -210,7 +211,11 @@ function applyRecipe(
   // `count(metric)` semantically counts non-null occurrences, not "the
   // recipe's aggregation of metric". Preserve user intent rather than
   // silently swapping to recipe.newAggregation.
-  const preserveUserAgg = userAgg === 'count';
+  // `count` counts non-null occurrences, not "the recipe's aggregation of
+  // metric". `percentile`/`median` take their OWN positional parameters, so
+  // swapping the function while keeping those args yields invalid DQL
+  // (`avg(metric, 95)`). Preserve user intent for all three.
+  const preserveUserAgg = userAgg === 'count' || userAgg === 'percentile' || userAgg === 'median';
   const effectiveNewAgg = preserveUserAgg ? userAgg : recipe.newAggregation;
 
   // If the user's aggregation differs from recipe.classicAggregation, warn —
@@ -339,7 +344,7 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   const metricKeySwaps = new Map<string, string>();
   let rewritten = input.replace(
     CLASSIC_KEY_PATTERN,
-    (full, userAgg: string, classicKey: string, trailing: string) => {
+    (full: string, userAgg: string, classicKey: string, trailing: string, offset: number) => {
       // The bare-`cloud.aws.*` branch of the pattern can also match
       // new-connection keys; disambiguate by rejecting any key whose shape
       // is `cloud.aws.<Service>.<PascalCase>.By.<Dim>`.
@@ -534,12 +539,31 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
               `metric key — apply the per_second division and/or scale factor manually.`,
           });
         }
-        const swapOnly = `${recipe.newAggregation}(\`${newKey}\`,`;
+        // Only swap the aggregation FUNCTION when the trailing args are a named
+        // `filter:{…}` block (which composes with any aggregation). Positional
+        // args belong to the user's own function — `percentile(m, 95)` becoming
+        // `avg(m, 95)` is invalid DQL. Reviewers hit exactly this on EZE/EA EKS
+        // ("converting percentile() to avg() but keeping the percentile
+        // parameters, breaking the query").
+        const restArgs = input.slice(offset + full.length);
+        const argsAreNamedFilter = /^\s*filter\s*:/.test(restArgs);
+        const aggForArgs = argsAreNamedFilter ? recipe.newAggregation : userAgg;
+        if (!argsAreNamedFilter && recipe.newAggregation !== userAgg) {
+          warnings.push({
+            kind: 'recipe-aggregation-mismatch',
+            text:
+              `Recipe maps ${userAgg}() → ${recipe.newAggregation}() for ${classicKey}, but this call passes ` +
+              `positional arguments that belong to ${userAgg}() — the aggregation was PRESERVED to keep the ` +
+              `query valid. Verify the values against the classic side.`,
+            match: classicKey,
+          });
+        }
+        const swapOnly = `${aggForArgs}(\`${newKey}\`,`;
         transforms.push({
           kind: 'metric-key',
           before: `${userAgg}(${classicKey},`,
           after: swapOnly,
-          detail: `metric-only swap (filter args present); recipe ${recipe.classicAggregation}/${recipe.newAggregation}`,
+          detail: `metric-only swap (${argsAreNamedFilter ? 'filter args' : 'positional args — agg preserved'}); recipe ${recipe.classicAggregation}/${recipe.newAggregation}`,
         });
         return swapOnly;
       }
@@ -957,6 +981,16 @@ function rewriteClassicSelectorIns(
   transforms: Transform[],
   warnings: Warning[]
 ): string {
+  // custom_device isn't in the entity-type table (it's "not planned"), but the
+  // query's metric service disambiguates it to a real node type — the same
+  // bridge Pass 1.55 uses for `by:{}`/`fetch`. Resolve it up front so the
+  // dominant anomaly-detector shape
+  // `in(dt.entity.custom_device, classicEntitySelector("type(custom_device),tag(...)"))`
+  // translates instead of bailing on the unmapped custom_device dim.
+  const cdService = serviceFromClassicKeyInQuery(input);
+  const cdNodeType = cdService ? nodeTypeForMetricService(cdService) : undefined;
+  const customDeviceDim = cdNodeType ? smartscapeDimForNodeType(cdNodeType) : undefined;
+
   // Find all `in(` openings followed by a classic/smartscape dim ref, then
   // walk the parens to find the matching close.
   const result: string[] = [];
@@ -978,8 +1012,24 @@ function rewriteClassicSelectorIns(
     const cleanDim = dimRef.replace(/^`|`$/g, '');
     let smartscapeDim = cleanDim;
     if (cleanDim.startsWith('dt.entity.')) {
-      const mapping = classicEntityToSmartscape(cleanDim.slice('dt.entity.'.length));
-      if (!mapping || !mapping.smartscapeDimension) {
+      const entityType = cleanDim.slice('dt.entity.'.length);
+      const mapping = classicEntityToSmartscape(entityType);
+      let resolvedDim = mapping?.smartscapeDimension;
+      // custom_device has no entity-table mapping; fall back to the metric-
+      // service disambiguation resolved above.
+      if (!resolvedDim && entityType === 'custom_device' && customDeviceDim) {
+        resolvedDim = customDeviceDim;
+        if (cdService && isMultiNodeService(cdService)) {
+          warnings.push({
+            kind: 'custom-device-disambiguated',
+            text:
+              `classicEntitySelector on custom_device resolved to ${cdNodeType} via service "${cdService}", ` +
+              `but that service emits metrics under >1 node type (${MULTI_NODE_SERVICES[cdService]!.join(', ')}). ` +
+              `Verify the filter targets the intended grain.`,
+          });
+        }
+      }
+      if (!resolvedDim) {
         warnings.push({
           kind: 'unmapped-entity-type',
           text: `classicEntitySelector wraps an unmapped entity type ${cleanDim}; left unchanged.`,
@@ -989,7 +1039,7 @@ function rewriteClassicSelectorIns(
         i += fullMatch.length;
         continue;
       }
-      smartscapeDim = mapping.smartscapeDimension;
+      smartscapeDim = resolvedDim;
     }
 
     // Parse + translate.
@@ -1016,9 +1066,14 @@ function rewriteClassicSelectorIns(
       after: translation.filter,
       detail: `predicates=${ast.length}; defaulted to Check 2 (getNodeField) — verify with fieldsSnapshot.`,
     });
+    // A COMPLETE translation (every predicate produced a clause) means the
+    // filter is correct and its notes are advisory (e.g. assumed tag context) —
+    // emit them non-blocking. An INCOMPLETE one dropped a predicate, so the
+    // filter is wrong; keep those notes blocking so the asset is flagged.
+    const noteKind: Warning['kind'] = translation.complete ? 'classic-selector-note' : 'classic-entity-selector';
     for (const note of translation.notes) {
       warnings.push({
-        kind: 'classic-entity-selector',
+        kind: noteKind,
         text: note,
         reference: 'dt-migration/references/mass-data-filtering-strategy.md',
       });
@@ -2095,7 +2150,7 @@ function rewriteAwsTagFilters(input: string, transforms: Transform[]): string {
 // bare column tokens within each fields/fieldsKeep clause, keeping first order.
 function dedupeFieldsClauses(input: string, transforms: Transform[]): string {
   return input.replace(/(\|\s*fields(?:Keep)?\s+)([^|]+)/g, (full, head: string, body: string) => {
-    const parts = body.split(',').map((p) => p.trim());
+    const parts = splitTopLevel(body).map((p) => p.trim());
     const seen = new Set<string>();
     const kept: string[] = [];
     let dropped = 0;
@@ -2121,18 +2176,31 @@ function dedupeFieldsClauses(input: string, transforms: Transform[]): string {
   });
 }
 
-/** Split on top-level commas only (ignore commas nested in ()/[]/{}). */
+/**
+ * Split on top-level commas only — commas nested inside ()/[]/{} OR inside a
+ * string/backtick literal belong to a call or literal, not the column list.
+ * A naive split shears function arguments apart: a repeated argument (two
+ * tiles' `if(cond, "same")`) then looks like a duplicate column and gets
+ * dropped, truncating the call. Reviewers hit exactly this — an if() losing
+ * its "result if true" portion (EZE EKS Overview).
+ */
 function splitTopLevel(s: string): string[] {
   const out: string[] = [];
   let depth = 0;
+  let quote: string | null = null;
   let cur = '';
-  for (const ch of s) {
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!;
+    if (quote) {
+      cur += ch;
+      if (ch === quote && s[i - 1] !== '\\') quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; cur += ch; continue; }
     if (ch === '(' || ch === '[' || ch === '{') depth++;
     else if (ch === ')' || ch === ']' || ch === '}') depth--;
-    if (ch === ',' && depth === 0) {
-      out.push(cur);
-      cur = '';
-    } else cur += ch;
+    if (ch === ',' && depth === 0) { out.push(cur); cur = ''; continue; }
+    cur += ch;
   }
   if (cur.trim()) out.push(cur);
   return out;
@@ -2199,7 +2267,7 @@ function rewriteSmartscapeIdFilter(input: string, transforms: Transform[]): stri
 // simple dims per by-clause. Skips assignment/expr items (`X = …`, calls).
 function dedupeByClauses(input: string, transforms: Transform[]): string {
   return input.replace(/\bby\s*:\s*\{([^}]*)\}/g, (full, body: string) => {
-    const parts = body.split(',').map((p) => p.trim()).filter((p) => p.length > 0);
+    const parts = splitTopLevel(body).map((p) => p.trim()).filter((p) => p.length > 0);
     const seen = new Set<string>();
     const kept: string[] = [];
     let dropped = 0;

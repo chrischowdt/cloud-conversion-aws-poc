@@ -267,8 +267,19 @@ export function classicSnakeCandidates(key: string): string[] {
   const m = /^(?:ext:|builtin:|dt\.)?(cloud\.aws\.)([a-z0-9_]+)\.(.+)$/i.exec(key);
   if (!m) return [];
   const svc = m[2]!.toLowerCase();
-  const seg = m[3]!.toLowerCase();
-  if (!seg.includes('_')) return []; // camelCase/new shapes are handled elsewhere
+  const rawSeg = m[3]!;
+  let seg = rawSeg.toLowerCase();
+  if (!seg.includes('_')) {
+    // camelCase single-segment metric (`mrActiveNodesSum`). Classic dashboards
+    // write both this and the snake form; the maps only carry snake. Derive it
+    // and fall through to the normal candidate generation.
+    if (rawSeg.includes('.')) return [];                                    // new-form `X.By.Dim`
+    if (!/[A-Z]/.test(rawSeg)) return [];                                   // not camelCase
+    if (/^[a-z][a-zA-Z0-9]*By[A-Z][a-z0-9]*[A-Z]/.test(rawSeg)) return [];  // AWS Metric Streams — no equivalent
+    const snake = rawSeg.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+    if (!snake.includes('_')) return [];
+    seg = snake;
+  }
   const STAT = /_(sum|average|avg|maximum|max|minimum|min|samplecount)(?=_by_|$)/;
   const noStat = seg.replace(STAT, '');
   const noDim = noStat.replace(/_by_.*$/, '');
