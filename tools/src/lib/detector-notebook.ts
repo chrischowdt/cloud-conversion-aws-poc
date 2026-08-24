@@ -213,12 +213,21 @@ function batchHeader(label: string, items: DetectorReviewItem[]): MarkdownSectio
     `${items.length} anomaly detector(s): ` +
       `${counts.clean ?? 0} 🟢 clean · ${counts.soft ?? 0} 🟡 review · ${counts.blocked ?? 0} 🔴 blocked.`,
     '',
-    'For each detector below: the markdown tile summarizes the automated changes; ' +
-      'the DQL tile has the **translated query** (runnable). **Run it, confirm it returns the expected series, ' +
-      'fix the DQL if needed, and save.** The migration script reads your edited query back and applies it ' +
-      'in place to the live detector — nothing here alerts.',
+    'Each detector below has **three tiles**:',
     '',
-    '> Keep the `// [CCT-DETECTOR …]` and `// [CCT-ORIGINAL] …` marker lines — they anchor the read-back.',
+    '1. **Summary** — what the conversion changed (node type, threshold, alert binding) and what to verify.',
+    '2. **Query** — the translated DQL, runnable. **Run it, confirm it returns the expected series, ' +
+      'and fix the DQL if it does not.**',
+    '3. **Conversion status** — set the status and add any notes. This is what the migration ' +
+      'script reads to decide what gets published.',
+    '',
+    'The script reads your edited query and your status back, then applies the query in place to the ' +
+      'live detector. Nothing in this notebook alerts, so you can run everything freely.',
+    '',
+    `> Statuses: ${REVIEW_STATUSES.filter((s) => s !== 'Not Reviewed').map((s) => `**${s}**`).join(' · ')}. ` +
+      'Anything left at *Not Reviewed* is skipped.',
+    '',
+    '> Keep the `// [CCT-DETECTOR …]`, `// [CCT-ORIGINAL] …` and `CCT-REVIEW …` markers — they anchor the read-back.',
   ].join('\n');
   return { id: `hdr-${slug(label)}`, type: 'markdown', markdown: md };
 }
@@ -233,6 +242,8 @@ export function buildDetectorNotebook(label: string, items: DetectorReviewItem[]
   for (const it of items) {
     sections.push({ id: `md-${it.objectId}`, type: 'markdown', markdown: buildDetectorMarkdown(it) });
     sections.push(dqlSection(it.objectId, buildReviewQuery(it.objectId, it.rewritten, it.original)));
+    // The reviewer's verdict goes AFTER the query — read it, run it, then mark it.
+    sections.push({ id: reviewCardId(it.objectId), type: 'markdown', markdown: buildReviewCard(it) });
   }
   return {
     version: '7',
@@ -246,5 +257,127 @@ export function buildDetectorNotebook(label: string, items: DetectorReviewItem[]
 export function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+// ─── reviewer verdict card ────────────────────────────────────────────────
+//
+// One markdown tile per detector where the reviewer records the outcome. It has
+// to be BOTH pleasant to edit by hand and reliably machine-readable, because
+// `migrate-promote-detectors` only cuts over what a human actually approved.
+// So: a fixed `**Status:**` line the reviewer overwrites with one word, and a
+// free-text notes block. The objectId is carried in the tile id AND in the text,
+// so read-back still works if a tile gets copied or its id changes.
+
+/** Vocabulary for the per-query verdict. `Not Reviewed` is the starting value. */
+export const REVIEW_STATUSES = [
+  'Not Reviewed',
+  'Converted OK',
+  'Needs Fix',
+  'Blocked',
+  'Descope',
+] as const;
+export type ReviewStatus = (typeof REVIEW_STATUSES)[number];
+
+/**
+ * How a per-query verdict rolls up to the shared tracker's `decision` column
+ * (see lib/tracker-xlsx.ts DECISION_STATES), so the two vocabularies stay
+ * reconcilable when we write detector outcomes back.
+ */
+export const STATUS_TO_DECISION: Record<ReviewStatus, string> = {
+  'Not Reviewed': 'Needs Review',
+  'Converted OK': 'Ready To Publish',
+  'Needs Fix': 'In Progress',
+  Blocked: 'Needs Review',
+  Descope: 'Descope',
+};
+
+const STATUS_MARK = '**Status:**';
+const NOTES_MARK = '**Notes:**';
+const REVIEW_TAG = 'CCT-REVIEW objectId=';
+
+export function reviewCardId(objectId: string): string {
+  return `review-${objectId}`;
+}
+
+/** The editable verdict tile for one detector. */
+export function buildReviewCard(item: DetectorReviewItem): string {
+  return [
+    `#### ✍️ Conversion status — ${item.title}`,
+    '',
+    `\`${REVIEW_TAG}${item.objectId}\``,
+    '',
+    `${STATUS_MARK} Not Reviewed`,
+    '',
+    `> Replace the word above with one of: ${REVIEW_STATUSES.filter((s) => s !== 'Not Reviewed')
+      .map((s) => `**${s}**`)
+      .join(' · ')}`,
+    '',
+    NOTES_MARK,
+    '',
+    '_(optional — replace this line with anything the migration team should know:',
+    'what you changed, what still looks wrong, which tiles you spot-checked.)_',
+  ].join('\n');
+}
+
+export interface ParsedReviewCard {
+  objectId?: string;
+  status: ReviewStatus | string;
+  notes: string;
+  /** True when the reviewer left the card at its default, untouched state. */
+  untouched: boolean;
+}
+
+/**
+ * Read a verdict tile back. Tolerant by design: reviewers will bold things,
+ * change case, or add trailing punctuation, and none of that should lose their
+ * answer. An unrecognized status is returned verbatim rather than coerced, so a
+ * typo surfaces as itself instead of silently becoming an approval.
+ */
+export function parseReviewCard(markdown: string): ParsedReviewCard {
+  const idM = new RegExp(REVIEW_TAG + '([^\s`]+)').exec(markdown);
+  const lines = markdown.split('\n');
+
+  let status = '';
+  const statusIdx = lines.findIndex((l) => l.includes(STATUS_MARK));
+  if (statusIdx >= 0) {
+    status = lines[statusIdx]!.slice(lines[statusIdx]!.indexOf(STATUS_MARK) + STATUS_MARK.length)
+      .replace(/[*_`]/g, '')
+      .trim()
+      .replace(/[.,;]+$/, '');
+  }
+  const canonical = REVIEW_STATUSES.find((s) => s.toLowerCase() === status.toLowerCase());
+
+  let notes = '';
+  const notesIdx = lines.findIndex((l) => l.includes(NOTES_MARK));
+  if (notesIdx >= 0) {
+    notes = lines
+      .slice(notesIdx + 1)
+      // Drop the italic placeholder and the status hint blockquote.
+      .filter((l) => !/^\s*>/.test(l) && !/^\s*_\(optional/.test(l) && !/^what you changed/.test(l))
+      .join('\n')
+      .trim();
+    if (/^_\(.*\)_$/s.test(notes)) notes = '';
+  }
+
+  const resolved = canonical ?? status;
+  return {
+    objectId: idM?.[1],
+    status: resolved || 'Not Reviewed',
+    notes,
+    untouched: (!resolved || resolved === 'Not Reviewed') && notes === '',
+  };
+}
+
+/** Collect every reviewer verdict from a notebook's sections. */
+export function collectReviewCards(content: unknown): ParsedReviewCard[] {
+  const sections = ((content as { sections?: NotebookSection[] })?.sections ?? []) as NotebookSection[];
+  const out: ParsedReviewCard[] = [];
+  for (const s of sections) {
+    if (s.type !== 'markdown' || !s.markdown.includes(REVIEW_TAG)) continue;
+    const parsed = parseReviewCard(s.markdown);
+    if (!parsed.objectId && s.id?.startsWith('review-')) parsed.objectId = s.id.slice('review-'.length);
+    out.push(parsed);
+  }
   return out;
 }
