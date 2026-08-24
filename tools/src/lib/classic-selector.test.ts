@@ -279,3 +279,29 @@ describe('translateSelector — DQL emission', () => {
     );
   });
 });
+
+describe('parseSelector — malformed input must terminate (no hang)', () => {
+  it('does not spin forever on a nested paren inside a value list', () => {
+    // Regression: parseValueList stopped its bare-token scan on ')' but never
+    // consumed it, so the index stalled and the loop appended '' until the array
+    // exceeded its max length — surfacing as "RangeError: Invalid array length"
+    // after ~8s of spinning. Found while scanning the UA dashboard corpus.
+    const started = Date.now();
+    const r = parseSelector('entityName.in(type(HOST))');
+    assert.ok(Date.now() - started < 1000, 'must terminate promptly');
+    assert.ok(r.length >= 1);
+  });
+
+  it('terminates on an unbalanced trailing paren mid-list', () => {
+    const started = Date.now();
+    const r = parseSelector('type(HOST),entityName.in(a(b))');
+    assert.ok(Date.now() - started < 1000, 'must terminate promptly');
+    assert.equal(r.length, 2);
+  });
+
+  it('still parses a normal quoted value list unchanged', () => {
+    const r = parseSelector('entityName.in("a","b")');
+    const p = r.find((x) => x.kind === 'entityName') as any;
+    assert.deepEqual(p.values, ['a', 'b']);
+  });
+});

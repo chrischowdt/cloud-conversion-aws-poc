@@ -213,6 +213,12 @@ function parseValueList(args: string): string[] {
   const out: string[] = [];
   let i = 0;
   while (i < args.length) {
+    // Every branch below must consume at least one character. If one ever
+    // doesn't, the index stalls and this loop appends forever until the array
+    // blows past its max length ("RangeError: Invalid array length") — a hang,
+    // not a parse error. The `)` case below was exactly that; this guard makes
+    // any future non-advancing branch degrade to a truncated parse instead.
+    const loopStart = i;
     while (i < args.length && /\s/.test(args[i]!)) i++;
     if (i >= args.length) break;
     if (args[i] === '"') {
@@ -235,10 +241,17 @@ function parseValueList(args: string): string[] {
       // Bare token (e.g. type(HOST))
       const start = i;
       while (i < args.length && args[i] !== ',' && args[i] !== ')') i++;
-      out.push(args.slice(start, i).trim());
+      const token = args.slice(start, i).trim();
+      if (token.length > 0) out.push(token);
+      // A ')' sitting inside the value list is an unbalanced or nested paren
+      // (e.g. `entityName.in(type(HOST))`). The scan above stops on it but
+      // never consumes it, and the comma check below won't either — so treat it
+      // as the end of the list rather than stalling.
+      if (i < args.length && args[i] === ')') break;
     }
     while (i < args.length && /\s/.test(args[i]!)) i++;
     if (args[i] === ',') i++;
+    if (i === loopStart) break; // defensive: no branch consumed anything
   }
   return out;
 }
