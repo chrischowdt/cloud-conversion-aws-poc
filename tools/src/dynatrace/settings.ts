@@ -117,6 +117,8 @@ export class SettingsClient {
     schemaId: string;
     pageSize?: number;
     fields?: string;
+    /** Server-side filter, e.g. `value.name contains 'PSS SEATS'`. Avoids paging a whole schema. */
+    filter?: string;
     onPage?: (received: number, total: number | undefined) => void;
   }): Promise<SettingsObject[]> {
     const all: SettingsObject[] = [];
@@ -130,6 +132,7 @@ export class SettingsClient {
             schemaIds: opts.schemaId,
             pageSize: String(opts.pageSize ?? 500),
             fields: opts.fields ?? 'objectId,schemaId,summary,value',
+            filter: opts.filter,
           };
       const parsed = JSON.parse(await this.request(params)) as SettingsListResponse;
       if (parsed.items) all.push(...parsed.items);

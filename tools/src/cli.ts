@@ -41,6 +41,9 @@ import { runMigratePull } from './commands/migrate-pull.ts';
 import { runMigratePromote } from './commands/migrate-promote.ts';
 import { runMigrateVerify } from './commands/migrate-verify.ts';
 import { runMigrateRollback } from './commands/migrate-rollback.ts';
+import { runStageDetectors } from './commands/stage-detectors.ts';
+import { runDiscoverManagementZones } from './commands/discover-management-zones.ts';
+import type { ReviewBucket } from './lib/detector-notebook.ts';
 import { SHARED_OUT_DIR, tenantOutDir } from './lib/paths.ts';
 import type { CloudProvider } from './lib/types.ts';
 
@@ -178,6 +181,24 @@ COMMANDS
                     group; falls back to environment-wide if neither is set.
                     Flags: --apply, --restage, --share-group <id>, --ids <a,b>,
                     --limit, --tracker.
+  discover-management-zones
+                    Read classic management zones and reduce each to the AWS tag
+                    predicates defining it, so mzName(...) in a classicEntitySelector
+                    converts to a native enriched-tag dimension filter
+                    (aws.tags.<key>). Writes <tenant>/management-zones.json; every
+                    command picks it up automatically. Zones with no consistent AWS
+                    tag rules are left untranslated. Flags: --name-contains <s>,
+                    --page-size <n>.
+  stage-detectors   Alert lane: generate REVIEW NOTEBOOKS for AWS Davis anomaly
+                    detectors (never a second armed detector — a notebook is
+                    inert, zero double-alert risk). Rewrites each detector and
+                    lays the translated queries into notebooks (batches of N),
+                    one markdown + one DQL tile each, for query-only review.
+                    Default PREPARE writes notebook payloads + a manifest under
+                    migration/detector-review/; --apply creates the notebooks and
+                    shares them. Flags: --apply, --share-group <id> (or env
+                    DT_SHARE_GROUP_ID), --batch-size <n> (default 10), --buckets
+                    <clean,soft> (default), --ids <a,b>, --limit, --input-file.
   migrate-pull      Fetch the human-fixed review copies (Document API) into
                     migration/reviewed/ and mark rows in-review. Needs the admin
                     token. Flags: --ids, --limit, --tracker.
@@ -598,6 +619,41 @@ async function main(): Promise<void> {
         apply: args.flags.get('apply') === true,
         restage: args.flags.get('restage') === true,
         shareGroupId: getString(args.flags, 'share-group') ?? process.env.DT_SHARE_GROUP_ID,
+        mappingPath: getString(args.flags, 'mapping'),
+        liveMetricsPath: getString(args.flags, 'live-metrics'),
+        minOverrideSeries: getNumber(args.flags, 'min-override-series'),
+      });
+      return;
+    }
+    case 'discover-management-zones': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDiscoverManagementZones({
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
+        nameContains: getString(args.flags, 'name-contains'),
+        pageSize: getNumber(args.flags, 'page-size'),
+      });
+      return;
+    }
+    case 'stage-detectors': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      const idsFlag = getString(args.flags, 'ids');
+      const bucketsFlag = getString(args.flags, 'buckets');
+      await runStageDetectors({
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
+        inputFile: getString(args.flags, 'input-file'),
+        apply: args.flags.get('apply') === true,
+        noShare: args.flags.get('no-share') === true,
+        shareGroupId: getString(args.flags, 'share-group') ?? process.env.DT_SHARE_GROUP_ID,
+        batchSize: getNumber(args.flags, 'batch-size'),
+        buckets: bucketsFlag
+          ? (bucketsFlag.split(',').map((s) => s.trim()).filter(Boolean) as ReviewBucket[])
+          : undefined,
+        ids: idsFlag ? idsFlag.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+        limit: getNumber(args.flags, 'limit'),
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),

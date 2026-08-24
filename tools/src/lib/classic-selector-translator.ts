@@ -23,6 +23,7 @@
 
 import type { Predicate, StringOp } from './classic-selector-parser.ts';
 import { classicEntityToSmartscape, lookupBySmartscapeDim } from './entity-mappings.ts';
+import { mzFilterExpression, type MzTagIndex } from './mz-tags.ts';
 import { findEdgesBetween } from './smartscape-edges.ts';
 
 /**
@@ -72,6 +73,14 @@ export interface TranslationResult {
   filter: string;
   /** Notes for the human reviewer (untranslated predicates, ambiguities, etc.). */
   notes: string[];
+  /**
+   * True when every predicate either produced a clause or is implicit (a bare
+   * `type(...)`). A false value means a real predicate was DROPPED, so the
+   * emitted `filter` is incomplete and would return wrong results — callers
+   * should treat that as blocking. When complete, the notes are purely
+   * advisory (e.g. "assumed tag context aws") and must NOT block.
+   */
+  complete: boolean;
 }
 
 /**
@@ -91,16 +100,20 @@ export function translateSelector(
 ): TranslationResult {
   const clauses: string[] = [];
   const notes: string[] = [];
+  let complete = true;
 
   for (const p of predicates) {
     const t = translatePredicate(p, smartscapeDim, hints);
     if (t.clause) clauses.push(t.clause);
+    // A non-`type` predicate that produced no clause was dropped → incomplete.
+    else if (p.kind !== 'type') complete = false;
     if (t.note) notes.push(t.note);
   }
 
   return {
     filter: clauses.join(' and '),
     notes,
+    complete,
   };
 }
 
@@ -108,6 +121,13 @@ export interface TranslationHints {
   /** Default tag context when classicEntitySelector tag has no `[Context]` prefix.
    *  For AWS resources, "aws" is a sensible default. */
   defaultTagContext?: string;
+  /**
+   * Management zone -> the AWS tag predicates that define its AWS slice
+   * (`discover-management-zones` -> `management-zones.json`). When a zone is
+   * present here, `mzName(...)` becomes a native enriched-tag dimension filter
+   * instead of an untranslatable note. Absent zones stay untranslated.
+   */
+  mzTags?: MzTagIndex;
 }
 
 interface PredicateTranslation {
@@ -147,11 +167,7 @@ function translatePredicate(
       return translateTag(p, dim, hints);
 
     case 'mz':
-      return {
-        note:
-          `${p.field}(${p.values.join(',')}) — management zones are not migratable to Smartscape. ` +
-          `Rewrite using the underlying entity conditions directly. See dt-migration/references/mass-data-filtering-strategy.md.`,
-      };
+      return translateManagementZone(p, hints);
 
     case 'healthState': {
       // Skill maps healthState → availability.state (smartscape node attr)
@@ -258,6 +274,53 @@ function translateAttribute(
   }
   const fieldRef = `getNodeField(${dim}, ${jsonString(field)})`;
   return { clause: stringOpToClause(fieldRef, p.op, values) };
+}
+
+/**
+ * `mzName("…")` / `managementZone("…")` → a native enriched-tag dimension
+ * filter, when we know the zone's AWS tag definition.
+ *
+ * Management zones don't exist in Smartscape, so historically this predicate was
+ * dropped and the whole panel blocked. But the AWS slice of a zone is just a set
+ * of tag rules, and the new integration enriches those same tags onto the metric
+ * (`aws.tags.<key>`) — so the zone reduces to a plain dimension filter needing no
+ * entity lookup. Only zones present in the discovered index are translated; an
+ * unknown zone still returns a note so the asset keeps blocking rather than
+ * silently changing an alert's scope.
+ */
+function translateManagementZone(
+  p: Predicate & { kind: 'mz' },
+  hints: TranslationHints
+): PredicateTranslation {
+  const names = p.values ?? [];
+  const idx = hints.mzTags;
+  if (idx && names.length > 0) {
+    const parts: string[] = [];
+    const unresolved: string[] = [];
+    for (const n of names) {
+      const preds = idx.get(n);
+      if (preds && preds.length) parts.push(mzFilterExpression(preds));
+      else unresolved.push(n);
+    }
+    if (parts.length > 0 && unresolved.length === 0) {
+      // Multiple zones in one predicate are a union.
+      const clause = parts.length === 1 ? parts[0]! : '(' + parts.map((c) => `(${c})`).join(' or ') + ')';
+      return {
+        clause,
+        note:
+          `Management zone ${names.map((n) => `"${n}"`).join(', ')} was rewritten as an enriched-tag ` +
+          `dimension filter (${clause}). Zones have no Smartscape equivalent; this reproduces the zone's ` +
+          `AWS membership rules only — verify the scope matches, especially if the zone also selected ` +
+          `non-AWS entities or if some resources are missing the tag.`,
+      };
+    }
+  }
+  return {
+    note:
+      `${p.field}(${names.join(',')}) — management zones are not migratable to Smartscape, and this zone's ` +
+      `AWS tag definition isn't available (run \`cct discover-management-zones\`). ` +
+      `Rewrite using the underlying entity conditions directly. See dt-migration/references/mass-data-filtering-strategy.md.`,
+  };
 }
 
 function translateTag(
@@ -500,12 +563,14 @@ function translateForSmartscapeNode(
 ): TranslationResult {
   const clauses: string[] = [];
   const notes: string[] = [];
+  let complete = true;
   for (const p of predicates) {
     const t = translatePredicateForNode(p, hints);
     if (t.clause) clauses.push(t.clause);
+    else if (p.kind !== 'type') complete = false;
     if (t.note) notes.push(t.note);
   }
-  return { filter: clauses.join(' and '), notes };
+  return { filter: clauses.join(' and '), notes, complete };
 }
 
 function translatePredicateForNode(

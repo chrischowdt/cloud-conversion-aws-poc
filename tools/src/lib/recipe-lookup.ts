@@ -27,6 +27,7 @@ import {
 } from './live-metrics.ts';
 import { builtinToDqlClassic } from './schema-transforms.ts';
 import { correctServiceNamespace } from './service-namespace-corrections.ts';
+import { buildMzIndex, type MzTagIndex } from './mz-tags.ts';
 
 export type Aggregation = 'avg' | 'sum' | 'max' | 'min' | 'count';
 export type NewAggMode = 'raw' | 'per_second';
@@ -126,6 +127,13 @@ export interface RecipeIndex {
    * populated variant when the inventory is incomplete.
    */
   minOverrideSeries?: number;
+  /**
+   * Management zone → the AWS tag predicates that define it
+   * (`discover-management-zones`). Lets the selector translator rewrite
+   * `mzName(...)` as a native enriched-tag dimension filter instead of dropping
+   * the predicate and blocking the panel.
+   */
+  mzTags?: MzTagIndex;
 }
 
 export async function loadRecipeIndex(
@@ -136,6 +144,7 @@ export async function loadRecipeIndex(
     perKeyPath?: string;
     liveMetricsPath?: string;
     minOverrideSeries?: number;
+    mzTagsPath?: string;
   } = {}
 ): Promise<RecipeIndex> {
   const file = JSON.parse(await readFile(path, 'utf8')) as MergedMappingFile;
@@ -165,6 +174,14 @@ export async function loadRecipeIndex(
   if (options.liveMetricsPath) {
     result.liveMetrics = await loadLiveMetrics(options.liveMetricsPath);
     result.minOverrideSeries = options.minOverrideSeries ?? DEFAULT_MIN_OVERRIDE_SERIES;
+  }
+  if (options.mzTagsPath) {
+    try {
+      result.mzTags = buildMzIndex(JSON.parse(await readFile(options.mzTagsPath, 'utf8')));
+    } catch {
+      // Absent or malformed → mzName() simply stays untranslated, which is the
+      // safe default (the panel keeps blocking rather than changing scope).
+    }
   }
   return result;
 }

@@ -23,6 +23,7 @@ import {
   smartscapeDimForNodeType,
 } from './aws-service-node-types.ts';
 import { parseSelector } from './classic-selector-parser.ts';
+import type { MzTagIndex } from './mz-tags.ts';
 import { translateSelector } from './classic-selector-translator.ts';
 import { lookupInDac, cloudwatchStatisticForNewKey, isAdditiveSumMetric } from './dac-lookup.ts';
 import { ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE } from './entity-field-mappings.ts';
@@ -630,7 +631,7 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // can use the original classic dim to determine which smartscape dim
   // applies. Both forms are matched: pre-pass-2 (with `dt.entity.X`) and the
   // already-renamed form (`dt.smartscape.X`).
-  rewritten = rewriteClassicSelectorIns(rewritten, transforms, warnings);
+  rewritten = rewriteClassicSelectorIns(rewritten, transforms, warnings, index.mzTags);
 
   // Pass 1.55: disambiguate classic `dt.entity.custom_device` to a real
   // Smartscape node type. Custom_device is "not planned" in Smartscape, but in
@@ -990,7 +991,8 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
 function rewriteClassicSelectorIns(
   input: string,
   transforms: Transform[],
-  warnings: Warning[]
+  warnings: Warning[],
+  mzTags?: MzTagIndex
 ): string {
   // custom_device isn't in the entity-type table (it's "not planned"), but the
   // query's metric service disambiguates it to a real node type — the same
@@ -1022,6 +1024,34 @@ function rewriteClassicSelectorIns(
     // up the mapping; if they already wrote dt.smartscape.X, use as-is.
     const cleanDim = dimRef.replace(/^`|`$/g, '');
     let smartscapeDim = cleanDim;
+
+    // DIM-INDEPENDENT SHORT-CIRCUIT. Some predicates translate to filters on the
+    // METRIC's own dimensions rather than on the entity — notably `mzName(...)`,
+    // which becomes an enriched-tag filter (`aws.tags.<key>`). When a selector
+    // reduces ENTIRELY to those, the outer `in(<dim>, …)` wrapper is irrelevant:
+    // the filter selects the right series no matter which entity dim it was
+    // hung off. That matters because the grouping dims these selectors use
+    // (`custom_device_group`) have no Smartscape node at all, so the dim-based
+    // path below would bail and block an otherwise perfectly convertible query.
+    const dimFreeAst = safeParseSelector(selectorStr);
+    if (dimFreeAst) {
+      const t = translateSelector(dimFreeAst, cleanDim, { defaultTagContext: 'aws', mzTags });
+      if (t.filter && t.complete && !t.filter.includes('getNodeField(')) {
+        transforms.push({
+          kind: 'classic-selector',
+          before: fullMatch,
+          after: t.filter,
+          detail: 'selector reduced to native metric-dimension filters — outer entity dim not needed',
+        });
+        for (const note of t.notes) {
+          warnings.push({ kind: 'classic-selector-note', text: note, reference: SKILL_REFS.massData });
+        }
+        result.push(t.filter);
+        i += fullMatch.length;
+        continue;
+      }
+    }
+
     if (cleanDim.startsWith('dt.entity.')) {
       const entityType = cleanDim.slice('dt.entity.'.length);
       // AWS-only scope. `dt.entity.service` / `host` / k8s / Azure are APM or
@@ -1068,7 +1098,7 @@ function rewriteClassicSelectorIns(
 
     // Parse + translate.
     const ast = parseSelector(unescapeDqlString(selectorStr));
-    const translation = translateSelector(ast, smartscapeDim, { defaultTagContext: 'aws' });
+    const translation = translateSelector(ast, smartscapeDim, { defaultTagContext: 'aws', mzTags });
 
     if (!translation.filter) {
       warnings.push({
@@ -2343,4 +2373,16 @@ function dedupeByClauses(input: string, transforms: Transform[]): string {
     });
     return `by:{${kept.join(', ')}}`;
   });
+}
+
+/**
+ * parseSelector, but never throws. Malformed selectors exist in real dashboards
+ * and a parse failure must degrade to "leave it classic", not abort the rewrite.
+ */
+function safeParseSelector(selectorStr: string): ReturnType<typeof parseSelector> | null {
+  try {
+    return parseSelector(unescapeDqlString(selectorStr));
+  } catch {
+    return null;
+  }
 }
