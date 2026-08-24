@@ -948,10 +948,21 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     },
   ];
 
+  // A classicEntitySelector we DELIBERATELY left classic because its subject is
+  // a non-AWS entity is out of scope, not a blocker — Pass 1.5 already recorded
+  // a non-blocking `non-aws-entity` note for it. Flagging it here too would mark
+  // an AWS dashboard blocked for a tile the AWS migration never owned.
+  const outOfScopeSelector = (text: string, idx: number): boolean => {
+    const before = text.slice(Math.max(0, idx - 120), idx);
+    const m = new RegExp('\\bin\\(\\s*`?dt\\.entity\\.([\\w:]+)`?\\s*,\\s*$').exec(before);
+    return !!m && entityScope(m[1]!) !== 'aws';
+  };
+
   for (const fp of flagPatterns) {
     fp.re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = fp.re.exec(rewritten)) !== null) {
+      if (fp.kind === 'classic-entity-selector' && outOfScopeSelector(rewritten, m.index)) continue;
       warnings.push({ kind: fp.kind, text: fp.text, reference: fp.reference, match: m[0] });
     }
   }
@@ -1013,6 +1024,19 @@ function rewriteClassicSelectorIns(
     let smartscapeDim = cleanDim;
     if (cleanDim.startsWith('dt.entity.')) {
       const entityType = cleanDim.slice('dt.entity.'.length);
+      // AWS-only scope. `dt.entity.service` / `host` / k8s / Azure are APM or
+      // general-migration entities: converting their classicEntitySelector
+      // filter produces a Smartscape query the tile never asked for and breaks
+      // it. Reviewers repeatedly reverted these ("many non-AWS tiles converted
+      // that needed to be reverted" — CUX Metrics, EA EKS, EDJ-Partner
+      // Management). Leave them classic with a non-blocking note, exactly as
+      // Pass 2's dim sweep already does.
+      if (entityScope(entityType) === 'non-aws') {
+        noteNonAwsEntity(warnings, entityType);
+        result.push(fullMatch);
+        i += fullMatch.length;
+        continue;
+      }
       const mapping = classicEntityToSmartscape(entityType);
       let resolvedDim = mapping?.smartscapeDimension;
       // custom_device has no entity-table mapping; fall back to the metric-
@@ -1797,10 +1821,20 @@ function rewriteRelationshipBrackets(
 
 // ─── Pass 2.5: entityName / entityAttr → getNodeName / getNodeField ───────
 
-/** The x in entityName(x)/entityAttr(x,…) references a non-AWS classic entity. */
+/**
+ * True when the operand still names a classic `dt.entity.<type>` that is NOT an
+ * in-scope AWS entity. By the time the entityName/entityAttr pass runs, Pass 2
+ * has already rewritten every in-scope AWS entity to `dt.smartscape.<type>` —
+ * so anything still written `dt.entity.…` is either an explicitly non-AWS
+ * entity (APM/K8s/Azure) or an extension/custom type with no Smartscape node at
+ * all (`ibmmq:local_queue`, `custom:solace_node`, `storage:dell_powermax`,
+ * `sql:postgres_host`). Converting those to getNodeName/getNodeField produces a
+ * query against a node type that does not exist. Reviewers reverted exactly
+ * these ("conversion broke many non-aws queries" — EDJ-Partner Management).
+ */
 function argRefsNonAwsEntity(arg: string): boolean {
-  const m = /dt\.entity\.([\w:]+)/.exec(arg);
-  return !!m && entityScope(m[1]!) === 'non-aws';
+  const m = new RegExp('dt\\.entity\\.([\\w:]+)').exec(arg);
+  return !!m && entityScope(m[1]!) !== 'aws';
 }
 
 function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
@@ -1864,10 +1898,30 @@ function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
 // direct key read: <src>[<Key>]. Case is preserved from the classic key, which
 // matches the AWS tag key on the record.
 const TAG_EXTRACT_RE =
-  /splitString\(\s*splitString\(\s*toString\(\s*((?:[A-Za-z_]\w*)|(?:getNodeField\([^)]*\)))\s*\)\s*,\s*"(?:\[AWS\])?([^:"\]]+):"\s*\)\s*\[\s*1\s*\]\s*,\s*"\\?""\s*\)\s*\[\s*0\s*\]/g;
+  /splitString\(\s*splitString\(\s*toString\(\s*((?:[A-Za-z_]\w*)|(?:getNodeField\([^)]*\)))\s*\)\s*,\s*"(\[AWS\])?([^:"\]]+):"\s*\)\s*\[\s*1\s*\]\s*,\s*"\\?""\s*\)\s*\[\s*0\s*\]/g;
 
 function rewriteTagExtraction(input: string, transforms: Transform[]): string {
-  return input.replace(TAG_EXTRACT_RE, (full, varName: string, key: string) => {
+  // AWS-ONLY. The classic split idiom is how you read a tag off ANY classic
+  // entity (service, host, span…), where `tags` is a string array — there the
+  // idiom is correct and must stay. Only the AWS side became a `tags:aws`
+  // RECORD that supports `tags[key]`. Rewriting a span/service tag read broke
+  // tiles for reviewers ("no need to modify the tags query for spans, it broke
+  // the data" — EHL Offer Engine; "tiles grabbed tags but then kept regular
+  // filters against tags" — FBS Monitoring Overview).
+  //
+  // A source is AWS when it IS a smartscape node field read, or when it is a
+  // variable assigned from one. Earlier passes have already converted AWS
+  // entity reads to getNodeField(dt.smartscape.…); non-AWS ones still read
+  // entityAttr(dt.entity.…), so this test cleanly separates them.
+  const awsVars = new Set<string>();
+  const assignRe = new RegExp('\\b([A-Za-z_]\\w*)\\s*=\\s*[^=]*?getNodeField\\(\\s*`?dt\\.smartscape\\.', 'g');
+  for (let m = assignRe.exec(input); m; m = assignRe.exec(input)) awsVars.add(m[1]!);
+
+  return input.replace(TAG_EXTRACT_RE, (full, varName: string, awsPrefix: string | undefined, key: string) => {
+    const isDirectNodeRead = varName.startsWith('getNodeField');
+    // The literal [AWS] prefix is itself an unambiguous AWS tag marker;
+    // classic span/service tag reads carry no prefix (plain "applicationci:").
+    if (!isDirectNodeRead && !awsVars.has(varName) && !awsPrefix) return full;
     const repl = `${varName}[${key}]`;
     transforms.push({
       kind: 'entity-dim',

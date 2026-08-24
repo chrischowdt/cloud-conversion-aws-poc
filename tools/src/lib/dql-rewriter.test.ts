@@ -1375,12 +1375,25 @@ describe('rewriteDql — AWS tag value-extraction idiom (Pass 2.5 tags + 2.55)',
 });
 
 describe('rewriteDql — tag value-extraction idiom variants (Pass 2.55)', () => {
-  it('handles a bare "<Key>:" delimiter (no [AWS] prefix)', () => {
+  it('leaves a bare "<Key>:" delimiter alone when the tag source is not AWS', () => {
+    // Classic `tags` on a service/span/host is a STRING ARRAY and this split is
+    // the correct way to read it — only the AWS side became a tags:aws RECORD.
+    // Rewriting the non-AWS form broke reviewer tiles (EHL Offer Engine: "no
+    // need to modify the tags query for spans, it broke the data").
     const idx = buildIndex([]);
     const input = 'fieldsAdd loc = splitString(splitString(toString(tags), "location:")[1], "\\"")[0]';
     const r = rewriteDql(input, idx);
-    assert.match(r.rewritten, /loc = tags\[location\]/);
-    assert.doesNotMatch(r.rewritten, /splitString/);
+    assert.equal(r.rewritten, input);
+  });
+
+  it('still collapses a bare "<Key>:" delimiter when the var IS an AWS node tag read', () => {
+    const idx = buildIndex([]);
+    const input =
+      ['fieldsAdd tags = getNodeField(dt.smartscape.aws_ec2_instance, "tags:aws")',
+       '| fieldsAdd loc = splitString(splitString(toString(tags), "location:")[1], "\\"")[0]'].join(String.fromCharCode(10));
+      '| fieldsAdd loc = splitString(splitString(toString(tags), "location:")[1], "\\"")[0]';
+    const r = rewriteDql(input, idx);
+    assert.ok(r.rewritten.includes('loc = tags[location]'), r.rewritten);
   });
 
   it('handles an inline getNodeField(...) as the toString arg', () => {
