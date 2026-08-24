@@ -25,6 +25,7 @@ import {
   type QueryDetailLike,
 } from '../lib/asset-confidence.ts';
 import { upsertRows, readExistingIds, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { REVIEW_PREFIX } from '../lib/doc-apply.ts';
 
 export interface MigrateRefreshArgs {
   outDir: string;
@@ -98,8 +99,18 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
 
   const rows: TrackerRow[] = [];
   const laneTally: Record<string, number> = {};
+  let skippedCopies = 0;
   const build = (results: ScanResult[], type: AssetType, manifest: Map<string, ManifestEntry>) => {
     for (const r of results) {
+      // Skip the review COPIES this pipeline created. They are real documents in
+      // the tenant, so `download-*` picks them up and they would otherwise land
+      // here as fresh candidates — inviting a review copy OF a review copy, and
+      // padding the queue with assets nobody needs to migrate. The originals are
+      // already tracked under their own ids.
+      if (r.name?.startsWith(REVIEW_PREFIX)) {
+        skippedCopies++;
+        continue;
+      }
       const scan = rollupBuckets(r.details ?? []);
       const parity = type === 'dashboard' ? parityById.get(r.id) : undefined;
       const conf = assetConfidence(scan, parity);
@@ -134,8 +145,11 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
   const { updated, added } = await upsertRows(trackerPath, rows);
 
   console.log(`Refreshed migration tracker: ${trackerPath}`);
-  console.log(`  assets: ${rows.length} (dashboards ${dashScan.length}, notebooks ${nbScan.length})`);
+  console.log(`  assets: ${rows.length} (scanned: dashboards ${dashScan.length}, notebooks ${nbScan.length})`);
   console.log(`  rows: ${added} added, ${updated} updated`);
+  if (skippedCopies) {
+    console.log(`  skipped ${skippedCopies} "${REVIEW_PREFIX.trim()}" review copies (not migration candidates)`);
+  }
   console.log(
     `  lanes: fast ${laneTally['fast'] ?? 0}, review ${laneTally['review'] ?? 0}, blocked ${laneTally['blocked'] ?? 0}`
   );
