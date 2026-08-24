@@ -1584,3 +1584,31 @@ describe('reviewer-reported regressions (UA migration team)', () => {
     assert.equal(m.length, 1);
   });
 });
+
+describe('rewriteDql — classic custom-device GROUP is dropped from AWS queries', () => {
+  it('removes it from a by-clause but keeps the real resource dims', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device_group, Region, Role}',
+      idx
+    );
+    assert.ok(!r.rewritten.includes('custom_device_group'), r.rewritten);
+    assert.ok(r.rewritten.includes('Region'));
+    assert.ok(r.rewritten.includes('Role'));
+  });
+
+  it('drops a fieldsAdd whose only purpose was the group label', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device_group, Region}\n| fieldsAdd entityName(dt.entity.custom_device_group)',
+      idx
+    );
+    assert.ok(!r.rewritten.includes('custom_device_group'), r.rewritten);
+  });
+
+  it('leaves NON-AWS queries that group by a custom-device group untouched', () => {
+    const idx = buildIndex([]);
+    const q = 'timeseries v=avg(my.custom.metric), by:{dt.entity.custom_device_group}';
+    assert.equal(rewriteDql(q, idx).rewritten, q);
+  });
+});

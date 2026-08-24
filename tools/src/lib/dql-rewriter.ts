@@ -631,7 +631,21 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // can use the original classic dim to determine which smartscape dim
   // applies. Both forms are matched: pre-pass-2 (with `dt.entity.X`) and the
   // already-renamed form (`dt.smartscape.X`).
-  rewritten = rewriteClassicSelectorIns(rewritten, transforms, warnings, index.mzTags);
+  // The mzName() → enriched-tag rewrite produces a filter on `aws.tags.*`, which
+  // are dimensions of the NEW connection's metrics. If Pass 1 could not map this
+  // query's metric key, the query still reads a CLASSIC metric — and a classic
+  // metric carries no `aws.tags.*` dimension, so the filter would match nothing
+  // and silently collapse the alert's scope to zero. (Verified: the classic
+  // kafka key returns data unfiltered and nothing with the tag filter applied.)
+  // Withhold the zone index in that case so mzName() stays untranslated and the
+  // panel keeps blocking, which is the honest outcome.
+  const metricUnmapped = warnings.some((w) => w.kind === 'unknown-metric' || w.kind === 'metric-streams-blocked');
+  rewritten = rewriteClassicSelectorIns(
+    rewritten,
+    transforms,
+    warnings,
+    metricUnmapped ? undefined : index.mzTags
+  );
 
   // Pass 1.55: disambiguate classic `dt.entity.custom_device` to a real
   // Smartscape node type. Custom_device is "not planned" in Smartscape, but in
@@ -972,6 +986,7 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // name any bare getNodeName/getNodeField fieldsAdd operand (a classic bare
   // dim-field ref that auto-named its column), then drop duplicate columns/dims a
   // collapse may have produced in a fields/by:{} clause.
+  rewritten = dropCustomDeviceGroup(rewritten, transforms);
   rewritten = rewriteSmartscapeIdFilter(rewritten, transforms);
   rewritten = nameBareEntityOperands(rewritten, transforms);
   rewritten = dedupeFieldsClauses(rewritten, transforms);
@@ -2385,4 +2400,58 @@ function safeParseSelector(selectorStr: string): ReturnType<typeof parseSelector
   } catch {
     return null;
   }
+}
+
+// ─── Late cleanup: drop the classic custom-device GROUP from AWS queries ──
+//
+// `dt.entity.custom_device_group` is purely an organizational container for the
+// OLD AWS custom devices — a folder, not a resource. It has no Smartscape
+// counterpart and no meaning in the new model, where scoping comes from the
+// resource's own tags/dimensions (and, for these queries, from the management
+// zone we already rewrote into an `aws.tags.*` filter). Left in place it is a
+// permanently-null column that also adds a meaningless extra alert grain, since
+// each series in a detector's by-clause is its own alert.
+//
+// Scoped to AWS metric queries so non-AWS panels that legitimately group by a
+// custom-device group are untouched.
+const CDG = 'dt\.entity\.custom_device_group';
+const CDG_RE = new RegExp('`?' + CDG + '`?');
+
+function dropCustomDeviceGroup(input: string, transforms: Transform[]): string {
+  if (!/cloud\.aws\./.test(input) || !CDG_RE.test(input)) return input;
+  let out = input;
+  let removed = 0;
+
+  // 1. Remove it as a grouping dim: by:{ …, dt.entity.custom_device_group, … }
+  out = out.replace(/\bby\s*:\s*\{([^}]*)\}/g, (full, body: string) => {
+    const kept = splitTopLevel(body).filter((p) => !CDG_RE.test(p.trim()) || /[=(]/.test(p));
+    if (kept.length === splitTopLevel(body).length) return full;
+    removed++;
+    // An empty by-clause is invalid; drop the whole clause in that case.
+    return kept.length ? `by:{${kept.map((p) => p.trim()).join(', ')}}` : '';
+  });
+
+  // 2. Drop a `| fieldsAdd …` whose ENTIRE body is about the group (the common
+  //    `fieldsAdd entityName(dt.entity.custom_device_group)` label column).
+  //    A clause that merely mentions it alongside other work is left alone.
+  out = out.replace(/\|\s*fieldsAdd\s+([^|]+)/g, (full, body: string) => {
+    const parts = splitTopLevel(body);
+    const kept = parts.filter((p) => !CDG_RE.test(p));
+    if (kept.length === parts.length) return full;
+    removed++;
+    return kept.length ? `| fieldsAdd ${kept.map((p) => p.trim()).join(', ')}` : '';
+  });
+
+  if (removed > 0) {
+    transforms.push({
+      kind: 'entity-dim',
+      before: 'dt.entity.custom_device_group',
+      after: '(dropped)',
+      detail:
+        'classic custom-device GROUP is an organizational container for old AWS entities — no Smartscape ' +
+        'counterpart and no meaning in the new model; kept it out of the grouping/labels so it does not ' +
+        'emit a null column or an extra alert grain',
+    });
+  }
+  return out;
 }

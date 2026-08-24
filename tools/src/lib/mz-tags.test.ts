@@ -114,3 +114,27 @@ describe('mzName translation through the selector translator', () => {
     assert.equal(t.complete, false);
   });
 });
+
+describe('mzName rewrite is withheld when the metric did not convert', () => {
+  it('leaves the selector classic if the metric key is unknown', async () => {
+    // A classic metric carries no `aws.tags.*` dimension, so emitting the
+    // zone's tag filter against it would return nothing and silently collapse
+    // the alert's scope. Verified on tenant: classic kafka key returns data
+    // unfiltered, zero rows with the tag filter applied.
+    const { rewriteDql } = await import('./dql-rewriter.ts');
+    const idx = buildMzIndex({
+      zones: [{ name: 'Z', tags: [{ key: 'ApplicationCI', value: 'cpn' }] }],
+    });
+    const index = {
+      byClassicId: new Map(),
+      byDqlClassicKey: new Map(),
+      mzTags: idx,
+    } as any;
+    const q =
+      'timeseries v=avg(cloud.aws.kafka.some_unmapped_metric_by_topic,' +
+      'filter:{in(dt.entity.custom_device,classicEntitySelector("type(CUSTOM_DEVICE),mzName(\\"Z\\")"))})';
+    const r = rewriteDql(q, index);
+    assert.ok(r.warnings.some((w) => w.kind === 'unknown-metric'), 'metric should be unknown');
+    assert.ok(!r.rewritten.includes('aws.tags.'), 'must NOT emit a dimension filter on a classic metric');
+  });
+});

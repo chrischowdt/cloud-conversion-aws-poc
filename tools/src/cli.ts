@@ -647,6 +647,7 @@ async function main(): Promise<void> {
         inputFile: getString(args.flags, 'input-file'),
         apply: args.flags.get('apply') === true,
         noShare: args.flags.get('no-share') === true,
+        restage: args.flags.get('restage') === true,
         shareGroupId: getString(args.flags, 'share-group') ?? process.env.DT_SHARE_GROUP_ID,
         batchSize: getNumber(args.flags, 'batch-size'),
         buckets: bucketsFlag

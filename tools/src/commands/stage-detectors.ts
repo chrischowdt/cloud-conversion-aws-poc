@@ -44,6 +44,13 @@ export interface StageDetectorsArgs {
   shareGroupId?: string;
   /** Create the notebook(s) but skip sharing — for a private validation run. */
   noShare?: boolean;
+  /**
+   * Re-render the notebooks already published (from the manifest) IN PLACE
+   * instead of creating new ones — the way to push improved conversions to a
+   * review notebook without changing its id, url, or shares. Keeps the SAME
+   * detector-to-batch assignment so reviewers don't lose their place.
+   */
+  restage?: boolean;
   batchSize?: number;
   buckets?: ReviewBucket[];
   ids?: string[];
@@ -127,6 +134,55 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
     console.log(`No AWS detectors matched buckets [${[...wantBuckets].join(', ')}]${idFilter ? ' + id filter' : ''}.`);
     return;
   }
+
+  // --restage: rebuild exactly the batches already published, from the manifest,
+  // so a notebook keeps its id/url/shares and its reviewers keep their place.
+  if (args.restage) {
+    const prior = JSON.parse(await readFile(join(reviewDir, 'manifest.json'), 'utf8')) as {
+      batches?: ManifestEntry[];
+    };
+    const published = (prior.batches ?? []).filter((b) => b.notebookId);
+    if (!published.length) throw new Error('stage-detectors --restage: no published notebooks in the manifest.');
+    const byId = new Map(items.map((it) => [it.objectId, it]));
+    const client2 = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
+    let updated = 0;
+    for (const b of published) {
+      const batch = b.detectors.map((d) => byId.get(d.objectId)).filter((x): x is DetectorReviewItem => !!x);
+      if (!batch.length) {
+        console.log(`  - ${b.batch}: no detectors resolve (bucket filter?) — skipped`);
+        continue;
+      }
+      const content = buildDetectorNotebook(`${b.batch} of ${published.length}`, batch);
+      const name = `[MIGRATION REVIEW] AWS alerts — ${b.batch} of ${published.length}`;
+      if (!args.apply) {
+        await writeFile(join(reviewDir, `${b.batch}.json`), JSON.stringify({ name, type: 'notebook', content }, null, 2));
+        console.log(`  · ${b.batch}: prepared refresh for notebook ${b.notebookId} (${batch.length} detectors)`);
+        continue;
+      }
+      try {
+        const live = await client2.getDocumentFull(b.notebookId!, true);
+        await client2.updateContent(b.notebookId!, {
+          name,
+          type: 'notebook',
+          content,
+          version: live.metadata.version,
+          adminAccess: true,
+        });
+        updated++;
+        console.log(`  ✓ ${b.batch}: refreshed notebook ${b.notebookId} in place (${batch.length} detectors)`);
+      } catch (e) {
+        const msg = e instanceof DocumentApiError ? `HTTP ${e.status}: ${e.body.slice(0, 120)}` : (e as Error).message;
+        console.log(`  ! ${b.batch}: refresh failed — ${msg}`);
+      }
+    }
+    console.log(
+      args.apply
+        ? `\nRefreshed ${updated}/${published.length} notebook(s) in place — same ids, urls and shares.`
+        : `\nPrepared refreshes in ${reviewDir}; no writes made. Re-run with --apply.`
+    );
+    return;
+  }
+
   const scoped = args.limit ? items.slice(0, args.limit) : items;
   const batches = chunk(scoped, batchSize);
   console.log(
@@ -176,7 +232,22 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
     }
   }
 
-  await writeFile(join(reviewDir, 'manifest.json'), JSON.stringify({ generated: new Date().toISOString(), batches: manifest }, null, 2));
+  // MERGE, don't clobber. Each run publishes its own notebooks, but the manifest
+  // is the only record of every notebook we've created — `--restage` iterates it
+  // to push improved conversions into notebooks reviewers already have open. A
+  // wholesale overwrite would orphan every previously published notebook. Keyed
+  // by notebookId (batch labels repeat across runs); prepare-mode entries have
+  // no id and are not persisted over prior ones.
+  const manifestPath = join(reviewDir, 'manifest.json');
+  let priorBatches: ManifestEntry[] = [];
+  try {
+    priorBatches = (JSON.parse(await readFile(manifestPath, 'utf8')) as { batches?: ManifestEntry[] }).batches ?? [];
+  } catch {
+    /* first run */
+  }
+  const freshIds = new Set(manifest.map((m) => m.notebookId).filter(Boolean));
+  const merged = [...priorBatches.filter((b) => b.notebookId && !freshIds.has(b.notebookId)), ...manifest];
+  await writeFile(manifestPath, JSON.stringify({ generated: new Date().toISOString(), batches: merged }, null, 2));
 
   console.log('');
   if (args.apply) {
