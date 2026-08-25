@@ -11,8 +11,9 @@ import {
   buildReviewCard,
   parseReviewCard,
   collectReviewCards,
-  REVIEW_STATUSES,
-  STATUS_TO_DECISION,
+  DECISION_STATES,
+  REVIEWER_CHOICES,
+  DEFAULT_DECISION,
 } from './detector-notebook.ts';
 
 function item(over: Partial<DetectorReviewItem> = {}): DetectorReviewItem {
@@ -115,51 +116,60 @@ describe('chunk', () => {
   });
 });
 
+
 describe('reviewer verdict card', () => {
   it('is emitted per detector, after the query tile', () => {
     const nb = buildDetectorNotebook('batch-01', [item()]);
-    // header + (summary, dql, review) = 4
-    assert.equal(nb.sections.length, 4);
-    assert.equal(nb.sections[1]!.type, 'markdown');
+    assert.equal(nb.sections.length, 4); // header + summary + dql + review
     assert.equal(nb.sections[2]!.type, 'dql');
     assert.equal(nb.sections[3]!.type, 'markdown');
     assert.equal(nb.sections[3]!.id, 'review-abc-123');
   });
 
-  it('starts at Not Reviewed and reads back as untouched', () => {
+  it('uses EXACTLY the tracker vocabulary — no second dialect', async () => {
+    const tracker = await import('./tracker-xlsx.ts');
+    assert.deepEqual([...DECISION_STATES], [...tracker.DECISION_STATES]);
+    // The automation owns "Published"; reviewers never set it by hand.
+    assert.ok(!REVIEWER_CHOICES.includes('Published' as never));
     const card = buildReviewCard(item());
-    const p = parseReviewCard(card);
+    for (const s of REVIEWER_CHOICES) assert.ok(card.includes(s), `card should offer "${s}"`);
+    assert.ok(!/Converted OK|Needs Fix/.test(card), 'no legacy notebook-only words');
+  });
+
+  it('starts at the tracker default and reads back as untouched', () => {
+    const p = parseReviewCard(buildReviewCard(item()));
     assert.equal(p.objectId, 'abc-123');
-    assert.equal(p.status, 'Not Reviewed');
+    assert.equal(p.status, DEFAULT_DECISION);
+    assert.equal(p.status, 'Needs Review');
     assert.equal(p.notes, '');
     assert.equal(p.untouched, true, 'a pristine card must not look like an answer');
   });
 
   it('reads back a filled-in status and notes', () => {
     const filled = buildReviewCard(item())
-      .replace('**Status:** Not Reviewed', '**Status:** Converted OK')
+      .replace(`**Status:** ${DEFAULT_DECISION}`, '**Status:** Ready To Publish')
       .replace(
         '_(optional — replace this line with anything the migration team should know:',
         'Checked all 3 tables, matches classic.'
       );
     const p = parseReviewCard(filled);
-    assert.equal(p.status, 'Converted OK');
+    assert.equal(p.status, 'Ready To Publish');
     assert.match(p.notes, /Checked all 3 tables/);
     assert.equal(p.untouched, false);
   });
 
   it('tolerates bold/case/punctuation around the status', () => {
-    for (const raw of ['**Needs Fix**', 'needs fix', 'Needs Fix.', '`Needs Fix`']) {
-      const card = buildReviewCard(item()).replace('**Status:** Not Reviewed', `**Status:** ${raw}`);
-      assert.equal(parseReviewCard(card).status, 'Needs Fix', `failed for ${raw}`);
+    for (const raw of ['**In Progress**', 'in progress', 'In Progress.', '`In Progress`']) {
+      const card = buildReviewCard(item()).replace(`**Status:** ${DEFAULT_DECISION}`, `**Status:** ${raw}`);
+      assert.equal(parseReviewCard(card).status, 'In Progress', `failed for ${raw}`);
     }
   });
 
   it('returns an unrecognized status verbatim rather than coercing it', () => {
-    const card = buildReviewCard(item()).replace('**Status:** Not Reviewed', '**Status:** looks fine to me');
+    const card = buildReviewCard(item()).replace(`**Status:** ${DEFAULT_DECISION}`, '**Status:** looks fine to me');
     const p = parseReviewCard(card);
     assert.equal(p.status, 'looks fine to me', 'a typo must not silently become an approval');
-    assert.ok(!REVIEW_STATUSES.includes(p.status as any));
+    assert.ok(!DECISION_STATES.includes(p.status as never));
   });
 
   it('collects every card from a notebook and keeps ids aligned', () => {
@@ -167,10 +177,5 @@ describe('reviewer verdict card', () => {
     const cards = collectReviewCards(nb);
     assert.deepEqual(cards.map((c) => c.objectId), ['abc-123', 'def-456']);
     assert.ok(cards.every((c) => c.untouched));
-  });
-
-  it('maps every status onto a tracker decision', () => {
-    for (const s of REVIEW_STATUSES) assert.ok(STATUS_TO_DECISION[s], `no mapping for ${s}`);
-    assert.equal(STATUS_TO_DECISION['Converted OK'], 'Ready To Publish');
   });
 });

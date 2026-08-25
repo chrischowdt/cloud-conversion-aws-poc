@@ -23,32 +23,18 @@ import ExcelJS from 'exceljs';
 
 export type AssetType = 'dashboard' | 'notebook';
 
-/**
- * The team's shared `decision` vocabulary (column V). Reviewers pick from the
- * first four; the automation sets `Published` itself after a successful cutover.
- */
-export const DECISION_STATES = [
-  'Descope', // exclude from any automated conversion
-  'Needs Review', // has a conversion blocker
-  'In Progress', // someone is actively reviewing
-  'Ready To Publish', // automation may cut the review copy over the original
-  'Published', // set BY the automation after cutover
-] as const;
-export type DecisionState = (typeof DECISION_STATES)[number];
-
-/** The decision value that authorizes the automation to publish a row. */
-export const READY_TO_PUBLISH = 'Ready To Publish';
-/** The decision value the automation writes back after a successful cutover. */
-export const PUBLISHED = 'Published';
-
-/** True when a (raw, any-case) decision cell means "ready to publish". */
-export function isReadyToPublish(decision: string | undefined): boolean {
-  return (decision ?? '').trim().toLowerCase() === READY_TO_PUBLISH.toLowerCase();
-}
-/** True when a (raw, any-case) decision cell means "already published". */
-export function isPublished(decision: string | undefined): boolean {
-  return (decision ?? '').trim().toLowerCase() === PUBLISHED.toLowerCase();
-}
+// The shared review vocabulary lives in decision-states.ts so the tracker and
+// the in-product review notebooks use ONE set of words. Re-exported here because
+// this module is where callers have always imported it from.
+export {
+  DECISION_STATES,
+  READY_TO_PUBLISH,
+  PUBLISHED,
+  isReadyToPublish,
+  isPublished,
+  type DecisionState,
+} from './decision-states.ts';
+import { DECISION_STATES } from './decision-states.ts';
 
 /** Columns the tool owns and overwrites. `asset_id` is the join key. */
 export const TOOL_COLUMNS = [

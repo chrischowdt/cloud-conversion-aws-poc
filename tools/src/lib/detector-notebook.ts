@@ -224,8 +224,8 @@ function batchHeader(label: string, items: DetectorReviewItem[]): MarkdownSectio
     'The script reads your edited query and your status back, then applies the query in place to the ' +
       'live detector. Nothing in this notebook alerts, so you can run everything freely.',
     '',
-    `> Statuses: ${REVIEW_STATUSES.filter((s) => s !== 'Not Reviewed').map((s) => `**${s}**`).join(' · ')}. ` +
-      'Anything left at *Not Reviewed* is skipped.',
+    `> Statuses (same words as the migration tracker): ${REVIEWER_CHOICES.map((s) => `**${s}**`).join(' · ')}. ` +
+      `Anything left at *${DEFAULT_DECISION}* is skipped.`,
     '',
     '> Keep the `// [CCT-DETECTOR …]`, `// [CCT-ORIGINAL] …` and `CCT-REVIEW …` markers — they anchor the read-back.',
   ].join('\n');
@@ -269,28 +269,16 @@ export function chunk<T>(arr: T[], size: number): T[][] {
 // free-text notes block. The objectId is carried in the tile id AND in the text,
 // so read-back still works if a tile gets copied or its id changes.
 
-/** Vocabulary for the per-query verdict. `Not Reviewed` is the starting value. */
-export const REVIEW_STATUSES = [
-  'Not Reviewed',
-  'Converted OK',
-  'Needs Fix',
-  'Blocked',
-  'Descope',
-] as const;
-export type ReviewStatus = (typeof REVIEW_STATUSES)[number];
-
 /**
- * How a per-query verdict rolls up to the shared tracker's `decision` column
- * (see lib/tracker-xlsx.ts DECISION_STATES), so the two vocabularies stay
- * reconcilable when we write detector outcomes back.
+ * The per-query verdict uses the migration team's SHARED vocabulary — the same
+ * words as the tracker's `decision` column — so a status set in a notebook and a
+ * status set in the spreadsheet mean exactly the same thing and roll up without
+ * a translation table.
  */
-export const STATUS_TO_DECISION: Record<ReviewStatus, string> = {
-  'Not Reviewed': 'Needs Review',
-  'Converted OK': 'Ready To Publish',
-  'Needs Fix': 'In Progress',
-  Blocked: 'Needs Review',
-  Descope: 'Descope',
-};
+export { DECISION_STATES, REVIEWER_CHOICES, DEFAULT_DECISION } from "./decision-states.ts";
+import { REVIEWER_CHOICES, DEFAULT_DECISION, canonicalDecision } from "./decision-states.ts";
+import type { DecisionState } from "./decision-states.ts";
+export type { DecisionState } from "./decision-states.ts";
 
 const STATUS_MARK = '**Status:**';
 const NOTES_MARK = '**Notes:**';
@@ -307,11 +295,9 @@ export function buildReviewCard(item: DetectorReviewItem): string {
     '',
     `\`${REVIEW_TAG}${item.objectId}\``,
     '',
-    `${STATUS_MARK} Not Reviewed`,
+    `${STATUS_MARK} ${DEFAULT_DECISION}`,
     '',
-    `> Replace the word above with one of: ${REVIEW_STATUSES.filter((s) => s !== 'Not Reviewed')
-      .map((s) => `**${s}**`)
-      .join(' · ')}`,
+    `> Replace the word above with one of: ${REVIEWER_CHOICES.map((s) => `**${s}**`).join(' · ')}`,
     '',
     NOTES_MARK,
     '',
@@ -322,7 +308,7 @@ export function buildReviewCard(item: DetectorReviewItem): string {
 
 export interface ParsedReviewCard {
   objectId?: string;
-  status: ReviewStatus | string;
+  status: DecisionState | string;
   notes: string;
   /** True when the reviewer left the card at its default, untouched state. */
   untouched: boolean;
@@ -346,7 +332,7 @@ export function parseReviewCard(markdown: string): ParsedReviewCard {
       .trim()
       .replace(/[.,;]+$/, '');
   }
-  const canonical = REVIEW_STATUSES.find((s) => s.toLowerCase() === status.toLowerCase());
+  const canonical = canonicalDecision(status);
 
   let notes = '';
   const notesIdx = lines.findIndex((l) => l.includes(NOTES_MARK));
@@ -363,9 +349,9 @@ export function parseReviewCard(markdown: string): ParsedReviewCard {
   const resolved = canonical ?? status;
   return {
     objectId: idM?.[1],
-    status: resolved || 'Not Reviewed',
+    status: resolved || DEFAULT_DECISION,
     notes,
-    untouched: (!resolved || resolved === 'Not Reviewed') && notes === '',
+    untouched: (!resolved || resolved === DEFAULT_DECISION) && notes === '',
   };
 }
 
