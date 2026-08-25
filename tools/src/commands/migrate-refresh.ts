@@ -24,7 +24,7 @@ import {
   type ParityCounts,
   type QueryDetailLike,
 } from '../lib/asset-confidence.ts';
-import { upsertRows, readExistingIds, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { upsertRows, readExistingIds, pruneReviewCopyRows, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { REVIEW_PREFIX } from '../lib/doc-apply.ts';
 
 export interface MigrateRefreshArgs {
@@ -142,11 +142,18 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
   build(dashScan, 'dashboard', dashManifest);
   build(nbScan, 'notebook', nbManifest);
 
+  // Drop any of our own review copies a PREVIOUS refresh enrolled as candidates.
+  // They are not assets to migrate (the originals are tracked under their own
+  // ids), and leaving them invites staging a review copy OF a review copy.
+  const pruned = await pruneReviewCopyRows(trackerPath, REVIEW_PREFIX);
+
   const { updated, added } = await upsertRows(trackerPath, rows);
 
   console.log(`Refreshed migration tracker: ${trackerPath}`);
   console.log(`  assets: ${rows.length} (scanned: dashboards ${dashScan.length}, notebooks ${nbScan.length})`);
   console.log(`  rows: ${added} added, ${updated} updated`);
+  if (pruned.removed) console.log(`  removed ${pruned.removed} stale review-copy row(s) a previous refresh had enrolled`);
+  for (const n of pruned.keptWithHumanInput) console.log(`  ! kept review-copy row with human input: ${n}`);
   if (skippedCopies) {
     console.log(`  skipped ${skippedCopies} "${REVIEW_PREFIX.trim()}" review copies (not migration candidates)`);
   }

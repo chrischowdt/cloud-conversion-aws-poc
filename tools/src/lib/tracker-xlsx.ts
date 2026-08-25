@@ -363,3 +363,49 @@ export async function readDecisions(path: string, sheetName = DEFAULT_SHEET): Pr
   });
   return out;
 }
+
+/**
+ * Remove rows for assets that are OUR OWN review copies.
+ *
+ * The copies this pipeline publishes are real documents in the tenant, so a
+ * download picks them up and earlier refreshes enrolled them as migration
+ * candidates — 74 of them on this tenant. They are not assets anyone needs to
+ * migrate (the originals are tracked under their own ids), and leaving them in
+ * invites staging a review copy OF a review copy.
+ *
+ * Deliberately refuses to delete a row carrying human input. If a reviewer has
+ * put a decision, note, or their name on one, that is a signal we do not
+ * understand the row — losing their work to a cleanup would be far worse than
+ * leaving one stray row, so we keep it and report it.
+ */
+export async function pruneReviewCopyRows(
+  path: string,
+  prefix: string,
+  sheetName = DEFAULT_SHEET
+): Promise<{ removed: number; keptWithHumanInput: string[] }> {
+  if (!existsSync(path)) return { removed: 0, keptWithHumanInput: [] };
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(path);
+  const ws = wb.getWorksheet(sheetName);
+  if (!ws) return { removed: 0, keptWithHumanInput: [] };
+  const header = headerIndex(ws);
+  const nameCol = header.get('name');
+  if (!nameCol) return { removed: 0, keptWithHumanInput: [] };
+  const humanCols = HUMAN_COLUMNS.map((c) => header.get(c.header)).filter((n): n is number => !!n);
+
+  const doomed: number[] = [];
+  const kept: string[] = [];
+  ws.eachRow((row, n) => {
+    if (n === 1) return;
+    const name = cellStr(row.getCell(nameCol).value);
+    if (!name.startsWith(prefix)) return;
+    const hasHuman = humanCols.some((c) => cellStr(row.getCell(c).value).trim().length > 0);
+    if (hasHuman) kept.push(name);
+    else doomed.push(n);
+  });
+
+  // Splice from the bottom so earlier row numbers stay valid.
+  for (const n of doomed.sort((a, b) => b - a)) ws.spliceRows(n, 1);
+  if (doomed.length) await wb.xlsx.writeFile(path);
+  return { removed: doomed.length, keptWithHumanInput: kept };
+}

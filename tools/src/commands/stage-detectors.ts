@@ -51,6 +51,8 @@ export interface StageDetectorsArgs {
    * detector-to-batch assignment so reviewers don't lose their place.
    */
   restage?: boolean;
+  /** Batch by the team prefix in each detector title instead of arbitrary runs of N. */
+  groupByTeam?: boolean;
   batchSize?: number;
   buckets?: ReviewBucket[];
   ids?: string[];
@@ -184,7 +186,56 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   }
 
   const scoped = args.limit ? items.slice(0, args.limit) : items;
-  const batches = chunk(scoped, batchSize);
+
+  // Group by the team prefix detector titles already carry ("CWE - Lambda
+  // Timeout is High"). 629 of the 807 AWS detectors have one, so this makes each
+  // notebook belong to a single team — reviewable by the people who own those
+  // alerts, and assignable without anyone first working out who owns what.
+  // Untagged detectors collect into MISC. Batch size still caps each notebook.
+  const batches: DetectorReviewItem[][] = [];
+  const labels: string[] = [];
+  if (args.groupByTeam) {
+    const groups = new Map<string, DetectorReviewItem[]>();
+    for (const it of scoped) {
+      const m = /^([A-Z][A-Z0-9]{1,5})\b/.exec(it.title.trim());
+      const key = m ? m[1]! : 'MISC';
+      (groups.get(key) ?? groups.set(key, []).get(key)!).push(it);
+    }
+    // Pack WHOLE teams into notebooks up to batchSize rather than giving every
+    // team its own: 67 prefixes, most with only a handful of detectors, would
+    // mean ~70 near-empty notebooks. A team bigger than a batch is split across
+    // sequential notebooks; smaller teams share one but stay contiguous, so a
+    // notebook is still assignable to a small set of owners.
+    const ordered = [...groups].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+    let cur: DetectorReviewItem[] = [];
+    let curTeams: string[] = [];
+    const flush = () => {
+      if (!cur.length) return;
+      batches.push(cur);
+      labels.push(curTeams.length <= 3 ? curTeams.join(' + ') : `${curTeams.slice(0, 3).join(' + ')} +${curTeams.length - 3} more`);
+      cur = []; curTeams = [];
+    };
+    for (const [team, list] of ordered) {
+      if (list.length >= batchSize) {
+        flush();
+        const parts = chunk(list, batchSize);
+        parts.forEach((p, i) => {
+          batches.push(p);
+          labels.push(parts.length > 1 ? `${team} ${i + 1} of ${parts.length}` : team);
+        });
+        continue;
+      }
+      if (cur.length + list.length > batchSize) flush();
+      cur.push(...list);
+      curTeams.push(team);
+    }
+    flush();
+  } else {
+    for (const [i, c] of chunk(scoped, batchSize).entries()) {
+      batches.push(c);
+      labels.push(`batch-${String(i + 1).padStart(2, '0')}`);
+    }
+  }
   console.log(
     `${args.apply ? 'Staging' : 'Preparing'} ${scoped.length} AWS detector(s) into ${batches.length} review notebook(s) ` +
       `(batch size ${batchSize}, buckets [${[...wantBuckets].join(', ')}])…`
@@ -196,17 +247,18 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   let created = 0;
 
   for (let i = 0; i < batches.length; i++) {
-    const label = `batch-${String(i + 1).padStart(2, '0')}`;
+    const label = labels[i]!;
     const batch = batches[i]!;
-    const content = buildDetectorNotebook(`${label} of ${total}`, batch);
-    const name = `[MIGRATION REVIEW] AWS alerts — ${label} of ${total}`;
+    const content = buildDetectorNotebook(label, batch);
+    const name = `[MIGRATION REVIEW] AWS alerts — ${label}`;
     const entry: ManifestEntry = {
       batch: label,
       detectors: batch.map((it) => ({ objectId: it.objectId, sectionId: `dql-${it.objectId}`, title: it.title, bucket: it.bucket })),
     };
 
     if (!args.apply) {
-      await writeFile(join(reviewDir, `${label}.json`), JSON.stringify({ name, type: 'notebook', content }, null, 2));
+      const fileLabel = label.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      await writeFile(join(reviewDir, `${fileLabel}.json`), JSON.stringify({ name, type: 'notebook', content }, null, 2));
       manifest.push(entry);
       continue;
     }
