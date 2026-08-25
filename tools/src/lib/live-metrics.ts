@@ -73,12 +73,18 @@ export interface VariantPreference {
 }
 
 /**
- * Default minimum target-series count for an auto-override. A sibling with
- * only 1 live series is the weakest possible evidence — on an incompletely-
- * collected tenant it may be a single test resource rather than the intended
- * grain — so by policy we don't swap to it. Tunable via `minSeries`.
+ * Minimum series a replacement variant must have before we swap to it. An
+ * override is only ever considered when our own key has NO series, so the
+ * comparison is "a variant with no data" vs "a variant with some" — and at the
+ * default of 1, any populated sibling wins.
+ *
+ * This was 2, on the reasoning that a single-series sibling might be one test
+ * resource rather than the intended grain. In practice that preserved panels
+ * guaranteed to be empty, and reviewers corrected them by hand anyway — so the
+ * caution cost more than it saved. Raise it (`--min-override-series`) to demand
+ * stronger evidence; every override is warned about regardless.
  */
-export const DEFAULT_MIN_OVERRIDE_SERIES = 2;
+export const DEFAULT_MIN_OVERRIDE_SERIES = 1;
 
 /**
  * Given a DAC/extra-resolved new key, return the key to actually use:
@@ -112,7 +118,18 @@ export function preferPopulatedVariant(
     if (sc > bc || (sc === bc && dimCount(s) < dimCount(best))) best = s;
   }
   const bestCount = index.byKey.get(best) ?? 0;
-  // Not enough evidence to override — thin (or, defensively, self) target.
+  // We only get here when OUR key has no series (a populated key returns above),
+  // so the real choice is "a variant with no data" vs "a variant with some".
+  // `minSeries` is the floor the replacement must clear; at the default of 1,
+  // any populated sibling beats a dead key. Raising it demands more evidence.
+  //
+  // This used to default to 2, which preserved guaranteed-empty panels: reviewers
+  // had to fix rds.Deadlocks.By.DBClusterIdentifier.Region.Role (absent from the
+  // tenant) down to the 1-series `.By.DBClusterIdentifier` by hand, and the same
+  // guard hid that dynamodb.SuccessfulRequestLatency.By.TableName has a
+  // `.By.Operation.TableName` sibling carrying 248 series. Every override is
+  // warned about and every asset is human-reviewed before publish, so offering
+  // the populated variant is strictly more useful than offering nothing.
   if (best === newKey || bestCount < minSeries) {
     return { key: newKey, overrode: false, count: own ?? 0 };
   }

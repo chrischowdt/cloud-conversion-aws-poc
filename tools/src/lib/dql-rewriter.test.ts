@@ -1612,3 +1612,36 @@ describe('rewriteDql — classic custom-device GROUP is dropped from AWS queries
     assert.equal(rewriteDql(q, idx).rewritten, q);
   });
 });
+
+describe('rewriteDql — by-clause dims the new key does not carry', () => {
+  it('prunes a classic dim the new key lacks (reviewer edit on CPN RDS Aurora Deadlocks)', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries v=avg(`cloud.aws.rds.Deadlocks.By.DBClusterIdentifier`), by:{Region, DBClusterIdentifier, Role}',
+      idx
+    );
+    assert.ok(r.rewritten.includes('DBClusterIdentifier'), r.rewritten);
+    assert.ok(!/\bRole\b/.test(r.rewritten), 'Role is not a dim of this key');
+    assert.ok(!/\bRegion\b/.test(r.rewritten), 'Region is not a dim of this key');
+    assert.ok(r.warnings.some((w) => w.kind === 'dim-not-carried'));
+  });
+
+  it('keeps the smartscape entity dim and aws.* dims, which are not metric dims', () => {
+    const idx = buildIndex([]);
+    const r = rewriteDql(
+      'timeseries v=avg(`cloud.aws.rds.Deadlocks.By.DBClusterIdentifier`), by:{dt.smartscape.aws_rds_dbinstance, `aws.region`, DBClusterIdentifier}',
+      idx
+    );
+    assert.ok(r.rewritten.includes('dt.smartscape.aws_rds_dbinstance'));
+    assert.ok(r.rewritten.includes('aws.region'));
+    assert.ok(r.rewritten.includes('DBClusterIdentifier'));
+  });
+
+  it('leaves a by-clause alone when every dim is carried', () => {
+    const idx = buildIndex([]);
+    const q = 'timeseries v=avg(`cloud.aws.rds.Deadlocks.By.DBClusterIdentifier.Role`), by:{DBClusterIdentifier, Role}';
+    const r = rewriteDql(q, idx);
+    assert.ok(r.rewritten.includes('by:{DBClusterIdentifier, Role}'), r.rewritten);
+    assert.ok(!r.warnings.some((w) => w.kind === 'dim-not-carried'));
+  });
+});

@@ -987,6 +987,8 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // dim-field ref that auto-named its column), then drop duplicate columns/dims a
   // collapse may have produced in a fields/by:{} clause.
   rewritten = dropCustomDeviceGroup(rewritten, transforms);
+  rewritten = pruneByDimsNotOnKey(rewritten, transforms, warnings);
+  warnDeadMetricVariant(rewritten, index, warnings);
   rewritten = rewriteSmartscapeIdFilter(rewritten, transforms);
   rewritten = nameBareEntityOperands(rewritten, transforms);
   rewritten = dedupeFieldsClauses(rewritten, transforms);
@@ -2454,4 +2456,97 @@ function dropCustomDeviceGroup(input: string, transforms: Transform[]): string {
     });
   }
   return out;
+}
+
+// ─── Late cleanup: drop by-clause dims the NEW metric key doesn't carry ───
+//
+// A new-connection key spells out its own dimensions: `cloud.aws.rds.Deadlocks
+// .By.DBClusterIdentifier` has exactly one. Classic keys often carried more
+// (`…_by_region_dbcluster_identifier_role`), and the classic by-clause named all
+// of them. Keeping a dim the key does NOT carry gives a permanently-null column
+// AND — because each series in a detector's by-clause is its own alert — the
+// wrong alert grain. Reviewers hit exactly this on CPN QA RDS Aurora Deadlocks,
+// pruning `by:{Region, DBClusterIdentifier, Role}` down to the dims that exist.
+//
+// Only bare dimension tokens are pruned. `dt.smartscape.*` (the entity dim),
+// `aws.*` (region/account/tags, present on every AWS series), and anything with
+// an assignment or call are always kept — they are not metric dimensions.
+const NEW_KEY_RE = /`?(cloud\.aws\.[a-z0-9_]+\.[A-Za-z0-9]+\.By\.[A-Za-z0-9._]+)`?/;
+
+function pruneByDimsNotOnKey(input: string, transforms: Transform[], warnings: Warning[]): string {
+  const keyM = NEW_KEY_RE.exec(input);
+  if (!keyM) return input;
+  const dims = new Set(
+    keyM[1]!.slice(keyM[1]!.indexOf('.By.') + 4).split('.').map((d) => d.toLowerCase())
+  );
+  if (dims.size === 0) return input;
+
+  const dropped: string[] = [];
+  const out = input.replace(/\bby\s*:\s*\{([^}]*)\}/g, (full, body: string) => {
+    const parts = splitTopLevel(body).map((p) => p.trim()).filter(Boolean);
+    const kept = parts.filter((p) => {
+      const bare = p.replace(/`/g, '');
+      // keep anything that isn't a plain dimension token
+      if (/[=()]/.test(p)) return true;
+      if (/^dt\./.test(bare) || /^aws\./.test(bare)) return true;
+      if (dims.has(bare.toLowerCase())) return true;
+      dropped.push(bare);
+      return false;
+    });
+    if (kept.length === parts.length || kept.length === 0) return full;
+    return `by:{${kept.join(', ')}}`;
+  });
+
+  if (dropped.length) {
+    transforms.push({
+      kind: 'entity-dim',
+      before: `by:{… ${dropped.join(', ')} …}`,
+      after: 'dropped',
+      detail: `${keyM[1]} does not carry ${dropped.join(', ')} — kept only the dimensions the new key has`,
+    });
+    warnings.push({
+      kind: 'dim-not-carried',
+      text:
+        `Removed ${dropped.join(', ')} from the by-clause: the new key ${keyM[1]} does not carry ` +
+        `${dropped.length > 1 ? 'those dimensions' : 'that dimension'}, so grouping by ${dropped.length > 1 ? 'them' : 'it'} ` +
+        `would produce a null column and change the alert grain. Confirm the remaining grouping is the grain you want.`,
+      match: keyM[1],
+    });
+  }
+  return out;
+}
+
+/**
+ * Flag a final metric key that has NO series on this tenant while a sibling
+ * variant does. The lookup's automatic dim-override deliberately skips the
+ * verified recipe tier — those keys carry an aggregation/scale calibrated for a
+ * specific dimension, so silently repointing them could quietly change the
+ * numbers an alert fires on. Staying silent isn't right either: reviewers were
+ * left diagnosing empty panels from scratch (reported on AAP:JET —
+ * "No data in tenant for cloud.aws.dynamodb.SuccessfulRequestLatency.By.TableName",
+ * whose `.By.Operation.TableName` sibling carries 248 series). So we name the
+ * populated sibling and let a human make the call.
+ */
+function warnDeadMetricVariant(input: string, index: RecipeIndex, warnings: Warning[]): void {
+  const live = index.liveMetrics;
+  if (!live) return;
+  const m = NEW_KEY_RE.exec(input);
+  if (!m) return;
+  const key = m[1]!;
+  if ((live.byKey.get(key) ?? 0) > 0) return;
+  const stem = key.split('.By.')[0]!;
+  const sibs = (live.byBase.get(stem) ?? [])
+    .filter((s) => s !== key && (live.byKey.get(s) ?? 0) > 0)
+    .sort((a, b) => (live.byKey.get(b) ?? 0) - (live.byKey.get(a) ?? 0));
+  if (!sibs.length) return;
+  const best = sibs[0]!;
+  warnings.push({
+    kind: 'dim-variant-override',
+    text:
+      `${key} has no series on this tenant, but ${best} does (${live.byKey.get(best)} series). ` +
+      `This key came from a verified recipe whose aggregation/scale is calibrated for its dimension, so it was ` +
+      `NOT repointed automatically — switching to the populated variant may change the values the alert fires on. ` +
+      `Confirm which grain you want.`,
+    match: key,
+  });
 }

@@ -101,13 +101,20 @@ describe('preferPopulatedVariant', () => {
     assert.equal(r.count, 0);
   });
 
-  it('does NOT swap to a single-series target at the default threshold (≥2)', () => {
-    // The verified Step Functions case: empty region-qualified variant, the
-    // only populated sibling has just 1 series — too thin to trust by default.
+  it('DOES swap to a single-series target at the default threshold (≥1)', () => {
+    // Our key has no series at all, so the choice is "nothing" vs "something".
+    // Reviewers made exactly this call by hand on rds.Deadlocks — leaving the
+    // dead variant in place just meant a guaranteed-empty panel to diagnose.
     const live = buildLive({ 'cloud.aws.states.ExecutionsStarted.By.StateMachineArn': 1 });
     const r = preferPopulatedVariant(live, 'cloud.aws.states.ExecutionsStarted.By.Region.StateMachineArn');
+    assert.equal(r.overrode, true);
+    assert.equal(r.key, 'cloud.aws.states.ExecutionsStarted.By.StateMachineArn');
+  });
+
+  it('still refuses when the caller demands stronger evidence', () => {
+    const live = buildLive({ 'cloud.aws.states.ExecutionsStarted.By.StateMachineArn': 1 });
+    const r = preferPopulatedVariant(live, 'cloud.aws.states.ExecutionsStarted.By.Region.StateMachineArn', 5);
     assert.equal(r.overrode, false);
-    assert.equal(r.key, 'cloud.aws.states.ExecutionsStarted.By.Region.StateMachineArn');
   });
 
   it('DOES swap to a single-series target when minSeries is lowered to 1', () => {
