@@ -409,3 +409,53 @@ export async function pruneReviewCopyRows(
   if (doomed.length) await wb.xlsx.writeFile(path);
   return { removed: doomed.length, keptWithHumanInput: kept };
 }
+
+/** Workflow states that mean real work is in flight — never pruned. */
+const IN_FLIGHT_STATUSES = new Set(['staged', 'in-review', 'promoted', 'verified']);
+
+/**
+ * Remove rows for assets that are no longer in scope — e.g. after narrowing the
+ * download to "opened in the last N days", so the sheet tracks the assets the
+ * team actually has to migrate rather than everything that has ever existed.
+ *
+ * `upsertRows` only ever adds or updates, so without this a narrowed scan just
+ * leaves the old rows sitting there and the sheet never shrinks.
+ *
+ * Three things are never pruned, whatever the scope says:
+ *   - rows carrying human input (assignee / decision / reviewer / notes)
+ *   - rows with work in flight (staged, in-review, promoted, verified)
+ * Losing either to a scope change would destroy work that scope has no opinion
+ * about. Everything kept for those reasons is reported so it stays visible.
+ */
+export async function pruneRowsNotInScope(
+  path: string,
+  keepIds: Set<string>,
+  sheetName = DEFAULT_SHEET
+): Promise<{ removed: number; keptHuman: number; keptInFlight: number }> {
+  if (!existsSync(path)) return { removed: 0, keptHuman: 0, keptInFlight: 0 };
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(path);
+  const ws = wb.getWorksheet(sheetName);
+  if (!ws) return { removed: 0, keptHuman: 0, keptInFlight: 0 };
+  const header = headerIndex(ws);
+  const idCol = header.get('asset_id');
+  const statusCol = header.get('status');
+  if (!idCol) return { removed: 0, keptHuman: 0, keptInFlight: 0 };
+  const humanCols = HUMAN_COLUMNS.map((c) => header.get(c.header)).filter((n): n is number => !!n);
+
+  const doomed: number[] = [];
+  let keptHuman = 0, keptInFlight = 0;
+  ws.eachRow((row, n) => {
+    if (n === 1) return;
+    const id = cellStr(row.getCell(idCol).value).trim();
+    if (!id || keepIds.has(id)) return;
+    if (humanCols.some((c) => cellStr(row.getCell(c).value).trim().length > 0)) { keptHuman++; return; }
+    const status = statusCol ? cellStr(row.getCell(statusCol).value).trim().toLowerCase() : '';
+    if (IN_FLIGHT_STATUSES.has(status)) { keptInFlight++; return; }
+    doomed.push(n);
+  });
+
+  for (const n of doomed.sort((a, b) => b - a)) ws.spliceRows(n, 1);
+  if (doomed.length) await wb.xlsx.writeFile(path);
+  return { removed: doomed.length, keptHuman, keptInFlight };
+}

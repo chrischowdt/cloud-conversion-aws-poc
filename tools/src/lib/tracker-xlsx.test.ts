@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { rm, mkdtemp } from 'node:fs/promises';
 
 import ExcelJS from 'exceljs';
-import { upsertRows, readDecisions, cellStr, isReadyToPublish, isPublished, PUBLISHED, type TrackerRow } from './tracker-xlsx.ts';
+import { upsertRows, readDecisions, cellStr, isReadyToPublish, isPublished, PUBLISHED, pruneRowsNotInScope, pruneReviewCopyRows, readRows, type TrackerRow } from './tracker-xlsx.ts';
 
 let dir: string;
 let path: string;
@@ -115,5 +115,70 @@ describe('decision helpers', () => {
     assert.ok(isPublished('Published'));
     assert.ok(isPublished('published'));
     assert.ok(!isPublished('Ready To Publish'));
+  });
+});
+
+describe('pruneRowsNotInScope — narrowing scope must not destroy work', () => {
+  it('removes untouched candidate rows that fell out of scope', async () => {
+    const p = join(dir, 'scope.xlsx');
+    await upsertRows(p, [row('keep-1'), row('drop-1'), row('drop-2')]);
+    const r = await pruneRowsNotInScope(p, new Set(['keep-1']));
+    assert.equal(r.removed, 2);
+    const left = await readRows(p);
+    assert.deepEqual([...left.keys()].sort(), ['keep-1']);
+  });
+
+  it('NEVER removes a row carrying human input, even out of scope', async () => {
+    const p = join(dir, 'scope-human.xlsx');
+    await upsertRows(p, [row('a'), row('b')]);
+    // simulate a reviewer claiming row b
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    const ws = wb.getWorksheet('migration')!;
+    const hdr = new Map<string, number>();
+    ws.getRow(1).eachCell((c, i) => hdr.set(cellStr(c.value), i));
+    ws.getRow(3).getCell(hdr.get('reviewer')!).value = 'Alex';
+    await wb.xlsx.writeFile(p);
+
+    const r = await pruneRowsNotInScope(p, new Set<string>()); // nothing in scope
+    assert.equal(r.keptHuman, 1);
+    assert.equal(r.removed, 1);
+    const left = await readRows(p);
+    assert.ok(left.has('b'), 'the reviewed row must survive a scope change');
+  });
+
+  it('NEVER removes a row with work in flight', async () => {
+    const p = join(dir, 'scope-inflight.xlsx');
+    await upsertRows(p, [row('staged-1', { status: 'staged' }), row('verified-1', { status: 'verified' }), row('cand-1')]);
+    const r = await pruneRowsNotInScope(p, new Set<string>());
+    assert.equal(r.keptInFlight, 2);
+    assert.equal(r.removed, 1);
+    const left = await readRows(p);
+    assert.deepEqual([...left.keys()].sort(), ['staged-1', 'verified-1']);
+  });
+});
+
+describe('pruneReviewCopyRows', () => {
+  it('removes our own review copies but keeps any a human annotated', async () => {
+    const p = join(dir, 'copies.xlsx');
+    await upsertRows(p, [
+      row('orig-1'),
+      row('copy-1', { name: '[MIGRATION REVIEW] Dash A' }),
+      row('copy-2', { name: '[MIGRATION REVIEW] Dash B' }),
+    ]);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    const ws = wb.getWorksheet('migration')!;
+    const hdr = new Map<string, number>();
+    ws.getRow(1).eachCell((c, i) => hdr.set(cellStr(c.value), i));
+    ws.getRow(4).getCell(hdr.get('notes')!).value = 'checked this one';
+    await wb.xlsx.writeFile(p);
+
+    const r = await pruneReviewCopyRows(p, '[MIGRATION REVIEW] ');
+    assert.equal(r.removed, 1);
+    assert.equal(r.keptWithHumanInput.length, 1);
+    const left = await readRows(p);
+    assert.ok(left.has('orig-1'));
+    assert.ok(left.has('copy-2'), 'annotated copy is kept and reported');
   });
 });

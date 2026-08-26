@@ -24,7 +24,7 @@ import {
   type ParityCounts,
   type QueryDetailLike,
 } from '../lib/asset-confidence.ts';
-import { upsertRows, readExistingIds, pruneReviewCopyRows, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { upsertRows, readExistingIds, pruneReviewCopyRows, pruneRowsNotInScope, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { REVIEW_PREFIX } from '../lib/doc-apply.ts';
 
 export interface MigrateRefreshArgs {
@@ -147,11 +147,21 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
   // ids), and leaving them invites staging a review copy OF a review copy.
   const pruned = await pruneReviewCopyRows(trackerPath, REVIEW_PREFIX);
 
+  // Drop rows for assets no longer in scope. Narrowing the download (e.g.
+  // --used-within-days) changes what we scan, but upsertRows only adds and
+  // updates — without this the sheet would only ever grow. Human input and
+  // in-flight work are never pruned, whatever the scope says.
+  const scope = new Set(rows.map((r) => r.asset_id));
+  const outOfScope = await pruneRowsNotInScope(trackerPath, scope);
+
   const { updated, added } = await upsertRows(trackerPath, rows);
 
   console.log(`Refreshed migration tracker: ${trackerPath}`);
   console.log(`  assets: ${rows.length} (scanned: dashboards ${dashScan.length}, notebooks ${nbScan.length})`);
   console.log(`  rows: ${added} added, ${updated} updated`);
+  if (outOfScope.removed) console.log(`  removed ${outOfScope.removed} row(s) no longer in scope`);
+  if (outOfScope.keptHuman) console.log(`  kept ${outOfScope.keptHuman} out-of-scope row(s) carrying human input`);
+  if (outOfScope.keptInFlight) console.log(`  kept ${outOfScope.keptInFlight} out-of-scope row(s) with work in flight`);
   if (pruned.removed) console.log(`  removed ${pruned.removed} stale review-copy row(s) a previous refresh had enrolled`);
   for (const n of pruned.keptWithHumanInput) console.log(`  ! kept review-copy row with human input: ${n}`);
   if (skippedCopies) {
