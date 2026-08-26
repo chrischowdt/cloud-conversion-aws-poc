@@ -28,6 +28,7 @@ import {
 import { builtinToDqlClassic } from './schema-transforms.ts';
 import { correctServiceNamespace } from './service-namespace-corrections.ts';
 import { buildMzIndex, type MzTagIndex } from './mz-tags.ts';
+import { loadEnrichedTags, type EnrichedTagIndex } from './enriched-tags.ts';
 
 export type Aggregation = 'avg' | 'sum' | 'max' | 'min' | 'count';
 export type NewAggMode = 'raw' | 'per_second';
@@ -134,6 +135,12 @@ export interface RecipeIndex {
    * the predicate and blocking the panel.
    */
   mzTags?: MzTagIndex;
+  /**
+   * Tag keys the connection enriches onto METRIC series (`discover-tags`). Lets
+   * the rewriter read a tag as the native `aws.tags.<key>` dimension instead of
+   * a case-sensitive entity lookup that silently returns null.
+   */
+  enrichedTags?: EnrichedTagIndex;
 }
 
 export async function loadRecipeIndex(
@@ -145,6 +152,7 @@ export async function loadRecipeIndex(
     liveMetricsPath?: string;
     minOverrideSeries?: number;
     mzTagsPath?: string;
+    enrichedTagsPath?: string;
   } = {}
 ): Promise<RecipeIndex> {
   const file = JSON.parse(await readFile(path, 'utf8')) as MergedMappingFile;
@@ -181,6 +189,13 @@ export async function loadRecipeIndex(
     } catch {
       // Absent or malformed → mzName() simply stays untranslated, which is the
       // safe default (the panel keeps blocking rather than changing scope).
+    }
+  }
+  if (options.enrichedTagsPath) {
+    try {
+      result.enrichedTags = await loadEnrichedTags(options.enrichedTagsPath);
+    } catch {
+      // Absent/malformed → we keep the entity lookup, which is the status quo.
     }
   }
   return result;

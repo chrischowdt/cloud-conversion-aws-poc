@@ -22,6 +22,7 @@ import {
 } from '../lib/paths.ts';
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { mzTagsPathIfPresent } from '../lib/mz-tags.ts';
+import { enrichedTagsPathIfPresent } from '../lib/enriched-tags.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { runAssetScan, type ScanInputAsset } from '../lib/asset-scan-run.ts';
 import { extractDetectorQueries } from '../lib/asset-extractors.ts';
@@ -49,6 +50,7 @@ export async function runScanAnomalyDetectors(args: ScanAnomalyDetectorsArgs): P
     perKeyPath: SKILL_PER_KEY_AWS_METRICS,
     liveMetricsPath,
     mzTagsPath: mzTagsPathIfPresent(base),
+    enrichedTagsPath: enrichedTagsPathIfPresent(base),
     minOverrideSeries: args.minOverrideSeries,
   });
 

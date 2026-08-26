@@ -24,6 +24,8 @@ import {
   SKILL_PER_KEY_AWS_METRICS,
 } from '../lib/paths.ts';
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
+import { enrichedTagsPathIfPresent } from '../lib/enriched-tags.ts';
+import { mzTagsPathIfPresent } from '../lib/mz-tags.ts';
 import { loadRecipeIndex, lookupClassicKey, type RecipeIndex } from '../lib/recipe-lookup.ts';
 
 export interface RewriteDashboardArgs {
@@ -374,6 +376,8 @@ export async function runRewriteDashboard(args: RewriteDashboardArgs): Promise<{
     manualPath: SKILL_MANUAL_AWS_METRICS,
     perKeyPath: SKILL_PER_KEY_AWS_METRICS,
     liveMetricsPath,
+    enrichedTagsPath: enrichedTagsPathIfPresent(resolve(dirname(inputPath), '..', '..')),
+    mzTagsPath: mzTagsPathIfPresent(resolve(dirname(inputPath), '..', '..')),
     minOverrideSeries: args.minOverrideSeries,
   });
   if (liveMetricsPath) {

@@ -24,6 +24,7 @@ import {
 } from './aws-service-node-types.ts';
 import { parseSelector } from './classic-selector-parser.ts';
 import type { MzTagIndex } from './mz-tags.ts';
+import { enrichedTagDimension } from './enriched-tags.ts';
 import { translateSelector } from './classic-selector-translator.ts';
 import { lookupInDac, cloudwatchStatisticForNewKey, isAdditiveSumMetric } from './dac-lookup.ts';
 import { ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE } from './entity-field-mappings.ts';
@@ -987,6 +988,7 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // dim-field ref that auto-named its column), then drop duplicate columns/dims a
   // collapse may have produced in a fields/by:{} clause.
   rewritten = dropCustomDeviceGroup(rewritten, transforms);
+  rewritten = useEnrichedTagDims(rewritten, index, transforms, warnings);
   rewritten = pruneByDimsNotOnKey(rewritten, transforms, warnings);
   warnDeadMetricVariant(rewritten, index, warnings);
   rewritten = rewriteSmartscapeIdFilter(rewritten, transforms);
@@ -2549,4 +2551,69 @@ function warnDeadMetricVariant(input: string, index: RecipeIndex, warnings: Warn
       `Confirm which grain you want.`,
     match: key,
   });
+}
+
+// ─── Enriched tag reads → the native metric dimension ─────────────────────
+//
+// `getNodeField(<dim>, "tags:aws")[Key]` matches Key against the resource's real
+// AWS tags CASE-SENSITIVELY. Classic queries write whatever case the author
+// used, so we faithfully emit `[applicationci]` while the resource is tagged
+// `ApplicationCI` — and the read returns null. Silently: the filter matches
+// nothing, the column shows blank. Measured on this corpus: 151 such reads
+// across 20 dashboards.
+//
+// Case-correcting the key is not safe — AWS tag keys are case-sensitive and the
+// same logical tag exists in several casings at once (`env` on 34,026 lambdas,
+// `Env` on 182). The connection sidesteps it by lowercasing tags when it
+// enriches them onto the METRIC, so `aws.tags.env` covers every spelling and
+// reaches 99.8% of series.
+//
+// Scope, deliberately narrow:
+//   - only in a `timeseries` query — the dimension exists on metric series, not
+//     on entity records, so a smartscapeNodes/fetch query must keep the lookup
+//   - only for keys the tenant actually enriches (`discover-tags`); substituting
+//     a dimension that isn't there would turn a working filter into an empty one
+// Assignments keep their own column name (`| fieldsAdd appci = …`), so nothing
+// downstream gets renamed.
+const TAG_RECORD_READ =
+  /getNodeField\(\s*`?dt\.smartscape\.[a-z0-9_]+`?\s*,\s*"tags:aws"\s*\)\s*\[\s*([A-Za-z_][\w-]*)\s*\]/g;
+
+function useEnrichedTagDims(
+  input: string,
+  index: RecipeIndex,
+  transforms: Transform[],
+  warnings: Warning[]
+): string {
+  const enriched = index.enrichedTags;
+  if (!enriched || enriched.size === 0) return input;
+  if (!/\btimeseries\b/.test(input)) return input;      // metric queries only
+  if (/\bsmartscapeNodes\b|\bfetch\s+dt\./.test(input)) return input; // entity query — keep the lookup
+
+  const swapped = new Set<string>();
+  const out = input.replace(TAG_RECORD_READ, (full, key: string) => {
+    if (!enriched.has(key.toLowerCase())) return full;
+    const dim = `\`${enrichedTagDimension(key)}\``;
+    swapped.add(`${key} → ${enrichedTagDimension(key)}`);
+    return dim;
+  });
+
+  if (swapped.size) {
+    transforms.push({
+      kind: 'entity-dim',
+      before: 'getNodeField(x, "tags:aws")[Key]',
+      after: [...swapped].map((s) => s.split(' → ')[1]).join(', '),
+      detail:
+        'read the enriched tag as a native metric dimension instead of a case-sensitive entity lookup ' +
+        '(the entity record keys are real-cased, so a differently-cased read returns null)',
+    });
+    warnings.push({
+      kind: 'classic-selector-note',
+      text:
+        `Tag read${swapped.size > 1 ? 's' : ''} ${[...swapped].join(', ')} now use the enriched metric ` +
+        `dimension rather than a tags:aws entity lookup. The connection lowercases enriched tags, so this ` +
+        `matches whatever casing the resource used — but it only covers resources whose series carry the ` +
+        `tag. Spot-check the row count against the classic tile.`,
+    });
+  }
+  return out;
 }

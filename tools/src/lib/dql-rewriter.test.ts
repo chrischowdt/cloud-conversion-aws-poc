@@ -1645,3 +1645,53 @@ describe('rewriteDql — by-clause dims the new key does not carry', () => {
     assert.ok(!r.warnings.some((w) => w.kind === 'dim-not-carried'));
   });
 });
+
+describe('rewriteDql — enriched tag reads become native metric dimensions', () => {
+  const withTags = (entries: MappingEntry[] = []) => {
+    const idx = buildIndex(entries) as any;
+    idx.enrichedTags = new Set(['applicationci', 'env']);
+    return idx as RecipeIndex;
+  };
+
+  it('swaps a case-mismatched tag read for the native dim (the null-filter bug)', () => {
+    // tags:aws[applicationci] returns null on this tenant — the resources are
+    // tagged ApplicationCI — so the filter silently matched nothing.
+    const r = rewriteDql(
+      'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}\n' +
+        '| filter getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci] == "dys"',
+      withTags()
+    );
+    assert.ok(r.rewritten.includes('`aws.tags.applicationci` == "dys"'), r.rewritten);
+    assert.ok(!r.rewritten.includes('"tags:aws")[applicationci]'));
+  });
+
+  it('swaps a display read too — a null column is just as wrong as a null filter', () => {
+    const r = rewriteDql(
+      'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}\n' +
+        '| fieldsAdd appci = getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci]',
+      withTags()
+    );
+    // the assignment keeps its own column name — nothing downstream is renamed
+    assert.ok(r.rewritten.includes('appci = `aws.tags.applicationci`'), r.rewritten);
+  });
+
+  it('leaves a tag the tenant does NOT enrich as an entity lookup', () => {
+    const r = rewriteDql(
+      'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}\n' +
+        '| filter getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[CostCenter] == "x"',
+      withTags()
+    );
+    assert.ok(r.rewritten.includes('"tags:aws")[CostCenter]'), 'no native dim exists for it');
+  });
+
+  it('leaves ENTITY queries alone — the dimension only exists on metric series', () => {
+    const q = 'smartscapeNodes AWS_RDS_DBINSTANCE | filter getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci] == "dys"';
+    assert.equal(rewriteDql(q, withTags()).rewritten, q);
+  });
+
+  it('does nothing when the tenant has not been probed for enriched tags', () => {
+    const q = 'timeseries v=avg(cloud.aws.rds.deadlocks)\n| filter getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci] == "dys"';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.ok(r.rewritten.includes('"tags:aws")[applicationci]'), 'must not guess which tags are enriched');
+  });
+});

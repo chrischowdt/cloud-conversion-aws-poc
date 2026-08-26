@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { REPO_ROOT, SKILL_DAC_AWS_METRICS, SKILL_MANUAL_AWS_METRICS, SKILL_PER_KEY_AWS_METRICS } from '../lib/paths.ts';
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { mzTagsPathIfPresent } from '../lib/mz-tags.ts';
+import { enrichedTagsPathIfPresent } from '../lib/enriched-tags.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { isBlockingWarning } from '../lib/dql-rewriter.ts';
 import { rewriteDetector, detectorQuery } from '../lib/detector-rewrite.ts';
@@ -95,6 +96,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
     perKeyPath: SKILL_PER_KEY_AWS_METRICS,
     liveMetricsPath,
     mzTagsPath: mzTagsPathIfPresent(base),
+    enrichedTagsPath: enrichedTagsPathIfPresent(base),
     minOverrideSeries: args.minOverrideSeries,
   });
 
