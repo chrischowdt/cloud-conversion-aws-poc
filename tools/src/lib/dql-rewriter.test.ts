@@ -1695,3 +1695,27 @@ describe('rewriteDql — enriched tag reads become native metric dimensions', ()
     assert.ok(r.rewritten.includes('"tags:aws")[applicationci]'), 'must not guess which tags are enriched');
   });
 });
+
+describe('rewriteDql — classic AWS entity attributes', () => {
+  it('maps awsInstanceId to the aws.resource.id node field', () => {
+    const r = rewriteDql(
+      'fetch dt.entity.ec2_instance | fields iid = entityAttr(dt.entity.ec2_instance, "awsInstanceId")',
+      buildIndex([])
+    );
+    assert.ok(r.rewritten.includes('aws.resource.id'), r.rewritten);
+    assert.ok(!r.rewritten.includes('awsInstanceId'));
+  });
+
+  it('warns (does not invent a lookup) for attributes that live only in aws.object', () => {
+    // aws.object is sparse, so auto-generating a parse would silently drop every
+    // resource whose blob is missing.
+    const r = rewriteDql(
+      'fetch dt.entity.ec2_instance | fields t = entityAttr(dt.entity.ec2_instance, "awsInstanceType")',
+      buildIndex([])
+    );
+    const w = r.warnings.find((x) => x.match === 'awsInstanceType');
+    assert.ok(w, 'must warn');
+    assert.match(w.text, /aws\.object/);
+    assert.match(w.text, /silently\s+drop/);
+  });
+});

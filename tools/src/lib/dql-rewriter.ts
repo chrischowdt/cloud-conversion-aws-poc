@@ -989,6 +989,7 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // collapse may have produced in a fields/by:{} clause.
   rewritten = dropCustomDeviceGroup(rewritten, transforms);
   rewritten = useEnrichedTagDims(rewritten, index, transforms, warnings);
+  warnObjectOnlyAttributes(rewritten, warnings);
   rewritten = pruneByDimsNotOnKey(rewritten, transforms, warnings);
   warnDeadMetricVariant(rewritten, index, warnings);
   rewritten = rewriteSmartscapeIdFilter(rewritten, transforms);
@@ -2616,4 +2617,39 @@ function useEnrichedTagDims(
     });
   }
   return out;
+}
+
+// ─── Classic attributes that survive only inside the aws.object blob ──────
+//
+// A handful of classic AWS entity attributes have no field on the Smartscape
+// node at all. Their data lives in `aws.object`, a raw JSON blob of the AWS
+// describe-call — and that blob is SPARSE (absent on many nodes, tenant-probed),
+// so we will not auto-generate the lookup+parse: it would produce a query that
+// silently drops every resource whose blob is missing.
+//
+// Emitting a null read and saying nothing is worse though — reviewers hit
+// exactly this on CBS - EC2 Dashboard and hand-wrote
+//   | lookup [smartScapeNodes "AWS_EC2_INSTANCE"
+//             | parse aws.object, "JSON:json"
+//             | fields id, instance_type = json[configuration][instanceType]], …
+// so we name the path and let them decide whether the coverage is acceptable.
+const OBJECT_ONLY_ATTRS: Record<string, string> = {
+  awsInstanceType: 'aws.object -> configuration.instanceType',
+  awsRuntime: 'aws.object -> configuration.runtime',
+  awsSecurityGroup: 'aws.security_group.id (node field) or aws.object',
+  awsNameTag: '`tags:aws`[Name]',
+};
+
+function warnObjectOnlyAttributes(input: string, warnings: Warning[]): void {
+  for (const [attr, where] of Object.entries(OBJECT_ONLY_ATTRS)) {
+    if (!new RegExp(`\\b${attr}\\b`).test(input)) continue;
+    warnings.push({
+      kind: 'dim-not-carried',
+      text:
+        `\`${attr}\` has no field on the Smartscape node — it reads null. The value lives in ${where}. ` +
+        `Note that \`aws.object\` is populated on only some nodes, so a lookup+parse over it will silently ` +
+        `drop resources whose blob is missing; check the row count against the classic tile before relying on it.`,
+      match: attr,
+    });
+  }
 }

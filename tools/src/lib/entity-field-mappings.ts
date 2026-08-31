@@ -27,6 +27,16 @@ export const ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE: Record<string, FieldMapping[]> 
   AWS_ACCOUNT: [
     { classicField: 'awsAccountId', smartscapeField: 'aws.account.id', notes: 'Verified on tenant 2026-05-12.' },
   ],
+  AWS_EC2_INSTANCE: [
+    {
+      classicField: 'awsInstanceId',
+      smartscapeField: 'aws.resource.id',
+      notes:
+        'Tenant-probed 2026-08-31: aws.resource.id carries the i-… instance id on every EC2 node. ' +
+        'The metric dimension `InstanceId` holds the same value and is cheaper inside a timeseries, ' +
+        'but the node field also works in entity queries, so it is the general answer.',
+    },
+  ],
   AWS_RDS_DBINSTANCE: [
     {
       classicField: 'rdsEngine',
