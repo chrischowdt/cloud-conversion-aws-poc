@@ -42,6 +42,7 @@ import { runMigratePromote } from './commands/migrate-promote.ts';
 import { runMigrateVerify } from './commands/migrate-verify.ts';
 import { runMigrateRollback } from './commands/migrate-rollback.ts';
 import { runStageDetectors } from './commands/stage-detectors.ts';
+import { runMigrateMergeDrift } from './commands/migrate-merge-drift.ts';
 import { runDiscoverManagementZones } from './commands/discover-management-zones.ts';
 import type { ReviewBucket } from './lib/detector-notebook.ts';
 import { SHARED_OUT_DIR, tenantOutDir } from './lib/paths.ts';
@@ -209,6 +210,14 @@ COMMANDS
                     performs the write with a drift guard (--force to override)
                     + a pre-cutover snapshot. Flags: --apply, --force, --ids,
                     --limit.
+  migrate-merge-drift
+                    Reconcile reviewed copies whose ORIGINAL was edited during
+                    review, so promote can cut over WITHOUT --force. Merges
+                    (staged original, reviewed copy, live original): owner-only
+                    changes are adopted, migration-only changes kept, and
+                    conflicts keep the migration side but are always reported.
+                    Re-bases based_on_version so the drift guard passes honestly.
+                    Flags: --apply, --ids, --tracker.
   migrate-verify    Confirm a cutover landed (live version advanced). Marks
                     verified. Needs the admin token. Flags: --ids, --limit.
   migrate-rollback  Re-apply the pre-cutover snapshot (admin write) to revert a
@@ -672,6 +681,19 @@ async function main(): Promise<void> {
         trackerPath: getString(args.flags, 'tracker'),
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
+      });
+      return;
+    }
+    case 'migrate-merge-drift': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      const ids = getString(args.flags, 'ids');
+      await runMigrateMergeDrift({
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
+        trackerPath: getString(args.flags, 'tracker'),
+        ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+        apply: args.flags.get('apply') === true,
       });
       return;
     }
