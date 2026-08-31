@@ -33,6 +33,8 @@ export interface MigrateStageArgs {
   token: string;
   trackerPath?: string;
   ids?: string[];
+  /** Stage only this asset type. The tracker holds dashboards AND notebooks. */
+  assetType?: AssetType;
   limit?: number;
   apply?: boolean;
   /** Update already-staged copies in place (re-rewrite from original) instead of creating new ones. */
@@ -62,7 +64,8 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
   // e.g. to re-apply an improved rewrite to review dashboards already out there.
   const wantStatus = args.restage ? 'staged' : 'candidate';
   let candidates = [...rows.entries()]
-    .filter(([id, r]) => r['lane'] === 'review' && r['status'] === wantStatus && (!idFilter || idFilter.has(id)))
+    .filter(([id, r]) => r['lane'] === 'review' && r['status'] === wantStatus && (!idFilter || idFilter.has(id))
+      && (!args.assetType || (r['asset_type'] ?? 'dashboard') === args.assetType))
     .map(([id, r]) => ({
       id,
       type: (r['asset_type'] as AssetType) ?? 'dashboard',

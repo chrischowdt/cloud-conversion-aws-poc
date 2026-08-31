@@ -627,6 +627,7 @@ async function main(): Promise<void> {
         limit: getNumber(args.flags, 'limit'),
         apply: args.flags.get('apply') === true,
         restage: args.flags.get('restage') === true,
+        assetType: getString(args.flags, 'asset-type') as any,
         shareGroupId: getString(args.flags, 'share-group') ?? process.env.DT_SHARE_GROUP_ID,
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
