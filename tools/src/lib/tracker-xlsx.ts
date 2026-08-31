@@ -41,6 +41,7 @@ export const TOOL_COLUMNS = [
   { key: 'asset_id', header: 'asset_id', width: 40 },
   { key: 'asset_type', header: 'asset_type', width: 11 },
   { key: 'name', header: 'name', width: 44 },
+  { key: 'asset_url', header: 'asset_url', width: 48 },
   { key: 'owner', header: 'owner', width: 22 },
   { key: 'access_count', header: 'access_count', width: 12 },
   { key: 'last_accessed', header: 'last_accessed', width: 22 },
@@ -78,6 +79,12 @@ export interface TrackerRow {
   asset_id: string;
   asset_type: AssetType;
   name: string;
+  /**
+   * Deep link to the LIVE asset. Written as a plain URL string — Excel turns it
+   * into a clickable link on its own, which is enough here and keeps the sheet
+   * free of hyperlink objects that complicate reading it back.
+   */
+  asset_url?: string;
   owner?: string;
   access_count?: number;
   last_accessed?: string;
@@ -182,6 +189,7 @@ function ensureInstructions(wb: ExcelJS.Workbook): void {
     'REVIEW WORKFLOW (per assigned row):',
     '  1. Set decision = In Progress so others know it is taken.',
     '  2. Open the review copy — click "review_copy_url" (a COPY named "[MIGRATION REVIEW] …"; the original is untouched).',
+    '     To compare against the live original side by side, click "asset_url" — that is the dashboard as it is today.',
     '     Each converted tile shows the ORIGINAL classic query as a // comment above the migrated one, for reference.',
     '  3. Check the tiles render and the data looks right; fix anything wrong directly in that copy in the UI.',
     '  4. When correct, put your name in "reviewer", add any "notes", and set decision = Ready To Publish.',
@@ -458,4 +466,44 @@ export async function pruneRowsNotInScope(
   for (const n of doomed.sort((a, b) => b - a)) ws.spliceRows(n, 1);
   if (doomed.length) await wb.xlsx.writeFile(path);
   return { removed: doomed.length, keptHuman, keptInFlight };
+}
+
+/**
+ * Fill `asset_url` on any row that lacks one, deriving it from the row's own
+ * asset_id + asset_type.
+ *
+ * A refresh only writes rows it just scanned, so rows kept for other reasons —
+ * out-of-scope rows carrying human input, anything already published — would
+ * otherwise be the only ones in the sheet without a working link, which is
+ * exactly backwards: those are the rows people most want to open.
+ */
+export async function backfillAssetUrls(
+  path: string,
+  baseUrl: string,
+  sheetName = DEFAULT_SHEET
+): Promise<number> {
+  if (!existsSync(path) || !baseUrl) return 0;
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(path);
+  const ws = wb.getWorksheet(sheetName);
+  if (!ws) return 0;
+  const header = headerIndex(ws);
+  const idCol = header.get('asset_id');
+  const typeCol = header.get('asset_type');
+  const urlCol = header.get('asset_url');
+  if (!idCol || !urlCol) return 0;
+
+  const root = baseUrl.replace(/\/+$/, '');
+  let filled = 0;
+  ws.eachRow((row, n) => {
+    if (n === 1) return;
+    const id = cellStr(row.getCell(idCol).value).trim();
+    if (!id || cellStr(row.getCell(urlCol).value).trim()) return;
+    const type = typeCol ? cellStr(row.getCell(typeCol).value).trim() : 'dashboard';
+    const app = type === 'notebook' ? 'dynatrace.notebooks/notebook' : 'dynatrace.dashboards/dashboard';
+    row.getCell(urlCol).value = `${root}/ui/apps/${app}/${id}`;
+    filled++;
+  });
+  if (filled) await wb.xlsx.writeFile(path);
+  return filled;
 }

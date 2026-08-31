@@ -24,7 +24,7 @@ import {
   type ParityCounts,
   type QueryDetailLike,
 } from '../lib/asset-confidence.ts';
-import { upsertRows, readExistingIds, pruneReviewCopyRows, pruneRowsNotInScope, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { upsertRows, readExistingIds, pruneReviewCopyRows, pruneRowsNotInScope, backfillAssetUrls, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { REVIEW_PREFIX } from '../lib/doc-apply.ts';
 
 export interface MigrateRefreshArgs {
@@ -54,12 +54,23 @@ async function readJsonl<T>(path: string): Promise<T[]> {
     .map((l) => JSON.parse(l) as T);
 }
 
-async function readManifest(path: string): Promise<Map<string, ManifestEntry>> {
+async function readManifest(
+  path: string
+): Promise<{ entries: Map<string, ManifestEntry>; baseUrl?: string }> {
   const map = new Map<string, ManifestEntry>();
-  if (!existsSync(path)) return map;
-  const m = JSON.parse(await readFile(path, 'utf8')) as { entries?: ManifestEntry[] };
+  if (!existsSync(path)) return { entries: map };
+  const m = JSON.parse(await readFile(path, 'utf8')) as { entries?: ManifestEntry[]; baseUrl?: string };
   for (const e of m.entries ?? []) if (e.id) map.set(e.id, e);
-  return map;
+  // The download recorded which tenant it came from — that is where the deep
+  // links have to point, and it keeps this command offline (no --base-url).
+  return { entries: map, baseUrl: m.baseUrl };
+}
+
+/** Deep link to the live asset in the Dynatrace UI. */
+function assetUrl(baseUrl: string | undefined, type: AssetType, id: string): string | undefined {
+  if (!baseUrl) return undefined;
+  const app = type === 'dashboard' ? 'dynatrace.dashboards/dashboard' : 'dynatrace.notebooks/notebook';
+  return `${baseUrl.replace(/\/+$/, '')}/ui/apps/${app}/${id}`;
 }
 
 async function readCompareParity(dir: string): Promise<Map<string, ParityCounts>> {
@@ -92,8 +103,11 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
     );
   }
 
-  const dashManifest = await readManifest(join(base, 'dashboards', 'manifest.json'));
-  const nbManifest = await readManifest(join(base, 'notebooks', 'manifest.json'));
+  const dashMf = await readManifest(join(base, 'dashboards', 'manifest.json'));
+  const nbMf = await readManifest(join(base, 'notebooks', 'manifest.json'));
+  const dashManifest = dashMf.entries;
+  const nbManifest = nbMf.entries;
+  const tenantUrl = dashMf.baseUrl ?? nbMf.baseUrl;
   const parityById = await readCompareParity(join(base, 'dashboard-compare'));
   const existing = await readExistingIds(trackerPath);
 
@@ -122,6 +136,7 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
         asset_id: r.id,
         asset_type: type,
         name: r.name,
+        asset_url: assetUrl(tenantUrl, type, r.id),
         owner: mf?.owner,
         access_count: mf?.accessCount,
         last_accessed: mf?.lastAccessed,
@@ -156,9 +171,14 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
 
   const { updated, added } = await upsertRows(trackerPath, rows);
 
+  // Rows kept but not re-scanned (out-of-scope-with-human-input, already
+  // published) never pass through the upsert, so give them a link too.
+  const backfilled = tenantUrl ? await backfillAssetUrls(trackerPath, tenantUrl) : 0;
+
   console.log(`Refreshed migration tracker: ${trackerPath}`);
   console.log(`  assets: ${rows.length} (scanned: dashboards ${dashScan.length}, notebooks ${nbScan.length})`);
   console.log(`  rows: ${added} added, ${updated} updated`);
+  if (backfilled) console.log(`  filled asset_url on ${backfilled} row(s) the scan did not touch`);
   if (outOfScope.removed) console.log(`  removed ${outOfScope.removed} row(s) no longer in scope`);
   if (outOfScope.keptHuman) console.log(`  kept ${outOfScope.keptHuman} out-of-scope row(s) carrying human input`);
   if (outOfScope.keptInFlight) console.log(`  kept ${outOfScope.keptInFlight} out-of-scope row(s) with work in flight`);

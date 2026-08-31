@@ -182,3 +182,28 @@ describe('pruneReviewCopyRows', () => {
     assert.ok(left.has('copy-2'), 'annotated copy is kept and reported');
   });
 });
+
+describe('asset_url', () => {
+  it('is written as a plain URL so Excel auto-links it', async () => {
+    const p = join(dir, 'asseturl.xlsx');
+    const url = 'https://nic55601.apps.dynatrace.com/ui/apps/dynatrace.dashboards/dashboard/abc';
+    await upsertRows(p, [row('abc', { asset_url: url })]);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    const ws = wb.getWorksheet('migration')!;
+    const hdr = new Map<string, number>();
+    ws.getRow(1).eachCell((c, i) => hdr.set(cellStr(c.value), i));
+    const cell = ws.getRow(2).getCell(hdr.get('asset_url')!).value;
+    assert.equal(typeof cell, 'string', 'plain string, not a hyperlink object');
+    assert.equal(cell, url);
+  });
+
+  it('survives a refresh round-trip alongside human columns', async () => {
+    const p = join(dir, 'asseturl2.xlsx');
+    await upsertRows(p, [row('x', { asset_url: 'https://t/ui/apps/d/x' })]);
+    await upsertRows(p, [row('x', { asset_url: 'https://t/ui/apps/d/x', status: 'staged' })]);
+    const back = await readRows(p);
+    assert.equal(back.get('x')!['asset_url'], 'https://t/ui/apps/d/x');
+    assert.equal(back.get('x')!['status'], 'staged');
+  });
+});
