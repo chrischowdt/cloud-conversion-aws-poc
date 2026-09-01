@@ -43,6 +43,7 @@ export const TOOL_COLUMNS = [
   { key: 'name', header: 'name', width: 44 },
   { key: 'asset_url', header: 'asset_url', width: 48 },
   { key: 'owner', header: 'owner', width: 22 },
+  { key: 'owner_email', header: 'owner_email', width: 32 },
   { key: 'access_count', header: 'access_count', width: 12 },
   { key: 'last_accessed', header: 'last_accessed', width: 22 },
   { key: 'scan_clean', header: 'scan_clean', width: 10 },
@@ -86,6 +87,12 @@ export interface TrackerRow {
    */
   asset_url?: string;
   owner?: string;
+  /**
+   * The owner as a person. Resolved from the user UUID via `discover-users`;
+   * absent when that user has not run a query in the window, in which case the
+   * raw id in `owner` is still there.
+   */
+  owner_email?: string;
   access_count?: number;
   last_accessed?: string;
   scan_clean?: number;
@@ -502,6 +509,43 @@ export async function backfillAssetUrls(
     const type = typeCol ? cellStr(row.getCell(typeCol).value).trim() : 'dashboard';
     const app = type === 'notebook' ? 'dynatrace.notebooks/notebook' : 'dynatrace.dashboards/dashboard';
     row.getCell(urlCol).value = `${root}/ui/apps/${app}/${id}`;
+    filled++;
+  });
+  if (filled) await wb.xlsx.writeFile(path);
+  return filled;
+}
+
+/**
+ * Fill `owner_email` on any row that has an owner id but no email yet.
+ *
+ * Same reason as the asset_url backfill: a refresh only writes rows it just
+ * scanned, so rows kept for other reasons (out-of-scope-with-human-input,
+ * already published) would keep showing a bare UUID. Rows whose owner isn't in
+ * the index are left alone — the raw id stays, which is more useful than blank.
+ */
+export async function backfillOwnerEmails(
+  path: string,
+  users: Map<string, string>,
+  sheetName = DEFAULT_SHEET
+): Promise<number> {
+  if (!existsSync(path) || users.size === 0) return 0;
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(path);
+  const ws = wb.getWorksheet(sheetName);
+  if (!ws) return 0;
+  const header = headerIndex(ws);
+  const ownerCol = header.get('owner');
+  const emailCol = header.get('owner_email');
+  if (!ownerCol || !emailCol) return 0;
+
+  let filled = 0;
+  ws.eachRow((row, n) => {
+    if (n === 1) return;
+    if (cellStr(row.getCell(emailCol).value).trim()) return;
+    const owner = cellStr(row.getCell(ownerCol).value).trim();
+    const email = owner ? users.get(owner) : undefined;
+    if (!email) return;
+    row.getCell(emailCol).value = email;
     filled++;
   });
   if (filled) await wb.xlsx.writeFile(path);

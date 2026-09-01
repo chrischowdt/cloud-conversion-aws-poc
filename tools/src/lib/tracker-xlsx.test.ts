@@ -207,3 +207,21 @@ describe('asset_url', () => {
     assert.equal(back.get('x')!['status'], 'staged');
   });
 });
+
+describe('owner_email', () => {
+  it('is stored alongside the raw owner id, not instead of it', async () => {
+    const p = join(dir, 'owner.xlsx');
+    await upsertRows(p, [row('a', { owner: 'uuid-1', owner_email: 'someone@united.com' })]);
+    const back = await readRows(p);
+    assert.equal(back.get('a')!['owner'], 'uuid-1', 'raw id stays for traceability');
+    assert.equal(back.get('a')!['owner_email'], 'someone@united.com');
+  });
+
+  it('leaves owner_email empty when the user is unknown, keeping the id', async () => {
+    const p = join(dir, 'owner2.xlsx');
+    await upsertRows(p, [row('b', { owner: 'uuid-unknown' })]);
+    const back = await readRows(p);
+    assert.equal(back.get('b')!['owner'], 'uuid-unknown');
+    assert.ok(!back.get('b')!['owner_email']);
+  });
+});

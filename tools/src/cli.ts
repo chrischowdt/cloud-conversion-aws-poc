@@ -44,6 +44,7 @@ import { runMigrateRollback } from './commands/migrate-rollback.ts';
 import { runStageDetectors } from './commands/stage-detectors.ts';
 import { runMigrateMergeDrift } from './commands/migrate-merge-drift.ts';
 import { runDiscoverManagementZones } from './commands/discover-management-zones.ts';
+import { runDiscoverUsers } from './commands/discover-users.ts';
 import type { ReviewBucket } from './lib/detector-notebook.ts';
 import { SHARED_OUT_DIR, tenantOutDir } from './lib/paths.ts';
 import type { CloudProvider } from './lib/types.ts';
@@ -182,6 +183,11 @@ COMMANDS
                     group; falls back to environment-wide if neither is set.
                     Flags: --apply, --restage, --share-group <id>, --ids <a,b>,
                     --limit, --tracker.
+  discover-users     Harvest user id -> email pairs from query executions so the
+                    tracker can show WHO owns a dashboard instead of a UUID.
+                    Only users who ran a query in the window appear; an owner
+                    missing from it keeps their raw id. Writes <tenant>/users.json,
+                    picked up automatically by migrate-refresh. Flags: --days (90).
   discover-management-zones
                     Read classic management zones and reduce each to the AWS tag
                     predicates defining it, so mzName(...) in a classicEntitySelector
@@ -632,6 +638,16 @@ async function main(): Promise<void> {
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),
+      });
+      return;
+    }
+    case 'discover-users': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDiscoverUsers({
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
+        days: getNumber(args.flags, 'days'),
       });
       return;
     }

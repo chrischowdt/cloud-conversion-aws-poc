@@ -24,8 +24,9 @@ import {
   type ParityCounts,
   type QueryDetailLike,
 } from '../lib/asset-confidence.ts';
-import { upsertRows, readExistingIds, pruneReviewCopyRows, pruneRowsNotInScope, backfillAssetUrls, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { upsertRows, readExistingIds, pruneReviewCopyRows, pruneRowsNotInScope, backfillAssetUrls, backfillOwnerEmails, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { REVIEW_PREFIX } from '../lib/doc-apply.ts';
+import { loadUsers, usersPathIfPresent, emailForUser } from '../lib/users.ts';
 
 export interface MigrateRefreshArgs {
   outDir: string;
@@ -109,6 +110,8 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
   const nbManifest = nbMf.entries;
   const tenantUrl = dashMf.baseUrl ?? nbMf.baseUrl;
   const parityById = await readCompareParity(join(base, 'dashboard-compare'));
+  const usersPath = usersPathIfPresent(base);
+  const users = usersPath ? await loadUsers(usersPath) : undefined;
   const existing = await readExistingIds(trackerPath);
 
   const rows: TrackerRow[] = [];
@@ -138,6 +141,7 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
         name: r.name,
         asset_url: assetUrl(tenantUrl, type, r.id),
         owner: mf?.owner,
+        owner_email: emailForUser(users, mf?.owner),
         access_count: mf?.accessCount,
         last_accessed: mf?.lastAccessed,
         scan_clean: scan.clean,
@@ -174,10 +178,18 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
   // Rows kept but not re-scanned (out-of-scope-with-human-input, already
   // published) never pass through the upsert, so give them a link too.
   const backfilled = tenantUrl ? await backfillAssetUrls(trackerPath, tenantUrl) : 0;
+  const backfilledOwners = users ? await backfillOwnerEmails(trackerPath, users) : 0;
 
   console.log(`Refreshed migration tracker: ${trackerPath}`);
   console.log(`  assets: ${rows.length} (scanned: dashboards ${dashScan.length}, notebooks ${nbScan.length})`);
   console.log(`  rows: ${added} added, ${updated} updated`);
+  if (users?.size) {
+    const resolved = rows.filter((r) => r.owner_email).length;
+    console.log(`  owner_email resolved on ${resolved}/${rows.length} row(s) from ${users.size} known users`);
+  } else {
+    console.log("  (no users.json — run `cct discover-users` to show owners as emails)");
+  }
+  if (backfilledOwners) console.log(`  filled owner_email on ${backfilledOwners} row(s) the scan did not touch`);
   if (backfilled) console.log(`  filled asset_url on ${backfilled} row(s) the scan did not touch`);
   if (outOfScope.removed) console.log(`  removed ${outOfScope.removed} row(s) no longer in scope`);
   if (outOfScope.keptHuman) console.log(`  kept ${outOfScope.keptHuman} out-of-scope row(s) carrying human input`);
