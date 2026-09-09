@@ -836,10 +836,14 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
         const replacement = m.smartscapeField.includes('.')
           ? `\`${m.smartscapeField}\``
           : m.smartscapeField;
-        // Negative lookbehind `(?<![$\w.])` skips `$rdsEngine` (variable ref)
-        // and `lookup.rdsEngine`-style accesses where the leading char is a
-        // dot — those would produce an ambiguous parse after rename.
-        const re = new RegExp(`(?<![$\\w.])${m.classicField}\\b`, 'g');
+        // Negative lookbehind `(?<![$\w."])` skips `$rdsEngine` (variable ref),
+        // `lookup.rdsEngine`-style accesses where the leading char is a dot —
+        // those would produce an ambiguous parse after rename — and QUOTED
+        // names. A quoted occurrence is a `getNodeField(x, "field")` argument,
+        // where the backtick wrapping below would land INSIDE the string and
+        // produce `"` + "`aws.resource.id`" + `"`; renameNodeFieldArgs handles
+        // that form properly.
+        const re = new RegExp(`(?<![$\\w."])${m.classicField}\\b(?!")`, 'g');
         let changed = false;
         rewritten = rewritten.replace(re, () => {
           changed = true;
@@ -988,6 +992,7 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // dim-field ref that auto-named its column), then drop duplicate columns/dims a
   // collapse may have produced in a fields/by:{} clause.
   rewritten = dropCustomDeviceGroup(rewritten, transforms);
+  rewritten = renameNodeFieldArgs(rewritten, transforms);
   rewritten = useEnrichedTagDims(rewritten, index, transforms, warnings);
   warnObjectOnlyAttributes(rewritten, warnings);
   rewritten = pruneByDimsNotOnKey(rewritten, transforms, warnings);
@@ -2659,4 +2664,34 @@ function warnObjectOnlyAttributes(input: string, warnings: Warning[]): void {
       match: attr,
     });
   }
+}
+
+// ─── Classic field names inside getNodeField(dim, "…") ────────────────────
+//
+// The bare-identifier rename pass only runs when a `fetch` was rewritten to
+// `smartscapeNodes`, so a `timeseries` query keeps reading the CLASSIC field
+// name — `getNodeField(dt.smartscape.aws_ec2_instance, "awsInstanceId")` reads
+// null on the new node. It also wraps dotted replacements in backticks, which is
+// right for a bare identifier but produces `"` + "`aws.resource.id`" + `"` when
+// the name sits inside a quoted argument.
+//
+// This handles that form directly: the node type comes from the dimension
+// itself, so it works in every query shape, and the field name is substituted
+// as a plain quoted string.
+const NODE_FIELD_ARG = /getNodeField\(\s*(`?dt\.smartscape\.([a-z0-9_]+)`?)\s*,\s*"([^"]+)"\s*\)/g;
+
+function renameNodeFieldArgs(input: string, transforms: Transform[]): string {
+  return input.replace(NODE_FIELD_ARG, (full, dim: string, nodeLower: string, field: string) => {
+    const table = ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE[nodeLower.toUpperCase()];
+    const hit = table?.find((m) => m.classicField === field);
+    if (!hit) return full;
+    const repl = `getNodeField(${dim}, "${hit.smartscapeField}")`;
+    transforms.push({
+      kind: 'entity-dim',
+      before: `getNodeField(…, "${field}")`,
+      after: `getNodeField(…, "${hit.smartscapeField}")`,
+      detail: `${nodeLower.toUpperCase()} field rename${hit.notes ? ` (${hit.notes})` : ''}`,
+    });
+    return repl;
+  });
 }

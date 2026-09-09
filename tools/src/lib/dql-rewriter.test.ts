@@ -1744,3 +1744,29 @@ describe('rewriteDql — enriched tag dims are AWS-metric only', () => {
     assert.ok(r.rewritten.includes('`aws.tags.applicationci` == "dys"'), r.rewritten);
   });
 });
+
+describe('rewriteDql — classic field names inside getNodeField(dim, "…")', () => {
+  it('renames in a timeseries query, where the fetch-scoped pass never runs', () => {
+    const r = rewriteDql(
+      'timeseries v=avg(cloud.aws.ec2.cpu.usage), by:{dt.entity.ec2_instance}\n' +
+        '| fieldsAdd iid = entityAttr(dt.entity.ec2_instance, "awsInstanceId")',
+      buildIndex([])
+    );
+    assert.ok(r.rewritten.includes('"aws.resource.id"'), r.rewritten);
+    assert.ok(!r.rewritten.includes('awsInstanceId'));
+  });
+
+  it('does not leave backticks inside the quoted argument', () => {
+    const r = rewriteDql(
+      'fetch dt.entity.ec2_instance | fields iid = entityAttr(dt.entity.ec2_instance, "awsInstanceId")',
+      buildIndex([])
+    );
+    assert.ok(r.rewritten.includes('"aws.resource.id"'), r.rewritten);
+    assert.ok(!r.rewritten.includes('"`'), 'a backticked name inside quotes is not a field');
+  });
+
+  it('still backticks a dotted rename used as a BARE identifier', () => {
+    const r = rewriteDql('fetch dt.entity.relational_database_service | fields e = rdsEngine', buildIndex([]));
+    assert.ok(r.rewritten.includes('`db.system`'), r.rewritten);
+  });
+});
