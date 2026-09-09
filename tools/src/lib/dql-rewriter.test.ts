@@ -1719,3 +1719,28 @@ describe('rewriteDql — classic AWS entity attributes', () => {
     assert.match(w.text, /silently\s+drop/);
   });
 });
+
+describe('rewriteDql — enriched tag dims are AWS-metric only', () => {
+  const withTags = () => {
+    const idx = buildIndex([]) as any;
+    idx.enrichedTags = new Set(['applicationci', 'env']);
+    return idx as RecipeIndex;
+  };
+
+  it('does NOT substitute on a non-AWS (APM) metric — the dimension is null there', () => {
+    // Tenant-verified: aws.tags.applicationci is null on dt.service.request.*.
+    // Substituting would turn a working tag filter into one matching nothing.
+    const q =
+      'timeseries r = avg(dt.service.request.response_time, filter:{ getNodeField(dt.smartscape.service, "tags:aws")[applicationci] == "cuw" }), by:{dt.entity.service}';
+    assert.equal(rewriteDql(q, withTags()).rewritten, q);
+  });
+
+  it('still substitutes on an AWS metric', () => {
+    const r = rewriteDql(
+      'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}\n' +
+        '| filter getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci] == "dys"',
+      withTags()
+    );
+    assert.ok(r.rewritten.includes('`aws.tags.applicationci` == "dys"'), r.rewritten);
+  });
+});

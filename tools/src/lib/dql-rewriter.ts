@@ -2589,6 +2589,13 @@ function useEnrichedTagDims(
   if (!enriched || enriched.size === 0) return input;
   if (!/\btimeseries\b/.test(input)) return input;      // metric queries only
   if (/\bsmartscapeNodes\b|\bfetch\s+dt\./.test(input)) return input; // entity query — keep the lookup
+  // …and specifically an AWS metric. The connection enriches these tags onto AWS
+  // series only: on an APM metric `aws.tags.applicationci` is simply null
+  // (tenant-verified against dt.service.request.response_time), so substituting
+  // it there would turn a working tag filter into one that matches nothing.
+  // A service can legitimately carry `tags:aws` on its ENTITY while its metrics
+  // carry no AWS dimensions at all, which is exactly the case that bites.
+  if (!/\bcloud\.aws\./.test(input)) return input;
 
   const swapped = new Set<string>();
   const out = input.replace(TAG_RECORD_READ, (full, key: string) => {
