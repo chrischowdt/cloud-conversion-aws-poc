@@ -24,7 +24,7 @@ import {
   type ParityCounts,
   type QueryDetailLike,
 } from '../lib/asset-confidence.ts';
-import { upsertRows, readExistingIds, pruneReviewCopyRows, pruneRowsNotInScope, backfillAssetUrls, backfillOwnerEmails, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { upsertRows, readExistingIds, readRows, pruneReviewCopyRows, pruneRowsNotInScope, backfillAssetUrls, backfillOwnerEmails, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { REVIEW_PREFIX } from '../lib/doc-apply.ts';
 import { loadUsers, usersPathIfPresent, emailForUser } from '../lib/users.ts';
 
@@ -113,6 +113,8 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
   const usersPath = usersPathIfPresent(base);
   const users = usersPath ? await loadUsers(usersPath) : undefined;
   const existing = await readExistingIds(trackerPath);
+  const existingRows = await readRows(trackerPath);
+  let unblocked = 0, reblocked = 0;
 
   const rows: TrackerRow[] = [];
   const laneTally: Record<string, number> = {};
@@ -183,6 +185,8 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
   console.log(`Refreshed migration tracker: ${trackerPath}`);
   console.log(`  assets: ${rows.length} (scanned: dashboards ${dashScan.length}, notebooks ${nbScan.length})`);
   console.log(`  rows: ${added} added, ${updated} updated`);
+  if (unblocked) console.log(`  ${unblocked} row(s) blocked -> candidate (now convertible; stageable again)`);
+  if (reblocked) console.log(`  ${reblocked} row(s) candidate -> blocked (no longer auto-converts)`);
   if (users?.size) {
     const resolved = rows.filter((r) => r.owner_email).length;
     console.log(`  owner_email resolved on ${resolved}/${rows.length} row(s) from ${users.size} known users`);

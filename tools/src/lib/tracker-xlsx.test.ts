@@ -225,3 +225,21 @@ describe('owner_email', () => {
     assert.ok(!back.get('b')!['owner_email']);
   });
 });
+
+describe('status re-evaluation (blocked <-> candidate only)', () => {
+  it('leaves status untouched when the refresh omits it — how in-flight rows are protected', async () => {
+    // migrate-refresh decides WHETHER to send a status: only for new rows, or
+    // when an existing row is still blocked/candidate. For anything in flight it
+    // sends nothing, and upsertRows must then leave the cell alone — that is
+    // what keeps real workflow progress from being rewound.
+    const p = join(dir, 'restatus.xlsx');
+    await upsertRows(p, [row('in-flight', { status: 'staged' }), row('was-blocked', { status: 'blocked' })]);
+    await upsertRows(p, [
+      { asset_id: 'in-flight', asset_type: 'dashboard', name: 'Dash in-flight' }, // no status sent
+      { asset_id: 'was-blocked', asset_type: 'dashboard', name: 'Dash was-blocked', status: 'candidate' },
+    ]);
+    const back = await readRows(p);
+    assert.equal(back.get('in-flight')!['status'], 'staged', 'in-flight work must not be rewound');
+    assert.equal(back.get('was-blocked')!['status'], 'candidate', 'a no-longer-blocked row becomes stageable again');
+  });
+});
