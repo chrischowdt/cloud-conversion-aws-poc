@@ -1770,3 +1770,48 @@ describe('rewriteDql — classic field names inside getNodeField(dim, "…")', (
     assert.ok(r.rewritten.includes('`db.system`'), r.rewritten);
   });
 });
+
+describe('rewriteDql — non-AWS entity selectors lose classicEntitySelector too', () => {
+  it('translates a service tag selector against the CLASSIC dimension', () => {
+    // The SERVICE smartscape node carries no tags at all, so the AWS route
+    // (getNodeField(dim,"tags:aws")[k]) is null for every service. Reading the
+    // classic entity's own tag list is what actually matches — verified against
+    // the tenant at 150 rows either way.
+    const r = rewriteDql(
+      'timeseries v=avg(dt.service.request.response_time, filter:{in(dt.entity.service, classicEntitySelector("type(service),tag(\\"applicationci:cwi\\")"))}), by:{dt.entity.service}',
+      buildIndex([])
+    );
+    assert.ok(r.rewritten.includes('in("applicationci:cwi", entityAttr(dt.entity.service, "tags"))'), r.rewritten);
+    assert.ok(!r.rewritten.includes('classicEntitySelector'));
+    assert.ok(!r.rewritten.includes('tags:aws'), 'services have no tags:aws');
+  });
+
+  it('matches entityName case-INSENSITIVELY, as the classic selector does', () => {
+    // A plain contains() is case-sensitive and returned 349 of 454 services.
+    const r = rewriteDql(
+      'timeseries v=avg(dt.service.request.response_time, filter:{in(dt.entity.service, classicEntitySelector("type(service),entityName.contains(\\"Consumer\\")"))}), by:{dt.entity.service}',
+      buildIndex([])
+    );
+    assert.ok(r.rewritten.includes('caseSensitive: false'), r.rewritten);
+    assert.ok(!r.rewritten.includes('classicEntitySelector'));
+  });
+
+  it('preserves a [Context] tag prefix in the literal it matches', () => {
+    const r = rewriteDql(
+      'timeseries v=avg(dt.service.request.response_time, filter:{in(dt.entity.service, classicEntitySelector("type(service),tag(\\"[Environment]DT_RELEASE_STAGE:qa\\")"))}), by:{dt.entity.service}',
+      buildIndex([])
+    );
+    assert.ok(r.rewritten.includes('"[Environment]DT_RELEASE_STAGE:qa"'), r.rewritten);
+  });
+
+  it('leaves the selector INTACT when a predicate cannot be translated', () => {
+    // A half-converted filter would change what the tile matches — worse than
+    // leaving a working classic selector in place.
+    const r = rewriteDql(
+      'timeseries v=avg(dt.service.request.response_time, filter:{in(dt.entity.service, classicEntitySelector("type(service),mzName(\\"Some Zone\\")"))}), by:{dt.entity.service}',
+      buildIndex([])
+    );
+    assert.ok(r.rewritten.includes('classicEntitySelector'), 'kept whole');
+    assert.ok(r.warnings.some((w) => w.kind === 'classic-entity-selector'));
+  });
+});

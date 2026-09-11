@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { parseSelector } from './classic-selector-parser.ts';
-import { translateSelector } from './classic-selector-translator.ts';
+import { translateSelector, translateSelectorClassic } from './classic-selector-translator.ts';
 
 describe('parseSelector — predicate parsing', () => {
   it('parses simple type predicate', () => {
@@ -303,5 +303,52 @@ describe('parseSelector — malformed input must terminate (no hang)', () => {
     const r = parseSelector('entityName.in("a","b")');
     const p = r.find((x) => x.kind === 'entityName') as any;
     assert.deepEqual(p.values, ['a', 'b']);
+  });
+});
+
+describe('parseSelector — predicate names are case-insensitive', () => {
+  it('treats entityname / ENTITYNAME as the entityName predicate', () => {
+    // Real dashboards write it lowercase; matching case-sensitively pushed 383
+    // of these into the generic `attribute` branch and kept the selector.
+    for (const s of ['type(SERVICE),entityname.contains("x")', 'TYPE(HOST),ENTITYNAME.EQUALS("x")']) {
+      assert.ok(parseSelector(s).some((p) => p.kind === 'entityName'), s);
+    }
+  });
+
+  it('still treats a genuine attribute as an attribute', () => {
+    const p = parseSelector('type(service),servicetype("WEB_REQUEST_SERVICE")');
+    assert.ok(p.some((x) => x.kind === 'attribute'));
+  });
+});
+
+describe('translateSelectorClassic — non-AWS entities', () => {
+  it('reads a tag off the classic entity, not a Smartscape field', () => {
+    const t = translateSelectorClassic(
+      parseSelector('type(service),tag("applicationci:cwi")'),
+      'dt.entity.service'
+    );
+    assert.equal(t.complete, true);
+    assert.equal(t.filter, 'in("applicationci:cwi", entityAttr(dt.entity.service, "tags"))');
+  });
+
+  it('matches entityName case-insensitively, like the classic selector', () => {
+    const t = translateSelectorClassic(
+      parseSelector('type(service),entityName.contains("Consumer")'),
+      'dt.entity.service'
+    );
+    assert.match(t.filter, /caseSensitive: false/);
+  });
+
+  it('reads any other predicate with entityAttr', () => {
+    const t = translateSelectorClassic(
+      parseSelector('type(service),serviceType("WEB_REQUEST_SERVICE")'),
+      'dt.entity.service'
+    );
+    assert.equal(t.filter, 'entityAttr(dt.entity.service, "serviceType") == "WEB_REQUEST_SERVICE"');
+  });
+
+  it('reports incomplete when a predicate has no equivalent', () => {
+    const t = translateSelectorClassic(parseSelector('type(service),mzName("Z")'), 'dt.entity.service');
+    assert.equal(t.complete, false);
   });
 });

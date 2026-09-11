@@ -25,7 +25,7 @@ import {
 import { parseSelector } from './classic-selector-parser.ts';
 import type { MzTagIndex } from './mz-tags.ts';
 import { enrichedTagDimension } from './enriched-tags.ts';
-import { translateSelector } from './classic-selector-translator.ts';
+import { translateSelector, translateSelectorClassic } from './classic-selector-translator.ts';
 import { lookupInDac, cloudwatchStatisticForNewKey, isAdditiveSumMetric } from './dac-lookup.ts';
 import { ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE } from './entity-field-mappings.ts';
 import { classicEntityToSmartscape, lookupByDimRef, entityScope } from './entity-mappings.ts';
@@ -1086,8 +1086,35 @@ function rewriteClassicSelectorIns(
       // that needed to be reverted" — CUX Metrics, EA EKS, EDJ-Partner
       // Management). Leave them classic with a non-blocking note, exactly as
       // Pass 2's dim sweep already does.
+      // Non-AWS entity (APM service, host, …). We still remove the
+      // classicEntitySelector — nothing should depend on the classic selector
+      // engine — but we translate against the CLASSIC dimension rather than a
+      // Smartscape one. The SERVICE node carries no tags at all, so the
+      // Smartscape route that works for AWS silently matches nothing here.
+      // See translateSelectorClassic for the tenant-verified equivalences.
       if (entityScope(entityType) === 'non-aws') {
+        const ast = safeParseSelector(selectorStr);
+        const t = ast ? translateSelectorClassic(ast, cleanDim) : null;
+        if (t && t.filter && t.complete) {
+          transforms.push({
+            kind: 'classic-selector',
+            before: fullMatch,
+            after: t.filter,
+            detail: `non-AWS entity — translated against the classic dimension (${cleanDim}), no classicEntitySelector`,
+          });
+          for (const note of t.notes) {
+            warnings.push({ kind: 'classic-selector-note', text: note, reference: SKILL_REFS.massData });
+          }
+          result.push(t.filter);
+          i += fullMatch.length;
+          continue;
+        }
+        // Couldn't translate every predicate — leaving a HALF-converted filter
+        // would change what the tile matches, so keep it intact and say why.
         noteNonAwsEntity(warnings, entityType);
+        for (const note of t?.notes ?? []) {
+          warnings.push({ kind: 'classic-entity-selector', text: note, reference: SKILL_REFS.massData });
+        }
         result.push(fullMatch);
         i += fullMatch.length;
         continue;

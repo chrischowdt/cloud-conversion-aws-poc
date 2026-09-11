@@ -647,3 +647,112 @@ function translateTagForNode(
     note: `tag("${p.raw}") inside relationship — substring match; verify intent.`,
   };
 }
+
+// ─── Non-AWS entities: translate against the CLASSIC dimension ────────────
+//
+// `classicEntitySelector` has to go — it is the classic selector engine, and a
+// query that depends on it is a query that breaks when classic does. But the
+// Smartscape route we use for AWS does not exist for an APM service: the SERVICE
+// node carries only id / name / type / dt.security_context — no tags at all
+// (tenant-probed), so `getNodeField(dt.smartscape.service, "tags:aws")[k]` is
+// null for every service. Reviewers hand-wrote exactly that, and it silently
+// matched nothing.
+//
+// What DOES work is reading the classic entity's own attributes, which are still
+// first-class in Grail. Both forms below were verified against the tenant by
+// running them beside the selector they replace:
+//
+//   tag("applicationci:cwi")        150 rows  ==  in("applicationci:cwi", entityAttr(d,"tags"))        150
+//   entityName.contains("Consumer") 454 rows  ==  contains(entityName(d), "Consumer", caseSensitive:false) 454
+//
+// The case-insensitivity matters: classic entityName matching ignores case, and
+// a plain `contains()` is case-sensitive — it returned 349 of the 454, quietly
+// dropping a quarter of the services.
+
+/** Rebuild the literal tag string a classic tag predicate matches. */
+function classicTagLiteral(p: Predicate & { kind: 'tag' }): string | undefined {
+  if (!p.key || p.value === undefined) return undefined;
+  return `${p.context ? `[${p.context}]` : ''}${p.key}:${p.value}`;
+}
+
+function translatePredicateClassic(p: Predicate, dim: string): PredicateTranslation {
+  switch (p.kind) {
+    case 'type':
+      return {}; // implicit: the dimension is already that type
+
+    case 'tag': {
+      const literal = classicTagLiteral(p);
+      if (!literal) {
+        return {
+          note:
+            `tag("${p.raw}") has no key:value to match on the classic entity's tag list — a value-only tag ` +
+            `needs a substring match you should write by hand.`,
+        };
+      }
+      return { clause: `in(${jsonString(literal)}, entityAttr(${dim}, "tags"))` };
+    }
+
+    case 'entityName': {
+      const name = `entityName(${dim})`;
+      const v = p.values.map(jsonString);
+      // Classic name matching is case-INSENSITIVE; DQL's is not.
+      switch (p.op) {
+        case 'contains':
+          return { clause: v.length === 1
+            ? `contains(${name}, ${v[0]}, caseSensitive: false)`
+            : '(' + v.map((x) => `contains(${name}, ${x}, caseSensitive: false)`).join(' or ') + ')' };
+        case 'startsWith':
+          return { clause: v.length === 1
+            ? `startsWith(lower(${name}), lower(${v[0]}))`
+            : '(' + v.map((x) => `startsWith(lower(${name}), lower(${x}))`).join(' or ') + ')' };
+        case 'in':
+        case 'equals':
+          return { clause: v.length <= 1
+            ? `lower(${name}) == lower(${v[0] ?? '""'})`
+            : `in(lower(${name}), array(${v.map((x) => `lower(${x})`).join(', ')}))` };
+        default:
+          return { note: `entityName op "${p.op}" not translated for a classic entity — write it by hand.` };
+      }
+    }
+
+    case 'attribute': {
+      // Any other predicate is an attribute of the classic entity, readable
+      // with entityAttr. Verified on the tenant against the selector it
+      // replaces: serviceType("WEB_REQUEST_SERVICE") and
+      // entityAttr(d,"serviceType") == "WEB_REQUEST_SERVICE" both return 6,286
+      // rows, and entityAttr is case-INSENSITIVE on the attribute name, so we
+      // can pass the predicate through as the dashboard spelled it.
+      const ref = `entityAttr(${dim}, ${jsonString(p.predicate)})`;
+      return { clause: stringOpToClause(ref, p.op, p.values.map(jsonString)) };
+    }
+
+    case 'mz':
+      return {
+        note:
+          `${p.field}(${p.values.join(',')}) on a non-AWS entity — management zones have no equivalent and the ` +
+          `AWS tag reduction does not apply here. Rewrite using the underlying entity conditions.`,
+      };
+
+    default:
+      return { note: `"${p.kind}" predicate is not translated for a classic (non-AWS) entity — write it by hand.` };
+  }
+}
+
+/**
+ * Translate a selector against a CLASSIC dimension (`dt.entity.service`, …),
+ * for entities with no Smartscape equivalent worth targeting. Removes the
+ * dependency on `classicEntitySelector` without pretending the entity has
+ * Smartscape fields it does not.
+ */
+export function translateSelectorClassic(predicates: Predicate[], classicDim: string): TranslationResult {
+  const clauses: string[] = [];
+  const notes: string[] = [];
+  let complete = true;
+  for (const p of predicates) {
+    const t = translatePredicateClassic(p, classicDim);
+    if (t.clause) clauses.push(t.clause);
+    else if (p.kind !== 'type') complete = false;
+    if (t.note) notes.push(t.note);
+  }
+  return { filter: clauses.join(' and '), notes, complete };
+}

@@ -47,6 +47,25 @@ const ENTITY_ID_NAMES = new Set(['entityId']);
 const MZ_NAMES = new Set(['mzId', 'mzName', 'managementZoneId', 'managementZoneName', 'mz']);
 const HEALTH_STATE_NAMES = new Set(['healthState']);
 
+/**
+ * Classic selector predicate names are matched case-INSENSITIVELY by the
+ * platform, and real dashboards exploit that freely — `entityname.contains(…)`
+ * and `servicetype(…)` are both common. Comparing them case-sensitively made
+ * them fall through to the generic `attribute` branch, which is why 383
+ * entityName predicates were being treated as unknown attributes and kept their
+ * classicEntitySelector. Canonicalise before dispatch.
+ */
+const CANONICAL_PREDICATES = new Map<string, string>(
+  [
+    ...MODIFIERS, ...TAG_NAMES, ...TYPE_NAMES, ...ENTITY_NAME_NAMES,
+    ...ENTITY_ID_NAMES, ...MZ_NAMES, ...HEALTH_STATE_NAMES,
+  ].map((n) => [n.toLowerCase(), n])
+);
+
+function canonicalPredicate(name: string): string {
+  return CANONICAL_PREDICATES.get(name.toLowerCase()) ?? name;
+}
+
 class Parser {
   pos = 0;
   private readonly input: string;
@@ -70,7 +89,7 @@ class Parser {
 
   private parsePredicate(): Predicate {
     const start = this.pos;
-    const name = this.readIdent();
+    const name = canonicalPredicate(this.readIdent());
     if (!name) {
       const raw = this.consumeBalanced();
       return { kind: 'unknown', raw };
@@ -133,7 +152,8 @@ class Parser {
     return { kind: 'attribute', predicate: name, op, values };
   }
 
-  private buildPredicate(name: string, op: StringOp, values: string[]): Predicate {
+  private buildPredicate(rawName: string, op: StringOp, values: string[]): Predicate {
+    const name = canonicalPredicate(rawName);
     if (TYPE_NAMES.has(name)) return { kind: 'type', value: values[0] ?? '' };
     if (ENTITY_NAME_NAMES.has(name)) return { kind: 'entityName', op, values };
     if (ENTITY_ID_NAMES.has(name)) return { kind: 'entityId', op, values };
