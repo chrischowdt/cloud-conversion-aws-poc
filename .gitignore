@@ -2,10 +2,12 @@
 node_modules/
 *.log
 
-# Env / secrets
+# Env / secrets. Ignore EVERY .env variant, not just the ones we happen to use
+# today: a second tenant means a second credentials file (.env.prod, .env.stg,
+# …) and the old patterns would have left those committable.
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Tool generated outputs (regeneratable from source)
 tools/out/
