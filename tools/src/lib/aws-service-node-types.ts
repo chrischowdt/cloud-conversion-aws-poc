@@ -28,6 +28,7 @@ export const SERVICE_NODE_TYPE_MAP: Record<string, string> = {
   autoscaling: 'AWS_AUTOSCALING_AUTOSCALINGGROUP',
   backup: 'AWS_BACKUP_BACKUPVAULT',
   certificatemanager: 'AWS_ACM_CERTIFICATE',
+  cloudfront: 'AWS_CLOUDFRONT_DISTRIBUTION',
   cognito: 'AWS_COGNITO_IDENTITYPOOL',
   containerinsights: 'AWS_EKS_CLUSTER',
   dax: 'AWS_DAX_CLUSTER',
