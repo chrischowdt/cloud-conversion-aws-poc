@@ -1816,35 +1816,38 @@ describe('rewriteDql — non-AWS entity selectors lose classicEntitySelector too
   });
 });
 
-describe('bare `tags` column after a restructured AWS fetch', () => {
-  it('BLOCKS rather than silently converting to an empty result', () => {
-    // The classic entity exposes a `tags` column; the Smartscape node does not
-    // (it carries the `tags:aws` record). Converting the fetch without the tag
-    // read leaves a query that parses and returns nothing. Tenant-measured:
-    // classic 6 rows, `tags` 0, `tags:aws` 0, toString(`tags:aws`) 12.
+describe('`tags` is a record on the new side — string functions need toString()', () => {
+  it('wraps a bare tags argument passed to a string matcher', () => {
+    // Classic `tags` behaved like a string; the Smartscape column still exists
+    // but is a RECORD, so the un-wrapped call matches nothing. Tenant-measured
+    // on AWS_ECS_CLUSTER with "*fap*": classic 6, matchesPhrase(tags) 0,
+    // matchesPhrase(toString(tags)) 12.
     const r = rewriteDql(
       'fetch `dt.entity.cloud:aws:ecs` | fieldsAdd tags, id | filter matchesPhrase(tags,"*fap*")',
       buildIndex([])
     );
-    assert.ok(r.warnings.some((w) => w.kind === 'classic-tags-column'), 'must block');
+    assert.match(r.rewritten, /matchesPhrase\(toString\(tags\)/);
   });
 
-  it('does not fire on a converted fetch that never reads tags', () => {
+  it('leaves an already-wrapped tags read alone', () => {
     const r = rewriteDql(
-      'fetch `dt.entity.cloud:aws:ecs:cluster` | filter contains(entity.name, "ecp")',
+      'fetch `dt.entity.cloud:aws:ecs` | filter contains(toString(tags), "fap")',
       buildIndex([])
     );
-    assert.ok(!r.warnings.some((w) => w.kind === 'classic-tags-column'));
-    assert.match(r.rewritten, /smartscapeNodes AWS_ECS_CLUSTER/);
+    assert.ok(!/toString\(toString\(/.test(r.rewritten), r.rewritten);
   });
 
-  it('does not fire on `tags:aws` or a quoted "tags" argument', () => {
-    for (const q of [
-      'fetch `dt.entity.cloud:aws:ecs` | fields `tags:aws`',
-      'fetch `dt.entity.cloud:aws:ecs` | fieldsAdd t = getNodeField(id, "tags")',
-    ]) {
-      const r = rewriteDql(q, buildIndex([]));
-      assert.ok(!r.warnings.some((w) => w.kind === 'classic-tags-column'), q);
-    }
+  it('does not touch a self-defined tags column built from tags:aws', () => {
+    // This is the shape our own tag passes emit and it is already correct.
+    const r = rewriteDql(
+      'fetch `dt.entity.cloud:aws:ecs` | fieldsAdd tags = toString(getNodeField(id, "tags:aws")) | filter contains(tags, "bbt")',
+      buildIndex([])
+    );
+    assert.ok(!/toString\(toString\(/.test(r.rewritten), r.rewritten);
+  });
+
+  it('still converts the entity type itself', () => {
+    const r = rewriteDql('fetch `dt.entity.cloud:aws:ecs` | fields id', buildIndex([]));
+    assert.match(r.rewritten, /smartscapeNodes AWS_ECS_CLUSTER/);
   });
 });

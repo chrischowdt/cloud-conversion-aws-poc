@@ -56,7 +56,6 @@ export interface Warning {
     | 'classic-selector-note'
     | 'entity-relationship-traversal'
     | 'unmapped-entity-type'
-    | 'classic-tags-column'
     | 'entity-name-attr'
     | 'classic-id-literal'
     | 'recipe-aggregation-mismatch'
@@ -92,12 +91,6 @@ export const BLOCKING_WARNING_KINDS: ReadonlySet<Warning['kind']> = new Set([
   'classic-entity-selector',
   'entity-relationship-traversal',
   'classic-id-literal',
-  // A bare `tags` column left over from a classic fetch. Blocking on purpose:
-  // the Smartscape node carries `tags:aws` (a RECORD), so the converted query
-  // parses fine and returns ZERO rows. Verified on tenant: classic 6 rows,
-  // `tags` 0, `tags:aws` 0, `toString(`tags:aws`)` 12. A silent empty is the
-  // worst outcome — better to fail visibly and let a human write the read.
-  'classic-tags-column',
 ]);
 
 /** True when a warning means the query can't be auto-converted (vs a verify-me caveat). */
@@ -896,32 +889,31 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     }
   }
 
-  // Pass 2.75: a bare `tags` column surviving a restructured AWS fetch.
+  // Pass 2.75: `tags` is a RECORD on the new side — string functions need toString().
   //
-  // Classic `fetch dt.entity.cloud:aws:ecs` exposes a `tags` column that string
-  // functions read directly. The Smartscape node has no such column — it carries
-  // `tags:aws`, a RECORD. So the converted query PARSES and returns nothing,
-  // which is the worst possible outcome: it looks migrated and is silently empty.
+  // The classic entity's `tags` behaved like a string, so dashboards wrote
+  // `matchesPhrase(tags, "*fap*")` directly. The Smartscape node still HAS a
+  // `tags` column (verified: 2360/2360 ECS clusters and 36552 Lambdas carry it —
+  // an earlier version of this pass wrongly assumed it was missing and blocked
+  // 131 good queries). What changed is its TYPE: it is now a record, and passing
+  // a record to a string matcher yields zero rows silently.
   //
-  // Measured on the tenant with `matchesPhrase(<x>, "*fap*")` on AWS_ECS_CLUSTER:
-  //   classic `tags`            6 rows
-  //   `tags` (unchanged)        0 rows   <- what we would have shipped
-  //   `tags:aws`                0 rows   <- a plain rename is NOT enough
-  //   toString(`tags:aws`)     12 rows   <- the working read
-  //
-  // The correct replacement depends on context (`fieldsAdd tags` needs an alias,
-  // a string match needs the toString wrapper), so rather than guess we block and
-  // say exactly what to write.
-  if (fetchContext.didRewriteFetch && /(?<![$\w.`"])tags(?![\w:`"])/.test(rewritten)) {
-    warnings.push({
-      kind: 'classic-tags-column',
-      text:
-        'This query reads a bare `tags` column, which existed on the classic entity but NOT on the ' +
-        'Smartscape node — the node carries `tags:aws`, a record. Left as-is the query returns zero rows ' +
-        'silently. Use toString(`tags:aws`) for a string match (verified: 12 rows where the classic form ' +
-        'returned 6), or `tags:aws`[Key] to read one tag.',
-      reference: SKILL_REFS.typeMappings,
-    });
+  // Measured on AWS_ECS_CLUSTER with `*fap*`:
+  //   classic `tags`              6 rows
+  //   matchesPhrase(tags, …)      0 rows   <- record passed to a string matcher
+  //   matchesPhrase(toString(tags), …)  12 rows   <- the fix
+  if (fetchContext.didRewriteFetch) {
+    const STRING_FNS = /\b(matchesPhrase|matchesValue|contains|startsWith|endsWith|lower|upper)\(\s*tags\s*(?=[,)])/g;
+    if (STRING_FNS.test(rewritten)) {
+      STRING_FNS.lastIndex = 0;
+      rewritten = rewritten.replace(STRING_FNS, (_m, fn: string) => `${fn}(toString(tags)`);
+      transforms.push({
+        kind: 'entity-dim',
+        before: 'tags',
+        after: 'toString(tags)',
+        detail: 'tags is a record on the new side; string functions need toString() or they match nothing',
+      });
+    }
   }
 
   // Pass 2.8: by-clause / non-carrier dim alignment.
