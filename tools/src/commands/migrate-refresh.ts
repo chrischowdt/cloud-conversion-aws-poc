@@ -155,8 +155,24 @@ export async function runMigrateRefresh(args: MigrateRefreshArgs): Promise<void>
         priority,
         reasons: conf.reasons.join('; '),
       };
-      // Only set status for brand-new assets — never reset workflow progress.
-      if (!existing.has(r.id)) row.status = conf.level === 'blocked' ? 'blocked' : 'candidate';
+      // Status for brand-new assets. For EXISTING ones, only the two
+      // not-yet-started states are re-evaluated: as the rewriter improves, an
+      // asset first seen as `blocked` can become convertible, but its status was
+      // frozen at first sight, so migrate-stage (which selects status=candidate)
+      // would never pick it up again. The reverse can happen too. Anything in
+      // flight — staged / in-review / promoted / verified — is never touched;
+      // that is real workflow progress and rewinding it would discard review work.
+      const wantStatus = conf.level === 'blocked' ? 'blocked' : 'candidate';
+      if (!existing.has(r.id)) {
+        row.status = wantStatus;
+      } else {
+        const current = String(existingRows.get(r.id)?.['status'] ?? '').trim();
+        if ((current === 'blocked' || current === 'candidate') && current !== wantStatus) {
+          row.status = wantStatus;
+          if (wantStatus === 'candidate') unblocked++;
+          else reblocked++;
+        }
+      }
       rows.push(row);
     }
   };

@@ -26,6 +26,7 @@ import { buildApply, type AssetType } from '../lib/doc-apply.ts';
 import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { findOriginal } from '../lib/migrate-support.ts';
 import { readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { canonicalDecision } from '../lib/decision-states.ts';
 
 export interface MigrateStageArgs {
   outDir: string;
@@ -63,8 +64,22 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
   // copies already published (status=staged, with a review_copy_id) in place —
   // e.g. to re-apply an improved rewrite to review dashboards already out there.
   const wantStatus = args.restage ? 'staged' : 'candidate';
+  // A reviewer who marked an asset `Descope` has decided it should not be
+  // migrated at all. Status alone doesn't carry that: an asset can sit at
+  // status=candidate (the tool's view: convertible) while the human has already
+  // ruled it out, so without this check we would publish a review copy of
+  // something nobody wants and put it back in front of the team.
+  const descoped = [...rows.entries()].filter(
+    ([id, r]) =>
+      canonicalDecision(r['decision'] as string | undefined) === 'Descope' &&
+      r['lane'] === 'review' &&
+      r['status'] === wantStatus &&
+      (!idFilter || idFilter.has(id))
+  );
+
   let candidates = [...rows.entries()]
     .filter(([id, r]) => r['lane'] === 'review' && r['status'] === wantStatus && (!idFilter || idFilter.has(id))
+      && canonicalDecision(r['decision'] as string | undefined) !== 'Descope'
       && (!args.assetType || (r['asset_type'] ?? 'dashboard') === args.assetType))
     .map(([id, r]) => ({
       id,
@@ -72,6 +87,9 @@ export async function runMigrateStage(args: MigrateStageArgs): Promise<void> {
       name: r['name'] ?? id,
       copyId: (r['review_copy_id'] as string | undefined) || undefined,
     }));
+  for (const [, r] of descoped) {
+    console.log(`  skipping "${r['name'] ?? ''}" — a reviewer marked it Descope`);
+  }
   if (args.restage) candidates = candidates.filter((c) => c.copyId);
   if (args.limit) candidates = candidates.slice(0, args.limit);
 
