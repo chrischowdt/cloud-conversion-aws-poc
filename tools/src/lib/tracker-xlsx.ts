@@ -18,7 +18,8 @@
  * Node-only (exceljs + fs) — not part of the App-portable core.
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, copyFileSync, readdirSync, unlinkSync, statSync } from 'node:fs';
+import { dirname, basename, join as joinPath } from 'node:path';
 import ExcelJS from 'exceljs';
 
 export type AssetType = 'dashboard' | 'notebook';
@@ -126,6 +127,45 @@ export interface Decision {
 }
 
 const DEFAULT_SHEET = 'migration';
+
+/**
+ * Snapshot the tracker before the first write of this process.
+ *
+ * Every mutating helper here rewrites the WHOLE workbook, and the file usually
+ * lives in a synced folder that reviewers also have open — so a bad run, or a
+ * run that races a reviewer's save, can only be undone if a copy exists. A
+ * refresh performs several writes in a row; we snapshot once, before the first,
+ * so the backup is the state we started from rather than a half-updated file.
+ *
+ * Keeps the newest BACKUPS_KEPT snapshots and prunes the rest, so a folder that
+ * people actually browse does not fill up with them.
+ */
+const BACKUPS_KEPT = 5;
+const backedUpThisRun = new Set<string>();
+
+export function snapshotTracker(path: string): string | undefined {
+  if (!existsSync(path) || backedUpThisRun.has(path)) return undefined;
+  backedUpThisRun.add(path);
+  const dir = dirname(path);
+  const base = basename(path).replace(/\.xlsx$/i, '');
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const dest = joinPath(dir, `${base}.autobackup-${stamp}.xlsx`);
+  try {
+    copyFileSync(path, dest);
+  } catch {
+    return undefined; // a backup must never block the actual work
+  }
+  try {
+    const mine = readdirSync(dir)
+      .filter((f) => f.startsWith(`${base}.autobackup-`) && f.endsWith('.xlsx'))
+      .map((f) => ({ f, t: statSync(joinPath(dir, f)).mtimeMs }))
+      .sort((a, b) => b.t - a.t);
+    for (const old of mine.slice(BACKUPS_KEPT)) unlinkSync(joinPath(dir, old.f));
+  } catch {
+    /* pruning is best-effort */
+  }
+  return dest;
+}
 
 /** Coerce any exceljs cell value to a plain string. */
 export function cellStr(v: ExcelJS.CellValue): string {
@@ -283,6 +323,7 @@ export async function upsertRows(
   }
 
   applyDecisionDropdown(ws, header);
+  snapshotTracker(path);
   await wb.xlsx.writeFile(path);
   return { updated, added };
 }
@@ -421,7 +462,7 @@ export async function pruneReviewCopyRows(
 
   // Splice from the bottom so earlier row numbers stay valid.
   for (const n of doomed.sort((a, b) => b - a)) ws.spliceRows(n, 1);
-  if (doomed.length) await wb.xlsx.writeFile(path);
+  if (doomed.length) { snapshotTracker(path); await wb.xlsx.writeFile(path); }
   return { removed: doomed.length, keptWithHumanInput: kept };
 }
 
@@ -471,7 +512,7 @@ export async function pruneRowsNotInScope(
   });
 
   for (const n of doomed.sort((a, b) => b - a)) ws.spliceRows(n, 1);
-  if (doomed.length) await wb.xlsx.writeFile(path);
+  if (doomed.length) { snapshotTracker(path); await wb.xlsx.writeFile(path); }
   return { removed: doomed.length, keptHuman, keptInFlight };
 }
 
@@ -511,7 +552,7 @@ export async function backfillAssetUrls(
     row.getCell(urlCol).value = `${root}/ui/apps/${app}/${id}`;
     filled++;
   });
-  if (filled) await wb.xlsx.writeFile(path);
+  if (filled) { snapshotTracker(path); await wb.xlsx.writeFile(path); }
   return filled;
 }
 
@@ -548,6 +589,6 @@ export async function backfillOwnerEmails(
     row.getCell(emailCol).value = email;
     filled++;
   });
-  if (filled) await wb.xlsx.writeFile(path);
+  if (filled) { snapshotTracker(path); await wb.xlsx.writeFile(path); }
   return filled;
 }

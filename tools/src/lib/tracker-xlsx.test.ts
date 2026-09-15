@@ -2,10 +2,11 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readdir } from 'node:fs/promises';
 import { rm, mkdtemp } from 'node:fs/promises';
 
 import ExcelJS from 'exceljs';
-import { upsertRows, readDecisions, cellStr, isReadyToPublish, isPublished, PUBLISHED, pruneRowsNotInScope, pruneReviewCopyRows, readRows, type TrackerRow } from './tracker-xlsx.ts';
+import { upsertRows, readDecisions, cellStr, isReadyToPublish, isPublished, PUBLISHED, pruneRowsNotInScope, pruneReviewCopyRows, readRows, type TrackerRow, snapshotTracker } from './tracker-xlsx.ts';
 
 let dir: string;
 let path: string;
@@ -241,5 +242,24 @@ describe('status re-evaluation (blocked <-> candidate only)', () => {
     const back = await readRows(p);
     assert.equal(back.get('in-flight')!['status'], 'staged', 'in-flight work must not be rewound');
     assert.equal(back.get('was-blocked')!['status'], 'candidate', 'a no-longer-blocked row becomes stageable again');
+  });
+});
+
+describe('snapshotTracker', () => {
+  it('copies the file before the first write, once per run', async () => {
+    // Every mutating helper rewrites the whole workbook, and the tracker lives
+    // in a synced folder reviewers also have open. Without a copy on disk a bad
+    // run is unrecoverable. A refresh writes several times; we want ONE snapshot
+    // of the pre-run state, not one per write.
+    const p = join(dir, 'snap.xlsx');
+    await upsertRows(p, [row('a', { status: 'candidate' })]);
+    await upsertRows(p, [row('a', { status: 'staged' })]);
+    await upsertRows(p, [row('a', { status: 'verified' })]);
+    const backups = (await readdir(dir)).filter((f) => f.startsWith('snap.autobackup-'));
+    assert.equal(backups.length, 1, `expected one snapshot, got: ${backups.join(', ')}`);
+  });
+
+  it('does not invent a backup for a file that does not exist', () => {
+    assert.equal(snapshotTracker(join(dir, 'absent.xlsx')), undefined);
   });
 });
