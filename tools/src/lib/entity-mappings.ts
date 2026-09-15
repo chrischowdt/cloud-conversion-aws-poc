@@ -106,6 +106,17 @@ export const AWS_ENTITY_MAPPINGS: EntityMapping[] = [
   { classicEntityType: 'cloud:aws:sns',                   smartscapeDimension: 'dt.smartscape.aws_sns_topic',                            smartscapeNodeType: 'AWS_SNS_TOPIC',                               status: 'available', source: 'dt-migration' },
   { classicEntityType: 'cloud:aws:cloud_front',           smartscapeDimension: 'dt.smartscape.aws_cloudfront_distribution',              smartscapeNodeType: 'AWS_CLOUDFRONT_DISTRIBUTION',                 status: 'available', source: 'dt-migration' },
   { classicEntityType: 'cloud:aws:nat_gateway',           smartscapeDimension: 'dt.smartscape.aws_ec2_natgateway',                       smartscapeNodeType: 'AWS_EC2_NATGATEWAY',                          status: 'available', source: 'dt-migration' },
+  // Found blocking real dashboards on the lower tenant: these three are AWS
+  // entity types that were simply absent from the table, so every query using
+  // them reported `unmapped-entity-type` and the whole asset stayed in the
+  // blocked lane. Node types probed on the tenant, not assumed:
+  // AWS_ECS_CLUSTER 2360 nodes, AWS_EMR_CLUSTER 233, AWS_MSK_CLUSTER 132.
+  // `AWS_KAFKA_CLUSTER` does not exist — classic `cloud:aws:kafka` is MSK.
+  // EMR nodes carry an empty `name`; the mapping is still correct, but a
+  // converted query that displays the name will look blank.
+  { classicEntityType: 'cloud:aws:ecs:cluster',           smartscapeDimension: 'dt.smartscape.aws_ecs_cluster',                          smartscapeNodeType: 'AWS_ECS_CLUSTER',                             status: 'available', source: 'discovered' },
+  { classicEntityType: 'cloud:aws:emr',                   smartscapeDimension: 'dt.smartscape.aws_emr_cluster',                          smartscapeNodeType: 'AWS_EMR_CLUSTER',                             status: 'available', source: 'discovered', notes: 'nodes have an empty name on the tenant' },
+  { classicEntityType: 'cloud:aws:kafka',                 smartscapeDimension: 'dt.smartscape.aws_msk_cluster',                          smartscapeNodeType: 'AWS_MSK_CLUSTER',                             status: 'available', source: 'discovered', notes: 'classic kafka == MSK' },
   { classicEntityType: 'cloud:aws:eks:cluster',           smartscapeDimension: 'dt.smartscape.aws_eks_cluster',                          smartscapeNodeType: 'AWS_EKS_CLUSTER',                             status: 'available', source: 'dt-migration' },
   { classicEntityType: 'cloud:aws:dynamodb',              smartscapeDimension: 'dt.smartscape.aws_dynamodb_table',                       smartscapeNodeType: 'AWS_DYNAMODB_TABLE',                          status: 'available', source: 'dt-migration', notes: 'alias of dynamo_db_table' },
   { classicEntityType: 'cloud:aws:redshift',              smartscapeDimension: 'dt.smartscape.aws_redshift_cluster',                     smartscapeNodeType: 'AWS_REDSHIFT_CLUSTER',                        status: 'available', source: 'dt-migration' },
