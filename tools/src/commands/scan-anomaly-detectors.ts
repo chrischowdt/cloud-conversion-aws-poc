@@ -23,6 +23,7 @@ import {
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { mzTagsPathIfPresent } from '../lib/mz-tags.ts';
 import { enrichedTagsPathIfPresent } from '../lib/enriched-tags.ts';
+import { entityCandidatesPathIfPresent } from '../lib/entity-candidates.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { runAssetScan, type ScanInputAsset } from '../lib/asset-scan-run.ts';
 import { extractDetectorQueries } from '../lib/asset-extractors.ts';
@@ -51,6 +52,7 @@ export async function runScanAnomalyDetectors(args: ScanAnomalyDetectorsArgs): P
     liveMetricsPath,
     mzTagsPath: mzTagsPathIfPresent(base),
     enrichedTagsPath: enrichedTagsPathIfPresent(base),
+    entityCandidatesPath: entityCandidatesPathIfPresent(base),
     minOverrideSeries: args.minOverrideSeries,
   });
 

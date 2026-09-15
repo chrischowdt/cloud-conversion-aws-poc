@@ -29,6 +29,8 @@ import { builtinToDqlClassic } from './schema-transforms.ts';
 import { correctServiceNamespace } from './service-namespace-corrections.ts';
 import { buildMzIndex, type MzTagIndex } from './mz-tags.ts';
 import { loadEnrichedTags, type EnrichedTagIndex } from './enriched-tags.ts';
+import { loadEntityCandidates } from './entity-candidates.ts';
+import { registerDiscoveredMappings } from './entity-mappings.ts';
 
 export type Aggregation = 'avg' | 'sum' | 'max' | 'min' | 'count';
 export type NewAggMode = 'raw' | 'per_second';
@@ -153,6 +155,12 @@ export async function loadRecipeIndex(
     minOverrideSeries?: number;
     mzTagsPath?: string;
     enrichedTagsPath?: string;
+    /**
+     * Verified classic->Smartscape entity mappings from
+     * `discover-entity-candidates`. Registered into the entity table rather
+     * than stored on the index: the entity passes look the table up directly.
+     */
+    entityCandidatesPath?: string;
   } = {}
 ): Promise<RecipeIndex> {
   const file = JSON.parse(await readFile(path, 'utf8')) as MergedMappingFile;
@@ -196,6 +204,13 @@ export async function loadRecipeIndex(
       result.enrichedTags = await loadEnrichedTags(options.enrichedTagsPath);
     } catch {
       // Absent/malformed → we keep the entity lookup, which is the status quo.
+    }
+  }
+  if (options.entityCandidatesPath) {
+    try {
+      registerDiscoveredMappings(await loadEntityCandidates(options.entityCandidatesPath));
+    } catch {
+      // Absent/malformed → the curated table stands on its own, as before.
     }
   }
   return result;

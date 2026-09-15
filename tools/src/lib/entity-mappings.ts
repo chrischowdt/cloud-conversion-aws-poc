@@ -132,6 +132,38 @@ const BY_CLASSIC_TYPE = new Map(
 );
 
 /**
+ * Add mappings discovered from the product team's entity file and VERIFIED
+ * against a tenant (see `entity-candidates.ts` / `discover-entity-candidates`).
+ *
+ * Curated entries always win: this only fills gaps. A hand-written row carries
+ * knowledge the derived name cannot — `cloud:aws:kafka` is MSK, EMR nodes have
+ * an empty `name` — so a derived entry must never overwrite one.
+ *
+ * Returns how many were actually added, so callers can report honestly rather
+ * than implying the whole file was adopted.
+ */
+export function registerDiscoveredMappings(
+  discovered: Array<{ classicEntityType: string; smartscapeNodeType: string; smartscapeDimension: string }>
+): number {
+  let added = 0;
+  for (const d of discovered) {
+    const key = d.classicEntityType.toLowerCase();
+    if (BY_CLASSIC_TYPE.has(key)) continue;
+    if (!d.smartscapeNodeType || !d.smartscapeNodeType.startsWith('AWS_')) continue;
+    BY_CLASSIC_TYPE.set(key, {
+      classicEntityType: key,
+      smartscapeDimension: d.smartscapeDimension || `dt.smartscape.${d.smartscapeNodeType.toLowerCase()}`,
+      smartscapeNodeType: d.smartscapeNodeType,
+      status: 'available',
+      source: 'discovered',
+      notes: 'derived from the skill entity file, node type verified on the tenant',
+    });
+    added++;
+  }
+  return added;
+}
+
+/**
  * Look up by `dt.entity.<type>` segment (the part after `dt.entity.`).
  * Case-insensitive — the classic API accepts both forms (e.g., `type("HOST")`
  * and `type("host")`) and we want to be robust to either.
@@ -172,10 +204,27 @@ export type EntityScope = 'aws' | 'non-aws' | 'unknown';
  * `classicType` may be a bare type (`process_group_instance`) or a full ref
  * (`dt.entity.process_group_instance`, backticked or not).
  */
+/**
+ * Types that cannot be AWS, recognised WITHOUT a table entry.
+ *
+ * A type we've never catalogued used to fall through as `unknown`, which the
+ * rewriter treats as a BLOCKING `unmapped-entity-type`. For a vendor or
+ * other-cloud entity that is the wrong answer twice over: it can never be
+ * migrated by this AWS automation, and blocking on it labels the whole asset
+ * "manual rebuild" when its AWS content may convert perfectly well. Measured on
+ * the two tenants: 753 and 865 such references, holding 1 and 12 assets
+ * respectively in the blocked lane with nothing else wrong.
+ *
+ * Deliberately a prefix/vendor list, not a guess at AWS-ness: matching here only
+ * downgrades a blocker to a note, and anything unrecognised still blocks.
+ */
+const CANNOT_BE_AWS =
+  /^(ibmmq:|tibco:|f5:|solace|custom:solace|geoloc_site|mobile_application|application_method|multiprotocol_monitor|synthetic|http_check|vmware_|gcp_|cloud:gcp:|azure_|cloud:azure:|sql:|elasticsearch|kubernetes|cloud_application|openshift|citrix|sap|oracle|mssql|mysql|db2|nagios|zos|cics|ims|relic|appd)/;
+
 export function entityScope(classicType: string): EntityScope {
   const t = classicType.replace(/^`/, '').replace(/`$/, '').replace(/^dt\.entity\./, '').toLowerCase();
   const m = classicEntityToSmartscape(t);
-  if (!m) return 'unknown';
+  if (!m) return CANNOT_BE_AWS.test(t) ? 'non-aws' : 'unknown';
   if (m.smartscapeNodeType.startsWith('AWS_')) return 'aws';
   if (m.smartscapeNodeType !== '') return 'non-aws';
   return NON_AWS_NOT_PLANNED.has(t) ? 'non-aws' : 'aws';

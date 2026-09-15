@@ -35,6 +35,7 @@ import {
 } from '../lib/paths.ts';
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { enrichedTagsPathIfPresent } from '../lib/enriched-tags.ts';
+import { entityCandidatesPathIfPresent } from '../lib/entity-candidates.ts';
 import { mzTagsPathIfPresent } from '../lib/mz-tags.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 
@@ -217,6 +218,7 @@ export async function runScanDashboards(args: ScanDashboardsArgs): Promise<void>
     perKeyPath: SKILL_PER_KEY_AWS_METRICS,
     liveMetricsPath,
     enrichedTagsPath: enrichedTagsPathIfPresent(base),
+    entityCandidatesPath: entityCandidatesPathIfPresent(base),
     mzTagsPath: mzTagsPathIfPresent(base),
     minOverrideSeries: args.minOverrideSeries,
   });

@@ -27,6 +27,7 @@ import { runDiscoverEntityTypes } from './commands/discover-entity-types.ts';
 import { runDiscoverFields } from './commands/discover-fields.ts';
 import { runDiscoverMetrics } from './commands/discover-metrics.ts';
 import { runDiscoverTags } from './commands/discover-tags.ts';
+import { runDiscoverEntityCandidates } from './commands/discover-entity-candidates.ts';
 import { runRewriteDashboard } from './commands/rewrite-dashboard.ts';
 import { runRewriteDql } from './commands/rewrite-dql.ts';
 import { runScanDashboards } from './commands/scan-dashboards.ts';
@@ -156,6 +157,11 @@ USAGE
 COMMANDS
   build-mapping     Transform reference DAC metric JSON into unified mappings.
   discover          Enumerate cloud metric keys on a tenant via DQL.
+  discover-entity-candidates
+                    Derive classic->Smartscape entity mappings from the product
+                    entity file and VERIFY each candidate node type against the
+                    tenant. Fills gaps in the curated table without overwriting
+                    it. Flags: --entities <path>, --limit <n>.
   discover-tags     Find which AWS tags the new connection enriches onto
                     metrics (writes enriched-tags.json). Enriched tags become
                     cheap aws.tags.<key> dim filters; others need a
@@ -813,6 +819,17 @@ async function main(): Promise<void> {
         from: getString(args.flags, 'from'),
         daSource: getString(args.flags, 'da-source'),
         sampleSize: getNumber(args.flags, 'sample-size'),
+      });
+      return;
+    }
+    case 'discover-entity-candidates': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDiscoverEntityCandidates({
+        baseUrl,
+        token,
+        outDir: tenantOut(args.flags, baseUrl),
+        entitiesPath: getString(args.flags, 'entities'),
+        limit: getNumber(args.flags, 'limit'),
       });
       return;
     }

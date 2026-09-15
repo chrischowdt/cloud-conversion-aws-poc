@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import { REPO_ROOT, SKILL_DAC_AWS_METRICS, SKILL_MANUAL_AWS_METRICS, SKILL_PER_KEY_AWS_METRICS } from '../lib/paths.ts';
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { enrichedTagsPathIfPresent } from '../lib/enriched-tags.ts';
+import { entityCandidatesPathIfPresent } from '../lib/entity-candidates.ts';
 import { mzTagsPathIfPresent } from '../lib/mz-tags.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { rewriteInPlace, stripOriginalCommentsInPlace, type QueryHit } from './rewrite-dashboard.ts';
@@ -100,6 +101,7 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
     perKeyPath: SKILL_PER_KEY_AWS_METRICS,
     liveMetricsPath,
     enrichedTagsPath: enrichedTagsPathIfPresent(base),
+    entityCandidatesPath: entityCandidatesPathIfPresent(base),
     mzTagsPath: mzTagsPathIfPresent(base),
     minOverrideSeries: args.minOverrideSeries,
   });
