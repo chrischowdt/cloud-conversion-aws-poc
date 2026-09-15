@@ -1815,3 +1815,36 @@ describe('rewriteDql — non-AWS entity selectors lose classicEntitySelector too
     assert.ok(r.warnings.some((w) => w.kind === 'classic-entity-selector'));
   });
 });
+
+describe('bare `tags` column after a restructured AWS fetch', () => {
+  it('BLOCKS rather than silently converting to an empty result', () => {
+    // The classic entity exposes a `tags` column; the Smartscape node does not
+    // (it carries the `tags:aws` record). Converting the fetch without the tag
+    // read leaves a query that parses and returns nothing. Tenant-measured:
+    // classic 6 rows, `tags` 0, `tags:aws` 0, toString(`tags:aws`) 12.
+    const r = rewriteDql(
+      'fetch `dt.entity.cloud:aws:ecs` | fieldsAdd tags, id | filter matchesPhrase(tags,"*fap*")',
+      buildIndex([])
+    );
+    assert.ok(r.warnings.some((w) => w.kind === 'classic-tags-column'), 'must block');
+  });
+
+  it('does not fire on a converted fetch that never reads tags', () => {
+    const r = rewriteDql(
+      'fetch `dt.entity.cloud:aws:ecs:cluster` | filter contains(entity.name, "ecp")',
+      buildIndex([])
+    );
+    assert.ok(!r.warnings.some((w) => w.kind === 'classic-tags-column'));
+    assert.match(r.rewritten, /smartscapeNodes AWS_ECS_CLUSTER/);
+  });
+
+  it('does not fire on `tags:aws` or a quoted "tags" argument', () => {
+    for (const q of [
+      'fetch `dt.entity.cloud:aws:ecs` | fields `tags:aws`',
+      'fetch `dt.entity.cloud:aws:ecs` | fieldsAdd t = getNodeField(id, "tags")',
+    ]) {
+      const r = rewriteDql(q, buildIndex([]));
+      assert.ok(!r.warnings.some((w) => w.kind === 'classic-tags-column'), q);
+    }
+  });
+});

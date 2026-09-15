@@ -114,6 +114,11 @@ export const AWS_ENTITY_MAPPINGS: EntityMapping[] = [
   // `AWS_KAFKA_CLUSTER` does not exist — classic `cloud:aws:kafka` is MSK.
   // EMR nodes carry an empty `name`; the mapping is still correct, but a
   // converted query that displays the name will look blank.
+  // Both the bare and the `:cluster`-suffixed classic types hold ECS CLUSTERS
+  // (1499 vs 1534 entities on the tenant, all named `…-cluster`, both stored
+  // as CUSTOM_DEVICE). Mapping only the suffixed one left real notebooks
+  // blocked on `dt.entity.cloud:aws:ecs`.
+  { classicEntityType: 'cloud:aws:ecs',                   smartscapeDimension: 'dt.smartscape.aws_ecs_cluster',                          smartscapeNodeType: 'AWS_ECS_CLUSTER',                             status: 'available', source: 'discovered' },
   { classicEntityType: 'cloud:aws:ecs:cluster',           smartscapeDimension: 'dt.smartscape.aws_ecs_cluster',                          smartscapeNodeType: 'AWS_ECS_CLUSTER',                             status: 'available', source: 'discovered' },
   { classicEntityType: 'cloud:aws:emr',                   smartscapeDimension: 'dt.smartscape.aws_emr_cluster',                          smartscapeNodeType: 'AWS_EMR_CLUSTER',                             status: 'available', source: 'discovered', notes: 'nodes have an empty name on the tenant' },
   { classicEntityType: 'cloud:aws:kafka',                 smartscapeDimension: 'dt.smartscape.aws_msk_cluster',                          smartscapeNodeType: 'AWS_MSK_CLUSTER',                             status: 'available', source: 'discovered', notes: 'classic kafka == MSK' },
