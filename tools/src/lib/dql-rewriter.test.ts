@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { buildPullIndex } from './metric-streams.ts';
 import { rewriteDql, isBlockingWarning } from './dql-rewriter.ts';
 import type {
   CompositeFormula,
@@ -1849,5 +1850,40 @@ describe('`tags` is a record on the new side — string functions need toString(
   it('still converts the entity type itself', () => {
     const r = rewriteDql('fetch `dt.entity.cloud:aws:ecs` | fields id', buildIndex([]));
     assert.match(r.rewritten, /smartscapeNodes AWS_ECS_CLUSTER/);
+  });
+});
+
+describe('Metric Streams -> polled equivalent', () => {
+  const idx = { ...buildIndex([]), streamsPull: buildPullIndex([
+    { key: 'cloud.aws.kafka.MaxOffsetLag.By.Cluster_Name.Consumer_Group.Topic', series: 31 },
+  ]) } as any;
+
+  it('swaps the key AND renames the dimensions to the polled spelling', () => {
+    // Key-only swap leaves by:{cluster_name} pointing at a field the polled
+    // metric does not have — the tile renders empty without erroring.
+    const r = rewriteDql(
+      'timeseries lag = avg(cloud.aws.kafka.maxOffsetLagByAccountIdClusterNameConsumerGroupRegionTopic), by:{cluster_name, consumer_group, topic}',
+      idx
+    );
+    assert.match(r.rewritten, /cloud\.aws\.kafka\.MaxOffsetLag\.By\.Cluster_Name\.Consumer_Group\.Topic/);
+    assert.match(r.rewritten, /by:\{`Cluster Name`, `Consumer Group`, Topic\}/);
+    assert.ok(!r.warnings.some((w) => w.kind === 'metric-streams-blocked'));
+  });
+
+  it('still blocks when the tenant has no polled equivalent', () => {
+    const r = rewriteDql(
+      'timeseries v = avg(cloud.aws.amazonmq.queueSizeByAccountIdBrokerQueueRegion)',
+      idx
+    );
+    assert.ok(r.warnings.some((w) => w.kind === 'metric-streams-blocked'));
+  });
+
+  it('blocks when no live inventory is loaded at all', () => {
+    // Without discover-metrics we have no evidence, so the old behaviour stands.
+    const r = rewriteDql(
+      'timeseries lag = avg(cloud.aws.kafka.maxOffsetLagByAccountIdClusterNameConsumerGroupRegionTopic)',
+      buildIndex([])
+    );
+    assert.ok(r.warnings.some((w) => w.kind === 'metric-streams-blocked'));
   });
 });

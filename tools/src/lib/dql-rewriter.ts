@@ -1,3 +1,4 @@
+import { findPullEquivalent, dimRef, NATIVE_DIMS } from './metric-streams.ts';
 /**
  * DQL rewriter — applies metric-key + entity-dim transforms to a classic
  * Dynatrace DQL query.
@@ -283,6 +284,13 @@ function applyRecipe(
 
 export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   const transforms: Transform[] = [];
+  /**
+   * Metric Streams keys converted to their polled twin this pass. The polled
+   * metric names its dimensions differently (push `cluster_name` vs polled
+   * `Cluster_Name`), so the rename has to happen AFTER the key swap, once we
+   * know which metric won — see the pass near the end of this function.
+   */
+  const streamsConversions: Array<{ classicKey: string; newKey: string; dimRenames: Map<string, string>; series: number }> = [];
   const warnings: Warning[] = [];
   const original = input;
 
@@ -388,13 +396,28 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
       const lookup: LookupResult = lookupClassicKey(index, classicKey);
       if (lookup.kind === 'unknown') {
         // AWS Metric Streams keys (camelCase metric + concatenated PascalCase
-        // dims, e.g. cloud.aws.kafka.cpuUserByAccountIdBrokerIDClusterNameRegion)
-        // have no new-connection equivalent — Metric Streams isn't supported by
-        // the new connection. Flag them distinctly rather than as a generic
-        // unknown-metric (they're unmappable by design, not a coverage gap).
-        // Only reached for keys that didn't resolve, so mapped classic keys
-        // (incl. camelCase v2 keys) are never misclassified here.
+        // dims, e.g. cloud.aws.kafka.cpuUserByAccountIdBrokerIDClusterNameRegion).
+        //
+        // The new connection has no PUSH ingest, which we used to read as "no
+        // equivalent". That was wrong: it POLLS many of the same CloudWatch
+        // metrics, and most of these keys have a polled twin already flowing
+        // (47 of 63 on nic55601, 27 of 45 on sfz80352). Try that first and only
+        // block when the tenant has no such metric. See metric-streams.ts for
+        // the measured parity and the dimension-rename trap.
         if (METRIC_STREAMS_KEY_RE.test(classicKey)) {
+          const pull = index.streamsPull ? findPullEquivalent(classicKey, index.streamsPull) : null;
+          if (pull) {
+            streamsConversions.push({ classicKey, ...pull });
+            transforms.push({
+              kind: 'metric-key',
+              before: classicKey,
+              after: pull.newKey,
+              detail:
+                `Metric Streams (push) -> polled equivalent on this tenant (${pull.series} series). ` +
+                `Same CloudWatch metric, different ingest.`,
+            });
+            return full.replace(classicKey, pull.newKey);
+          }
           warnings.push({
             kind: 'metric-streams-blocked',
             text:
@@ -885,6 +908,60 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
             detail: `Renamed lookup accessor for ${fetchContext.sourceSmartscapeType} field`,
           });
         }
+      }
+    }
+  }
+
+  // Pass 2.74: rename dimensions after a Metric Streams -> polled key swap.
+  //
+  // The two ingest paths name the same dimension differently: push series carry
+  // lowercase snake_case (`cluster_name`, `broker_id`, `consumer_group`), while
+  // the polled metric uses the cased form embedded in its own key
+  // (`Cluster_Name`, `Broker_ID`, `Consumer_Group`). Swapping only the key
+  // leaves `by:{cluster_name}` pointing at a dimension that does not exist, and
+  // the tile renders EMPTY without raising — the same silent failure mode as the
+  // `tags` record below.
+  //
+  // A dimension the polled metric does not carry at all is NOT dropped quietly:
+  // that would change what the tile groups by, so it blocks and says which one.
+  if (streamsConversions.length > 0) {
+    const renames = new Map<string, string>();
+    for (const c of streamsConversions) for (const [k, v] of c.dimRenames) renames.set(k, v);
+
+    for (const [lower, exact] of renames) {
+      if (lower === exact) continue;
+      // Bare identifier only: skip quoted names, member accesses and $variables.
+      const re = new RegExp(`(?<![$\\w.\`"])${lower}(?![\\w"\`])`, 'g');
+      if (!re.test(rewritten)) continue;
+      re.lastIndex = 0;
+      const ref = dimRef(exact); // names with spaces need backticks in DQL
+      rewritten = rewritten.replace(re, ref);
+      transforms.push({
+        kind: 'entity-dim',
+        before: lower,
+        after: ref,
+        detail: 'Metric Streams dimension renamed to the polled metric’s spelling',
+      });
+    }
+
+    // Any push dimension still referenced that the polled metric does not carry.
+    for (const c of streamsConversions) {
+      const parsed = /By([A-Z][A-Za-z0-9]*)$/.exec(c.classicKey);
+      if (!parsed) continue;
+      const pushDims = (parsed[1]!.match(/[A-Z][a-z0-9]*(?:[A-Z](?![a-z]))*/g) ?? []).map((d) => d.toLowerCase());
+      const missing = pushDims.filter(
+        (d) => !c.dimRenames.has(d) && !NATIVE_DIMS.has(d) && d !== 'accountid' && d !== 'region'
+      );
+      const stillUsed = missing.filter((d) => new RegExp(`(?<![$\\w.\`"])${d}(?![\\w"\`])`).test(rewritten));
+      if (stillUsed.length) {
+        warnings.push({
+          kind: 'metric-streams-blocked',
+          text:
+            `Converted ${c.classicKey} to the polled ${c.newKey}, but the query still groups or filters on ` +
+            `${stillUsed.join(', ')}, which the polled metric does not carry (it has ${[...c.dimRenames.values()].join(', ') || 'no dimensions'}). ` +
+            `Drop that dimension or pick a different grain — leaving it returns no rows.`,
+          match: c.classicKey,
+        });
       }
     }
   }
@@ -2551,7 +2628,11 @@ function pruneByDimsNotOnKey(input: string, transforms: Transform[], warnings: W
       // keep anything that isn't a plain dimension token
       if (/[=()]/.test(p)) return true;
       if (/^dt\./.test(bare) || /^aws\./.test(bare)) return true;
-      if (dims.has(bare.toLowerCase())) return true;
+      // The KEY spells a dimension with underscores (`.By.Cluster_Name`) while
+      // the SERIES carries it with spaces (`Cluster Name`). Compare on one
+      // normalised form, or a correctly-renamed dimension looks absent from its
+      // own key and gets dropped.
+      if (dims.has(bare.toLowerCase().replace(/ /g, '_'))) return true;
       dropped.push(bare);
       return false;
     });

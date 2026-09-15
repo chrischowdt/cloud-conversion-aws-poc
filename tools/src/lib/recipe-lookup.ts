@@ -30,6 +30,7 @@ import { correctServiceNamespace } from './service-namespace-corrections.ts';
 import { buildMzIndex, type MzTagIndex } from './mz-tags.ts';
 import { loadEnrichedTags, type EnrichedTagIndex } from './enriched-tags.ts';
 import { loadEntityCandidates } from './entity-candidates.ts';
+import { buildPullIndex, type PullIndex } from './metric-streams.ts';
 import { registerDiscoveredMappings } from './entity-mappings.ts';
 
 export type Aggregation = 'avg' | 'sum' | 'max' | 'min' | 'count';
@@ -125,6 +126,12 @@ export interface RecipeIndex {
    */
   liveMetrics?: LiveMetricsIndex;
   /**
+   * Polled equivalents for AWS Metric Streams keys, built from the same live
+   * inventory. Present only when that tenant has been inventoried — a metric
+   * that is not flowing is not a safe conversion target.
+   */
+  streamsPull?: PullIndex;
+  /**
    * Minimum target-series count required before a dim-override fires (see
    * `DEFAULT_MIN_OVERRIDE_SERIES`). Guards against swapping to a barely-
    * populated variant when the inventory is incomplete.
@@ -189,6 +196,9 @@ export async function loadRecipeIndex(
   }
   if (options.liveMetricsPath) {
     result.liveMetrics = await loadLiveMetrics(options.liveMetricsPath);
+    result.streamsPull = buildPullIndex(
+      [...result.liveMetrics.byKey].map(([key, series]) => ({ key, series }))
+    );
     result.minOverrideSeries = options.minOverrideSeries ?? DEFAULT_MIN_OVERRIDE_SERIES;
   }
   if (options.mzTagsPath) {
