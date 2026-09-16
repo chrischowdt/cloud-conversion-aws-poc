@@ -136,17 +136,43 @@ describe('buildEntityTags', () => {
 });
 
 describe('buildAffectedEntities', () => {
-  it('passes classic entities through WITHOUT inventing an id', () => {
-    // AWS resources have no classic entity (id_classic is null on every node),
-    // so classic reports the environment. Fabricating a substitute would be
-    // indistinguishable from a real id downstream.
-    const out = buildAffectedEntities(PROBLEM);
+  it('puts the SMARTSCAPE entity here by default — BigPanda reads this field', () => {
+    // The classic value is ENVIRONMENT-0000000000000001 for every migrated AWS
+    // alert, which would collapse all of them onto one entity in BigPanda's
+    // event metadata. The id and type below are real Smartscape identifiers,
+    // not invented ones; only the field they sit in is non-classic.
+    const out = buildAffectedEntities(PROBLEM, ENTITIES);
     assert.deepEqual(out, [
-      { entityId: { id: 'ENVIRONMENT-0000000000000001', type: 'ENVIRONMENT' }, name: 'United Lower Environments' },
+      {
+        entityId: {
+          id: 'AWS_ELASTICLOADBALANCINGV2_LOADBALANCER-4E8D175F77D1F07C',
+          type: 'AWS_ELASTICLOADBALANCINGV2_LOADBALANCER',
+        },
+        name: 'k8s-bbpeksup-upgrades-d748863ce2',
+      },
     ]);
   });
+
+  it('restores strict classic passthrough when asked', () => {
+    // For when BigPanda can read the entity off the evidence entry instead.
+    const out = buildAffectedEntities(PROBLEM, ENTITIES, false);
+    assert.equal(out[0]!.entityId.id, 'ENVIRONMENT-0000000000000001');
+    assert.equal(out[0]!.name, 'United Lower Environments');
+  });
+
+  it('falls back to the classic entity when there is no Smartscape one', () => {
+    const noSs = { ...PROBLEM, 'smartscape.affected_entities': null, 'smartscape.affected_entity.ids': null };
+    assert.equal(buildAffectedEntities(noSs, []) [0]!.entityId.id, 'ENVIRONMENT-0000000000000001');
+  });
+
+  it('uses the parallel id/type arrays when the object form is absent', () => {
+    const arraysOnly = { ...PROBLEM, 'smartscape.affected_entities': null };
+    const out = buildAffectedEntities(arraysOnly, ENTITIES);
+    assert.equal(out[0]!.entityId.type, 'AWS_ELASTICLOADBALANCINGV2_LOADBALANCER');
+  });
+
   it('returns an empty array when there is nothing to report', () => {
-    assert.deepEqual(buildAffectedEntities({}), []);
+    assert.deepEqual(buildAffectedEntities({}, []), []);
   });
 });
 

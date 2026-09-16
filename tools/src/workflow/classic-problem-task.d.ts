@@ -20,5 +20,9 @@ export function buildEntityTags(
   rows: EntityLookupRow[] | null | undefined,
   extra?: Array<string | null | undefined> | null
 ): ClassicTag[];
-export function buildAffectedEntities(p: Partial<DavisProblemRecord>): ClassicProblemDetails['affectedEntities'];
+export function buildAffectedEntities(
+  p: Partial<DavisProblemRecord>,
+  rows?: EntityLookupRow[] | null,
+  useSmartscapeEntities?: boolean
+): ClassicProblemDetails['affectedEntities'];
 export function buildClassicProblemDetails(input: BuildInput): ClassicProblemDetails;

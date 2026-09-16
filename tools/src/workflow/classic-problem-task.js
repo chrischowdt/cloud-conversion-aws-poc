@@ -74,7 +74,46 @@ export function buildEntityTags(rows, extra) {
   return out;
 }
 
-export function buildAffectedEntities(p) {
+// BigPanda builds its event metadata from affectedEntities/impactedEntities,
+// and the classic value for a migrated AWS resource is
+// ENVIRONMENT-0000000000000001 for EVERY alert. So by default we put the
+// Smartscape entity there instead. Knowingly not classic-shaped, but not
+// fabricated either: the id and type are real Smartscape identifiers.
+// Pass useSmartscapeEntities=false for strict classic passthrough.
+export function buildAffectedEntities(p, rows, useSmartscapeEntities) {
+  const useSs = useSmartscapeEntities !== false;
+  const lookup = rows || [];
+  const nameFor = (id) => {
+    const hit = lookup.find((r) => r && r.id === id);
+    if (hit && hit.entity_name) return String(hit.entity_name);
+    const pairs = (p && p['smartscape.affected_entities']) || [];
+    const fromEvent = pairs.find((e) => e && e.id === id);
+    if (fromEvent && fromEvent.name) return String(fromEvent.name);
+    const ids = (p && p['smartscape.affected_entity.ids']) || [];
+    if (ids.length === 1 && lookup.length === 1 && lookup[0] && lookup[0].entity_name) {
+      return String(lookup[0].entity_name);
+    }
+    return '';
+  };
+
+  if (useSs) {
+    const out = [];
+    for (const e of (p && p['smartscape.affected_entities']) || []) {
+      if (!e || !e.id) continue;
+      out.push({ entityId: { id: e.id, type: e.type || classicTypeFromId(e.id) }, name: nameFor(e.id) });
+    }
+    if (out.length === 0) {
+      const ids = (p && p['smartscape.affected_entity.ids']) || [];
+      const types = (p && p['smartscape.affected_entity.types']) || [];
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        if (!id) continue;
+        out.push({ entityId: { id, type: types[i] || classicTypeFromId(id) }, name: nameFor(id) });
+      }
+    }
+    if (out.length > 0) return out;
+  }
+
   const ids = (p && p.affected_entity_ids) || [];
   const names = (p && p.affected_entity_names) || [];
   const out = [];
@@ -130,6 +169,7 @@ export function buildClassicProblemDetails(input) {
   const entityName = named ? named.entity_name : null;
   const extraTags = [].concat(p.entity_tags || [], p.primary_tags || []);
   const impact = p['dt.davis.impact_level'];
+  const affected = buildAffectedEntities(p, rows, input && input.useSmartscapeEntities !== false);
 
   return {
     problemId: p['event.id'] || null,
@@ -140,8 +180,8 @@ export function buildClassicProblemDetails(input) {
     status: classicStatus(p),
     startTime: toEpochMillis(p['event.start']),
     endTime: toEpochMillis(p['event.end']),
-    affectedEntities: buildAffectedEntities(p),
-    impactedEntities: buildAffectedEntities(p),
+    affectedEntities: affected,
+    impactedEntities: affected,
     rootCauseEntity: p.root_cause_entity_name
       ? { entityId: { id: '', type: '' }, name: p.root_cause_entity_name }
       : null,

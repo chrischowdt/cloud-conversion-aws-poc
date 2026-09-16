@@ -212,23 +212,67 @@ export function buildEntityTags(
 /**
  * Affected entities.
  *
- * Deliberately NOT synthesised. Where classic has no entity it supplies the
- * environment entity, and that is what we pass on — inventing an id would be
- * indistinguishable from a real one downstream. The Smartscape identity still
- * travels, on the evidence entries and in the tag/name fields, which is what
- * the receiving system correlates on.
+ * BigPanda builds its event metadata from `affectedEntities` / `impactedEntities`,
+ * and for a migrated AWS resource the classic side of those is
+ * `ENVIRONMENT-0000000000000001` — the fallback classic uses for an entity it
+ * does not know. Every alert would collapse onto one "entity" and the metadata
+ * would be useless, so by default we put the SMARTSCAPE entity here instead.
+ *
+ * This is knowingly not classic-shaped. It is also not fabricated: the id and
+ * type are the real Smartscape identifiers, and the name comes from the live
+ * lookup. The distinction matters — we are relabelling a field, not inventing
+ * an identifier that could be mistaken for a classic one.
+ *
+ * Pass `useSmartscapeEntities: false` to restore strict classic passthrough
+ * once BigPanda can read the entity from the evidence entry instead.
  */
-export function buildAffectedEntities(p: DavisProblemRecord): ClassicEntityRef[] {
+export function buildAffectedEntities(
+  p: DavisProblemRecord,
+  rows: EntityLookupRow[] = [],
+  useSmartscapeEntities = true
+): ClassicEntityRef[] {
+  const nameFor = (id: string): string => {
+    const hit = (rows ?? []).find((r) => r?.id === id);
+    if (hit?.entity_name) return String(hit.entity_name);
+    const fromEvent = (p['smartscape.affected_entities'] ?? []).find((e) => e?.id === id);
+    if (fromEvent?.name) return String(fromEvent.name);
+    // Single-entity problems are the common case; if the lookup returned one
+    // row and there is one entity, they are the same thing.
+    const ids = p['smartscape.affected_entity.ids'] ?? [];
+    if (ids.length === 1 && (rows ?? []).length === 1 && rows[0]?.entity_name) {
+      return String(rows[0].entity_name);
+    }
+    return '';
+  };
+
+  if (useSmartscapeEntities) {
+    const pairs = p['smartscape.affected_entities'] ?? [];
+    const out: ClassicEntityRef[] = [];
+    for (const e of pairs) {
+      if (!e?.id) continue;
+      out.push({ entityId: { id: e.id, type: e.type ?? classicTypeFromId(e.id) }, name: nameFor(e.id) });
+    }
+    if (out.length === 0) {
+      // Fall back to the parallel id/type arrays when the object form is absent.
+      const ids = p['smartscape.affected_entity.ids'] ?? [];
+      const types = p['smartscape.affected_entity.types'] ?? [];
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        if (!id) continue;
+        out.push({ entityId: { id, type: types[i] ?? classicTypeFromId(id) }, name: nameFor(id) });
+      }
+    }
+    if (out.length > 0) return out;
+    // No Smartscape entity at all → fall through to whatever classic reported.
+  }
+
   const ids = p.affected_entity_ids ?? [];
   const names = p.affected_entity_names ?? [];
   const out: ClassicEntityRef[] = [];
   for (let i = 0; i < ids.length; i++) {
     const id = ids[i];
     if (!id) continue;
-    out.push({
-      entityId: { id, type: classicTypeFromId(id) },
-      name: names[i] ?? '',
-    });
+    out.push({ entityId: { id, type: classicTypeFromId(id) }, name: names[i] ?? '' });
   }
   return out;
 }
@@ -289,6 +333,13 @@ export interface BuildInput {
   events?: DavisEventRecord[];
   /** Rows from the Smartscape tag lookup. May be empty. */
   entities?: EntityLookupRow[];
+  /**
+   * Put the SMARTSCAPE entity in affectedEntities/impactedEntities rather than
+   * the classic ENVIRONMENT fallback. On by default because BigPanda builds its
+   * event metadata from those fields and the classic value is the same
+   * placeholder for every AWS alert. Set false for strict classic passthrough.
+   */
+  useSmartscapeEntities?: boolean;
 }
 
 /**
@@ -304,6 +355,7 @@ export function buildClassicProblemDetails(input: BuildInput): ClassicProblemDet
   const rows = input.entities ?? [];
 
   const entityName = rows.find((r) => r?.entity_name)?.entity_name ?? null;
+  const entities = buildAffectedEntities(p, rows, input.useSmartscapeEntities !== false);
   const extraTags = [...(p.entity_tags ?? []), ...(p.primary_tags ?? [])];
 
   return {
@@ -315,9 +367,9 @@ export function buildClassicProblemDetails(input: BuildInput): ClassicProblemDet
     status: classicStatus(p),
     startTime: toEpochMillis(p['event.start']),
     endTime: toEpochMillis(p['event.end']),
-    affectedEntities: buildAffectedEntities(p),
+    affectedEntities: entities,
     // Classic distinguishes these; Davis gives one set, so they are the same.
-    impactedEntities: buildAffectedEntities(p),
+    impactedEntities: entities,
     rootCauseEntity: p.root_cause_entity_name
       ? { entityId: { id: '', type: '' }, name: p.root_cause_entity_name }
       : null,
