@@ -219,7 +219,7 @@ export type EntityScope = 'aws' | 'non-aws' | 'unknown';
  * downgrades a blocker to a note, and anything unrecognised still blocks.
  */
 const CANNOT_BE_AWS =
-  /^(ibmmq:|tibco:|f5:|solace|custom:solace|geoloc_site|mobile_application|application_method|multiprotocol_monitor|synthetic|http_check|vmware_|gcp_|cloud:gcp:|azure_|cloud:azure:|sql:|elasticsearch|kubernetes|cloud_application|openshift|citrix|sap|oracle|mssql|mysql|db2|nagios|zos|cics|ims|relic|appd)/;
+  /^(ibmmq:|tibco:|f5:|solace|custom:solace|geoloc_site|mobile_application|application_method|multiprotocol_monitor|synthetic|http_check|vmware_|gcp_|cloud:gcp:|azure_|cloud:azure:|sql:|elasticsearch|kubernetes|cloud_application|openshift|citrix|sap|oracle|mssql|mysql|db2|nagios|zos|cics|ims|relic|appd|hypervisor|virtualmachine|datapower:|kafka:|service_method|network:|aruba:|host_id|container$|queue$|queue_instance$|process$|process_instance$)/;
 
 export function entityScope(classicType: string): EntityScope {
   const t = classicType.replace(/^`/, '').replace(/`$/, '').replace(/^dt\.entity\./, '').toLowerCase();

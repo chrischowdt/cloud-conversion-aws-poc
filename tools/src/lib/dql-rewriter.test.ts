@@ -561,9 +561,12 @@ describe('rewriteDql — fetch restructure (Situation 3)', () => {
       'fetch dt.entity.custom_device | filter entity.type == "cloud:aws:elb"',
       idx
     );
-    // Unresolvable → left for the downstream not-planned warning.
+    // Unresolvable → left classic, flagged NON-blockingly: the reference still
+    // runs, so it is one thing for a human to revisit rather than grounds for
+    // rebuilding the whole asset by hand.
     assert.match(r.rewritten, /custom_device/);
-    assert.ok(r.warnings.some((w) => w.kind === 'unmapped-entity-type'));
+    assert.ok(r.warnings.some((w) => w.kind === 'entity-not-planned'));
+    assert.ok(!r.warnings.some((w) => isBlockingWarning(w.kind)), 'must not block the asset');
   });
 
   it('leaves non-AWS cloud_application (Kubernetes) untouched', () => {
@@ -1252,7 +1255,8 @@ describe('rewriteDql — additional custom_device sub-types', () => {
     const idx = buildIndex([]);
     const r = rewriteDql('fetch dt.entity.custom_device | fields id, entity.name', idx);
     assert.match(r.rewritten, /dt\.entity\.custom_device/);
-    assert.ok(r.warnings.some((w) => w.kind === 'unmapped-entity-type'));
+    assert.ok(r.warnings.some((w) => w.kind === 'entity-not-planned'));
+    assert.ok(!r.warnings.some((w) => isBlockingWarning(w.kind)), 'must not block the asset');
   });
 });
 

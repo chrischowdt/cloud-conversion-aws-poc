@@ -57,6 +57,7 @@ export interface Warning {
     | 'classic-selector-note'
     | 'entity-relationship-traversal'
     | 'unmapped-entity-type'
+    | 'entity-not-planned'
     | 'entity-name-attr'
     | 'classic-id-literal'
     | 'recipe-aggregation-mismatch'
@@ -719,11 +720,16 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
       return full;
     }
     if (mapping.status === 'not-planned') {
+      // NON-blocking: the reference is left classic and classic DQL still runs
+      // on the new platform, so the tile keeps working. Blocking here labelled
+      // the whole asset "manual rebuild" — `custom_device` alone accounted for
+      // 129 references on sfz80352 — when in fact only this one reference needs
+      // a human, and the rest of the asset converts.
       warnings.push({
-        kind: 'unmapped-entity-type',
+        kind: 'entity-not-planned',
         text:
           `dt.entity.${entityType} has no Smartscape replacement (${mapping.notes ?? 'not planned'}). ` +
-          `See ${SKILL_REFS.specialCases}.`,
+          `Left classic — it still runs. See ${SKILL_REFS.specialCases}.`,
         reference: SKILL_REFS.specialCases,
         match: full,
       });
@@ -1751,11 +1757,15 @@ function rewriteFetchEntity(
     const mapping = classicEntityToSmartscape(entityType);
     if (!mapping || !mapping.smartscapeNodeType) {
       if (mapping?.status === 'not-planned') {
+        // NON-blocking, same reasoning as the dim-swap site: the fetch is left
+        // classic and keeps working, so this is one reference for a human to
+        // revisit, not grounds for rebuilding the whole asset by hand.
         warnings.push({
-          kind: 'unmapped-entity-type',
+          kind: 'entity-not-planned',
           text:
             `fetch dt.entity.${entityType} — this entity has no Smartscape replacement ` +
-            `(${mapping.notes ?? 'not planned'}). Manual rewrite required.`,
+            `(${mapping.notes ?? 'not planned'}). Left classic — it still runs, but it will need ` +
+            `a manual redesign before classic is retired.`,
           reference: SKILL_REFS.specialCases,
           match: full,
         });
