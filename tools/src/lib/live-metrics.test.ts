@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  matchLiveMetricByName,
   metricBase,
   preferPopulatedVariant,
   type LiveMetricsIndex,
@@ -145,5 +146,50 @@ describe('preferPopulatedVariant', () => {
     assert.equal(r.overrode, false);
     assert.equal(r.key, 'cloud.aws.x.M.By.A');
     assert.equal(r.count, 3);
+  });
+});
+
+
+describe('matchLiveMetricByName', () => {
+  const index: LiveMetricsIndex = {
+    byKey: new Map([
+      ['cloud.aws.rds.DatabaseConnections.By.DBInstanceIdentifier', 109],
+      ['cloud.aws.rds.DatabaseConnections.By.DBClusterIdentifier', 0],
+      ['cloud.aws.applicationelb.HTTPCode_Target_5XX_Count.By.LoadBalancer', 12],
+      ['cloud.aws.apigateway.Latency.By.ApiName', 3],
+      ['cloud.aws.ec2.CPUUtilization.By.InstanceId', 40],
+    ]),
+    byBase: new Map(),
+  };
+
+  it('matches a classic snake_case name to the live PascalCase metric', () => {
+    // The tables miss this one; the metric is flowing all the same.
+    assert.equal(
+      matchLiveMetricByName(index, 'cloud.aws.rds.database_connections'),
+      'cloud.aws.rds.DatabaseConnections.By.DBInstanceIdentifier'
+    );
+  });
+
+  it('strips the statistic suffix classic bakes into the name', () => {
+    assert.equal(
+      matchLiveMetricByName(index, 'cloud.aws.applicationelb.http_code_target_5xx_count_sum'),
+      'cloud.aws.applicationelb.HTTPCode_Target_5XX_Count.By.LoadBalancer'
+    );
+  });
+
+  it('strips a trailing _by_<dims> segment', () => {
+    assert.equal(
+      matchLiveMetricByName(index, 'cloud.aws.rds.database_connections_sum_by_region_engine_name'),
+      'cloud.aws.rds.DatabaseConnections.By.DBInstanceIdentifier'
+    );
+  });
+
+  it('never crosses service namespaces', () => {
+    // `latency` exists under apigateway; it must not satisfy an rds lookup.
+    assert.equal(matchLiveMetricByName(index, 'cloud.aws.rds.latency'), undefined);
+  });
+
+  it('returns undefined when nothing is flowing for that name', () => {
+    assert.equal(matchLiveMetricByName(index, 'cloud.aws.mwaa.queued_tasks_sum'), undefined);
   });
 });

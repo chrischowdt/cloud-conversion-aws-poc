@@ -118,6 +118,22 @@ export const AWS_ENTITY_MAPPINGS: EntityMapping[] = [
   // (1499 vs 1534 entities on the tenant, all named `…-cluster`, both stored
   // as CUSTOM_DEVICE). Mapping only the suffixed one left real notebooks
   // blocked on `dt.entity.cloud:aws:ecs`.
+  // Classic types that appear in real dashboards under spellings the product
+  // entity file does not carry, so discover-entity-candidates could not reach
+  // them (it has `cloud:aws:kinesis:data_analytics`, the dashboards write
+  // `cloud:aws:kinesisanalytics`). Node types probed on nic55601:
+  // KINESISANALYTICSV2 161, MWAA 69, KAFKACONNECT 234, S3 27523, ACCOUNT 991,
+  // REGION 17 — all returning named nodes.
+  // NOT added: cloud:aws:documentdb. AWS_DOCDB_DBCLUSTER returned 0 nodes on
+  // BOTH tenants, so there is no evidence for the mapping and guessing one
+  // would point queries at an empty node type.
+  { classicEntityType: 'cloud:aws:kinesisanalytics',     smartscapeDimension: 'dt.smartscape.aws_kinesisanalyticsv2_application', smartscapeNodeType: 'AWS_KINESISANALYTICSV2_APPLICATION', status: 'available', source: 'discovered' },
+  { classicEntityType: 'cloud:aws:mwaa',                  smartscapeDimension: 'dt.smartscape.aws_mwaa_environment',              smartscapeNodeType: 'AWS_MWAA_ENVIRONMENT',              status: 'available', source: 'discovered' },
+  { classicEntityType: 'cloud:aws:mwaaenvironment',       smartscapeDimension: 'dt.smartscape.aws_mwaa_environment',              smartscapeNodeType: 'AWS_MWAA_ENVIRONMENT',              status: 'available', source: 'discovered', notes: 'alias of cloud:aws:mwaa' },
+  { classicEntityType: 'cloud:aws:kafkaconnect',          smartscapeDimension: 'dt.smartscape.aws_kafkaconnect_connector',        smartscapeNodeType: 'AWS_KAFKACONNECT_CONNECTOR',        status: 'available', source: 'discovered' },
+  { classicEntityType: 's3bucket',                        smartscapeDimension: 'dt.smartscape.aws_s3_bucket',                     smartscapeNodeType: 'AWS_S3_BUCKET',                     status: 'available', source: 'discovered', notes: 'bare spelling of cloud:aws:s3' },
+  { classicEntityType: 'cloud:aws:account',               smartscapeDimension: 'dt.smartscape.aws_account',                       smartscapeNodeType: 'AWS_ACCOUNT',                       status: 'available', source: 'discovered' },
+  { classicEntityType: 'cloud:aws:region',                smartscapeDimension: 'dt.smartscape.aws_region',                        smartscapeNodeType: 'AWS_REGION',                        status: 'available', source: 'discovered' },
   { classicEntityType: 'cloud:aws:ecs',                   smartscapeDimension: 'dt.smartscape.aws_ecs_cluster',                          smartscapeNodeType: 'AWS_ECS_CLUSTER',                             status: 'available', source: 'discovered' },
   { classicEntityType: 'cloud:aws:ecs:cluster',           smartscapeDimension: 'dt.smartscape.aws_ecs_cluster',                          smartscapeNodeType: 'AWS_ECS_CLUSTER',                             status: 'available', source: 'discovered' },
   { classicEntityType: 'cloud:aws:emr',                   smartscapeDimension: 'dt.smartscape.aws_emr_cluster',                          smartscapeNodeType: 'AWS_EMR_CLUSTER',                             status: 'available', source: 'discovered', notes: 'nodes have an empty name on the tenant' },

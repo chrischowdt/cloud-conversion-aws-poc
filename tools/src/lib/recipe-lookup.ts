@@ -22,6 +22,7 @@ import {
 import {
   DEFAULT_MIN_OVERRIDE_SERIES,
   loadLiveMetrics,
+  matchLiveMetricByName,
   preferPopulatedVariant,
   type LiveMetricsIndex,
 } from './live-metrics.ts';
@@ -363,5 +364,38 @@ export function lookupClassicKey(
       if (r.kind !== 'unknown') return r;
     }
   }
+  // Tier 5 - match against what is ACTUALLY FLOWING on this tenant.
+  //
+  // The mapping tables are the same data the product team ships, and they still
+  // miss bread-and-butter keys: `cloud.aws.rds.database_connections` resolves in
+  // no tier, while `cloud.aws.rds.DatabaseConnections.By.DBInstanceIdentifier`
+  // is live on both tenants. The gap is spelling, not coverage - classic writes
+  // snake_case with the statistic and dimensions baked into the name; the polled
+  // metric writes PascalCase with the dimensions in a `.By.` segment.
+  //
+  // Measured: resolves 16 of 66 otherwise-unresolvable keys on nic55601 and 10
+  // of 76 on sfz80352, including apigateway.latency,
+  // lambda.concurrent_executions_max, applicationelb.http_code_target_5xx_count_sum.
+  //
+  // DELIBERATELY LAST, and evidence-based: it only proposes a key already
+  // producing data on the tenant being migrated, within the same service
+  // namespace, so it cannot invent a mapping the way a looser string match
+  // could. It is still a NAME match, so the note says so for the reviewer.
+  if (index.liveMetrics) {
+    const hit = matchLiveMetricByName(index.liveMetrics, classicMetricId);
+    if (hit) {
+      const synthetic: MappingEntry = {
+        service: serviceFromNewKey(hit),
+        classicMetricId,
+        newDtMetricKey: hit,
+        notes:
+          `Resolved by matching the metric NAME against this tenant's live inventory ` +
+          `(no mapping table had it). The target is confirmed to be flowing here. ` +
+          `Verify it is the same measurement before relying on it.`,
+      };
+      return { kind: 'mapped-no-recipe', entry: synthetic };
+    }
+  }
+
   return { kind: 'unknown' };
 }

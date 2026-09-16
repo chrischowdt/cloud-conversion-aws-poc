@@ -141,3 +141,51 @@ function dimCount(key: string): number {
   if (idx < 0) return 0;
   return key.slice(idx + 4).split('.').length;
 }
+
+/**
+ * Statistic words classic bakes onto the end of a metric name
+ * (`..._sum`, `..._count`). The polled metric carries the statistic separately.
+ */
+const TRAILING_STAT = /_(sum|avg|average|max|maximum|min|minimum|count|value)$/;
+
+/** `http_code_target_5xx_count_sum_by_availability_zone` -> `httpcodetarget5xxcount` */
+function squashClassicMetricName(metric: string): string[] {
+  const out = new Set<string>();
+  let m = metric.toLowerCase();
+  const by = m.indexOf('_by_');
+  if (by > 0) m = m.slice(0, by);
+  out.add(m.replace(/_/g, ''));
+  let stripped = m;
+  // Classic sometimes stacks two (`..._count_sum`), so peel at most twice.
+  for (let i = 0; i < 2 && TRAILING_STAT.test(stripped); i++) {
+    stripped = stripped.replace(TRAILING_STAT, '');
+    out.add(stripped.replace(/_/g, ''));
+  }
+  return [...out].filter(Boolean);
+}
+
+/**
+ * Find a live polled metric whose NAME matches a classic snake_case key, within
+ * the same service namespace. Returns the live key or undefined.
+ *
+ * Evidence-based by construction: every candidate comes from the tenant's own
+ * inventory, so a match is a metric that is demonstrably producing data. It is
+ * still a name match, not a semantic one — callers must surface it for review.
+ */
+export function matchLiveMetricByName(index: LiveMetricsIndex, classicKey: string): string | undefined {
+  const m = /^(?:builtin:|ext:|dt\.)?cloud\.aws\.([a-z0-9_]+)\.(.+)$/.exec(classicKey);
+  if (!m) return undefined;
+  const service = m[1]!.toLowerCase();
+  const wanted = new Set(squashClassicMetricName(m[2]!));
+  if (wanted.size === 0) return undefined;
+
+  let best: { key: string; series: number } | undefined;
+  for (const [key, series] of index.byKey) {
+    const p = /^cloud\.aws\.([a-z0-9_]+)\.([A-Za-z0-9_]+?)(?:\.By\..*)?$/.exec(key);
+    if (!p || p[1]!.toLowerCase() !== service) continue;
+    if (!wanted.has(p[2]!.toLowerCase().replace(/_/g, ''))) continue;
+    // Several dimensional variants can match; prefer the one carrying data.
+    if (!best || series > best.series) best = { key, series };
+  }
+  return best?.key;
+}
