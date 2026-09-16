@@ -41,3 +41,11 @@ Thumbs.db
 # Local scratch / working notes (not part of the deliverable)
 /product feedback notes.txt
 /product-ai-knowledgebase/dynatrace-*
+
+# Workflow templates exported from a tenant. These embed live integration
+# credentials in plain text (BigPanda x-app-key / x-auth-token sit in the task
+# headers), so the exported file must never be committed. Keep the SHAPE of a
+# workflow in code under tools/ instead, and let the tenant hold the secrets.
+problem-workflow/
+*.workflow-template*.yaml
+*.workflow-template*.yml

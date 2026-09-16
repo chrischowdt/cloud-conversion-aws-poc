@@ -1,0 +1,125 @@
+{
+  "problem": {
+    "timestamp": "2026-09-11T23:42:55.395000000Z",
+    "event.category": "CUSTOM_ALERT",
+    "display_id": "P-26091310801",
+    "dt.davis.mute.status": "NOT_MUTED",
+    "event.end": "2026-09-11T23:22:00.000000000Z",
+    "affected_entity_types": [
+      "dt.entity.environment"
+    ],
+    "event.status": "CLOSED",
+    "dt.davis.impact_level": [
+      "Infrastructure"
+    ],
+    "dt.analysis.offset": "-720000000000",
+    "smartscape.affected_entities": [
+      {
+        "id": "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER-4E8D175F77D1F07C",
+        "type": "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER"
+      }
+    ],
+    "event.kind": "DAVIS_PROBLEM",
+    "dt.analysis.ready": true,
+    "affected_entity_ids": [
+      "ENVIRONMENT-0000000000000001"
+    ],
+    "labels.alerting_profile": [
+      "Default"
+    ],
+    "event.severity": "3",
+    "smartscape.affected_entity.ids": [
+      "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER-4E8D175F77D1F07C"
+    ],
+    "dt.entity.environment": [
+      "ENVIRONMENT-0000000000000001"
+    ],
+    "event.name": "Amazon ApplicationELB TargetResponseTime [AWS] [Standard]",
+    "resolved_problem_duration": "900000000000",
+    "dt.davis.is_duplicate": false,
+    "dt.davis.is_frequent_event": false,
+    "affected_entity_names": [
+      "United Lower Environments"
+    ],
+    "dt.davis.event_ids": [
+      "-1035732575302979006_1789167300000"
+    ],
+    "maintenance.is_under_maintenance": false,
+    "event.description": "# Amazon ApplicationELB TargetResponseTime [AWS] [Standard]\n\nThe problem **affects 1 entity** overall.\n\nFollowing entities were affected by the problem:\n\n**AWS Elastic Load Balancing v2 load balancer, AWS_ELASTICLOADBALANCINGV2_LOADBALANCER-4E8D175F77D1F07C**\n\nCustom: Amazon ApplicationELB TargetResponseTime [AWS] [Standard]\n\n- Environment: qa\n\n❗**Alert description:**\nAn anomaly was detected on TargetResponseTime (By LoadBalancer and TargetGroup). Within the sliding window, violations were detected that were above the threshold of 1.66.",
+    "dt.duration_marker": "900000000000",
+    "event.status_transition": "UPDATED",
+    "smartscape.affected_entity.types": [
+      "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER"
+    ],
+    "event.id": "-1035732575302979006_1789167300000V2",
+    "event.start": "2026-09-11T23:07:00.000000000Z",
+    "dt.openpipeline.source": "classic_root_cause_analysis",
+    "dt.openpipeline.pipelines": [
+      "davis.problems:default"
+    ]
+  },
+  "event": {
+    "timestamp": "2026-09-11T23:42:48.169000000Z",
+    "dt.event.correlation_id": "db8c0f8814701fcdecd1b3b3bedc9907",
+    "event.category": "CUSTOM_ALERT",
+    "dt.davis.is_frequent_issue_detection_allowed": false,
+    "dt.davis.mute.status": "NOT_MUTED",
+    "dt.smartscape.aws_elasticloadbalancingv2_loadbalancer": "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER-4E8D175F77D1F07C",
+    "dt.davis.is_rootcause_relevant": true,
+    "dt.source_entity.type": "environment",
+    "dt.settings.object_id": "vu9U3hXa3q0AAAABAB9idWlsdGluOmRhdmlzLmFub21hbHktZGV0ZWN0b3JzAAZ0ZW5hbnQABnRlbmFudAAkMjllZTFhMDgtOTA5Yi0zNjYxLTgwNGEtOTYzNTQxOTBlZjU3vu9U3hXa3q0",
+    "event.end": "2026-09-11T23:22:00.000000000Z",
+    "affected_entity_types": [
+      "dt.entity.environment"
+    ],
+    "event.group_label": "Custom alert",
+    "dt.settings.scope_id": "environment",
+    "event.status": "CLOSED",
+    "dt.source_entity": "ENVIRONMENT-0000000000000001",
+    "dt.davis.analysis_trigger_delay": "3600",
+    "dt.analysis.offset": "720000000000",
+    "dt.davis.impact_level": "Infrastructure",
+    "dt.smartscape_source.type": "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER",
+    "smartscape.affected_entities": [
+      {
+        "id": "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER-4E8D175F77D1F07C",
+        "type": "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER"
+      }
+    ],
+    "dt.query": "timeseries avg(cloud.aws.applicationelb.TargetResponseTime.By.LoadBalancer.TargetGroup), by:{aws.tags.applicationci, aws.tags.env,LoadBalancer, aws.region,dt.smartscape.aws_elasticloadbalancingv2_loadbalancer}, interval: 60000ms\n//| filter aws.tags.applicationci == \"ccl\"\n//| fieldsAdd dt.source_entity = dt.smartscape.aws_elasticloadbalancingv2_loadbalancer | filter (`LoadBalancer` == \"\"\"app/k8s-bbpeksup-upgrades-d748863ce2/354bfd4c85d911c4\"\"\" AND `aws.region` == \"\"\"us-east-1\"\"\" AND `aws.tags.applicationci` == \"\"\"bbp\"\"\" AND `aws.tags.env` == \"\"\"qa\"\"\" AND `dt.smartscape.aws_elasticloadbalancingv2_loadbalancer` == toSmartscapeId(\"\"\"AWS_ELASTICLOADBALANCINGV2_LOADBALANCER-4E8D175F77D1F07C\"\"\"))",
+    "event.kind": "DAVIS_EVENT",
+    "dt.settings.schema_id": "builtin:davis.anomaly-detectors",
+    "affected_entity_ids": [
+      "ENVIRONMENT-0000000000000001"
+    ],
+    "dt.smartscape_source.id": "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER-4E8D175F77D1F07C",
+    "event.severity": "3",
+    "smartscape.affected_entity.ids": [
+      "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER-4E8D175F77D1F07C"
+    ],
+    "dt.davis.is_merging_allowed": false,
+    "dt.davis.disable_merging_reason": "Set by event reporter",
+    "event.name": "Amazon ApplicationELB TargetResponseTime [AWS] [Standard]",
+    "dt.entity.environment": "ENVIRONMENT-0000000000000001",
+    "dt.davis.is_frequent_event": false,
+    "event.provider": "METRIC_EVENTS",
+    "dt.davis.analysis_time_budget": "0",
+    "dt.davis.timeout": "0",
+    "maintenance.is_under_maintenance": false,
+    "event.description": "Environment: qa\n\n❗**Alert description:**\nAn anomaly was detected on TargetResponseTime (By LoadBalancer and TargetGroup). Within the sliding window, violations were detected that were above the threshold of 1.66.",
+    "event.type": "CUSTOM_ALERT",
+    "dt.entity.environment.type.name": "Environment",
+    "event.status_transition": "RECOVERED",
+    "dt.entity.environment.name": "United Lower Environments",
+    "smartscape.affected_entity.types": [
+      "AWS_ELASTICLOADBALANCINGV2_LOADBALANCER"
+    ],
+    "event.id": "-1035732575302979006_1789167300000",
+    "event.start": "2026-09-11T22:55:00.000000000Z",
+    "query_string": "timeseries avg(cloud.aws.applicationelb.TargetResponseTime.By.LoadBalancer.TargetGroup), by:{aws.tags.applicationci, aws.tags.env,LoadBalancer, aws.region,dt.smartscape.aws_elasticloadbalancingv2_loadbalancer}, interval: 60000ms\n//| filter aws.tags.applicationci == \"ccl\"\n//| fieldsAdd dt.source_entity = dt.smartscape.aws_elasticloadbalancingv2_loadbalancer | filter (`LoadBalancer` == \"\"\"app/k8s-bbpeksup-upgrades-d748863ce2/354bfd4c85d911c4\"\"\" AND `aws.region` == \"\"\"us-east-1\"\"\" AND `aws.tags.applicationci` == \"\"\"bbp\"\"\" AND `aws.tags.env` == \"\"\"qa\"\"\" AND `dt.smartscape.aws_elasticloadbalancingv2_loadbalancer` == toSmartscapeId(\"\"\"AWS_ELASTICLOADBALANCINGV2_LOADBALANCER-4E8D175F77D1F07C\"\"\"))",
+    "dt.openpipeline.source": "custom_alert",
+    "dt.openpipeline.pipelines": [
+      "davis.events:default"
+    ]
+  }
+}
