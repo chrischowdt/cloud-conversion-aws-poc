@@ -734,6 +734,7 @@ async function main(): Promise<void> {
         limit: getNumber(args.flags, 'limit'),
         apply: args.flags.get('apply') === true,
         force: args.flags.get('force') === true,
+        ignoreLint: args.flags.get('ignore-lint') === true,
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),

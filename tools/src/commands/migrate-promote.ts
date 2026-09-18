@@ -32,6 +32,7 @@ import { rewriteInPlace, stripOriginalCommentsInPlace, type QueryHit } from './r
 import { buildApply, type AssetType } from '../lib/doc-apply.ts';
 import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { findOriginal } from '../lib/migrate-support.ts';
+import { lintAsset, summarize } from '../lib/output-lint.ts';
 import { readRows, readDecisions, upsertRows, isReadyToPublish, isPublished, PUBLISHED, type TrackerRow } from '../lib/tracker-xlsx.ts';
 
 export interface MigratePromoteArgs {
@@ -43,6 +44,8 @@ export interface MigratePromoteArgs {
   limit?: number;
   apply?: boolean;
   force?: boolean;
+  /** Publish despite blocking lint findings. */
+  ignoreLint?: boolean;
   mappingPath?: string;
   liveMetricsPath?: string;
   minOverrideSeries?: number;
@@ -136,6 +139,34 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
       const hits: QueryHit[] = [];
       rewriteInPlace(clone, index, hits, '');
       content = clone;
+    }
+
+    // Gate: refuse shapes we have PROVEN return nothing. The rewriter is not the
+    // risk here — review is. Two of the three dashboards found carrying a
+    // proven-empty pattern had been approved by a human and published, because
+    // an empty tile renders exactly like a quiet one. See lib/output-lint.ts for
+    // the measurement behind each rule.
+    const findings = lintAsset(content);
+    const lint = summarize(findings);
+    if (lint.blocking > 0 && !args.ignoreLint) {
+      console.log(
+        `  ! ${c.id} (${c.name}) — ${lint.blocking} blocking lint finding(s). Skipping (--ignore-lint to override).`
+      );
+      const shown = new Set<string>();
+      for (const f of findings.filter((x) => x.severity === 'blocking')) {
+        if (shown.has(f.ruleId)) continue;
+        shown.add(f.ruleId);
+        const n = findings.filter((x) => x.ruleId === f.ruleId).length;
+        console.log(`      [${f.ruleId}] x${n} — ${f.message.split('.')[0]}.`);
+        if (f.fix) console.log(`         fix: ${f.fix}`);
+        console.log(`         e.g. ${f.location}: ${f.excerpt.slice(0, 110)}`);
+      }
+      skipped++;
+      continue;
+    }
+    if (lint.advisory > 0) {
+      const kinds = [...new Set(findings.filter((x) => x.severity === 'advisory').map((x) => x.ruleId))];
+      console.log(`    (advisory: ${lint.advisory} finding(s) — ${kinds.join(', ')})`);
     }
 
     // Strip any migration reference comments (added at stage) so the promoted
