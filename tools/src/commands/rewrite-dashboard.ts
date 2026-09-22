@@ -43,7 +43,23 @@ export interface RewriteDashboardArgs {
   minOverrideSeries?: number;
 }
 
-const QUERY_FIELD_NAMES = new Set(['query', 'input', 'dqlQuery']);
+/**
+ * Field names that can hold a DQL string.
+ *
+ * `value` is here because a NOTEBOOK keeps its executable DQL at
+ * `sections[].state.input.value`. `input` was in this set, but at that path
+ * `input` is an OBJECT — so the string check failed, the walk recursed, and the
+ * `value` underneath was never rewritten. Notebooks were therefore staged
+ * completely unconverted while `scan-notebooks` reported them as converted:
+ * the scanner reads the right slot (`extractNotebookQueries`) and the rewriter
+ * did not. 89 review copies went to the team with their original queries.
+ *
+ * Safe to include: measured across the corpus, DQL-shaped strings under a
+ * `value` key appear 11,692 times in notebooks (10,634 directly under `input`)
+ * and ZERO times in dashboards, so this cannot disturb dashboard rewriting.
+ * The length + keyword guard below still applies.
+ */
+const QUERY_FIELD_NAMES = new Set(['query', 'input', 'dqlQuery', 'value']);
 
 /**
  * Reference-comment fences prepended to a converted query so a reviewer can see

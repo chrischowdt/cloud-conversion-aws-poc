@@ -85,3 +85,36 @@ describe('stripOriginalCommentsInPlace', () => {
     assert.equal(dash.tiles.c.query, 'fetch untouched');
   });
 });
+
+describe('rewriteInPlace — notebooks', () => {
+  it('rewrites the slot a notebook actually executes', () => {
+    // Regression: `sections[].state.input.value`. `input` was in the field-name
+    // set but is an OBJECT at that path, so the walk recursed past it and the
+    // `value` underneath was never touched. 89 review copies reached the team
+    // with their original queries while scan-notebooks reported them converted.
+    const nb = {
+      sections: [
+        { type: 'dql', state: { input: { value: 'timeseries avg(cloud.aws.lambda.duration), by:{dt.entity.aws_lambda_function}' } } },
+      ],
+    };
+    const hits: any[] = [];
+    rewriteInPlace(nb, miniIndex(), hits, '');
+    assert.equal(hits.length, 1, 'the executed slot must be visited');
+    assert.match(nb.sections[0]!.state.input.value, /cloud\.aws\.lambda\.Duration\.By\.FunctionName/);
+    assert.match(nb.sections[0]!.state.input.value, /dt\.smartscape\.aws_lambda_function/);
+  });
+
+  it('leaves a short or non-DQL `value` alone', () => {
+    // `value` is a generic key; the length + keyword guard is what stops this
+    // from rewriting arbitrary strings.
+    const doc = {
+      sections: [{ state: { input: { value: 'just a label' } } }],
+      other: { value: 'https://example.com/a/b/c/d/e/f/g/h/i/j/k' },
+    };
+    const before = JSON.stringify(doc);
+    const hits: any[] = [];
+    rewriteInPlace(doc, miniIndex(), hits, '');
+    assert.equal(JSON.stringify(doc), before);
+    assert.equal(hits.length, 0);
+  });
+});
