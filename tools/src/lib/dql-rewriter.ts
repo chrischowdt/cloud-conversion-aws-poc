@@ -700,8 +700,12 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // subqueries — the entire subquery is classic-only and a partial rewrite
   // (smartscape dim inside a classic-fetch subquery) produces invalid DQL.
   const pass2NonSmartscapeRegions = findNonSmartscapeLookupRegions(rewritten);
+  // A classicEntitySelector pass 1.5 could not translate stays classic — so
+  // must the dimension handed to it.
+  const pass2SelectorRegions = findSurvivingSelectorRegions(rewritten);
   rewritten = rewritten.replace(ENTITY_DIM_PATTERN, (full, entityType: string, offset: number) => {
     if (isInsideRegion(offset, pass2NonSmartscapeRegions)) return full;
+    if (isInsideRegion(offset, pass2SelectorRegions)) return full;
     // Only rewrite AWS entities. Non-AWS (APM/infra/K8s/Azure) are left classic.
     if (entityScope(entityType) === 'non-aws') {
       noteNonAwsEntity(warnings, entityType);
@@ -1706,7 +1710,17 @@ function rewriteCustomDeviceViaService(
   CUSTOM_DEVICE_FETCH_FILTER_RE.lastIndex = 0;
   let out = input.replace(CUSTOM_DEVICE_FETCH_FILTER_RE, () => `smartscapeNodes ${nodeType}`);
   out = out.replace(BARE_FETCH_CUSTOM_DEVICE_RE, () => `smartscapeNodes ${nodeType}`);
-  out = out.replace(CUSTOM_DEVICE_REF_RE, (m) => (m.startsWith('`') ? '`' + dim + '`' : dim));
+  // Leave the dimension alone inside a classicEntitySelector that is staying
+  // classic. `in(dt.smartscape.X, classicEntitySelector(…))` matches a
+  // Smartscape id against classic entity ids: it parses and returns nothing.
+  // EXJ AWS Lambda hit this on 19 tiles — its selectors are built with
+  // concat(), so pass 1.5 cannot translate them and they stay classic.
+  const selectorRegions = findSurvivingSelectorRegions(out);
+  out = out.replace(CUSTOM_DEVICE_REF_RE, (m, ...rest) => {
+    const offset = rest[rest.length - 2] as number;
+    if (isInsideRegion(offset, selectorRegions)) return m;
+    return m.startsWith('`') ? '`' + dim + '`' : dim;
+  });
   if (out === input) return input;
 
   ctx.sourceSmartscapeType = nodeType;
@@ -1871,6 +1885,51 @@ function findNotPlannedLookupSource(input: string): string | null {
  * guard in case the pre-pass misses an edge case (e.g. lookup syntax that
  * doesn't match `findNotPlannedLookupSource`'s regex).
  */
+/**
+ * Spans covering an `in(<dim>, classicEntitySelector(…))` call that is STILL
+ * classic at this point in the pipeline.
+ *
+ * Pass 1.5 translates the selectors it can parse. What survives — a selector
+ * built with `concat(...)`, or one whose predicates have no equivalent — stays
+ * classic on purpose. The generic dim swap must then leave the dimension alone
+ * too: `in(dt.smartscape.X, classicEntitySelector(…))` resolves a Smartscape id
+ * against classic entity ids, the two never intersect, and the tile silently
+ * returns nothing. Verified live on EXJ AWS Lambda, where this shape reached
+ * the promote gate across 19 tiles.
+ */
+function findSurvivingSelectorRegions(input: string): Array<{ start: number; end: number }> {
+  const regions: Array<{ start: number; end: number }> = [];
+  const re = /\bin\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(input)) !== null) {
+    const start = m.index;
+    let d = 0;
+    let end = -1;
+    // Quote-aware: these selectors are frequently built with
+    // concat("type(CUSTOM_DEVICE),tags([AWS]App", …), so parens inside string
+    // literals must not move the depth counter or the region ends early and
+    // the guard silently misses.
+    let quote: string | null = null;
+    for (let i = start; i < input.length; i++) {
+      const c = input[i]!;
+      if (quote) {
+        if (c === '\\') { i++; continue; }
+        if (c === quote) quote = null;
+        continue;
+      }
+      if (c === '"' || c === "'") { quote = c; continue; }
+      if (c === '(') d++;
+      else if (c === ')') {
+        d--;
+        if (d === 0) { end = i + 1; break; }
+      }
+    }
+    if (end < 0) continue;
+    if (input.slice(start, end).includes('classicEntitySelector')) regions.push({ start, end });
+  }
+  return regions;
+}
+
 function findNonSmartscapeLookupRegions(input: string): Array<{ start: number; end: number }> {
   const regions: Array<{ start: number; end: number }> = [];
   const re = /\blookup\s*\[\s*fetch\s+`?dt\.entity\.([\w:]+)`?/g;

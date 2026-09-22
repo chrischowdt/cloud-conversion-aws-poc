@@ -296,13 +296,21 @@ describe('rewriteDql — reviewer-feedback fixes (entity.name / tags / region)',
     assert.match(r.rewritten, /filter: in\(toString\(dt\.smartscape\.aws_sqs_queue\), \$custom_device_ids\)/);
   });
 
-  it('does NOT cast the classicEntitySelector value form (manual migration)', () => {
+  it('does NOT cast, and leaves the dim classic, when a selector survives', () => {
+    // A classicEntitySelector that pass 1.5 could not translate stays classic,
+    // and so must its dimension. `in(dt.smartscape.X, classicEntitySelector(…))`
+    // matches a Smartscape id against classic entity ids — it parses and
+    // returns nothing. Seen live on EXJ AWS Lambda across 19 tiles, where the
+    // selector was built with concat() so the translator had to bail.
     const r = rewriteDql(
       'timeseries avg(cloud.aws.ec2.cpu.usage), by:{ dt.entity.ec2_instance }, filter: in(dt.entity.ec2_instance, classicEntitySelector("type(EC2_INSTANCE)"))',
       buildIndex([])
     );
-    assert.match(r.rewritten, /in\(dt\.smartscape\.aws_ec2_instance, classicEntitySelector/);
+    assert.match(r.rewritten, /in\(dt\.entity\.ec2_instance, classicEntitySelector/);
+    assert.doesNotMatch(r.rewritten, /in\(dt\.smartscape\.[\w.]+, classicEntitySelector/);
     assert.doesNotMatch(r.rewritten, /toString/);
+    // The grouping dim outside the selector still converts.
+    assert.match(r.rewritten, /by:\{ dt\.smartscape\.aws_ec2_instance \}/);
   });
 
   it('dedupes a duplicate grouping dim in a by:{} clause (FIELD_SPECIFIED_TWICE)', () => {
@@ -1889,5 +1897,38 @@ describe('Metric Streams -> polled equivalent', () => {
       buildIndex([])
     );
     assert.ok(r.warnings.some((w) => w.kind === 'metric-streams-blocked'));
+  });
+});
+
+describe('a surviving classicEntitySelector keeps its classic dimension', () => {
+  it('leaves the dim classic when the selector is built with concat()', () => {
+    // Pass 1.5 cannot parse a dynamically-built selector, so it stays classic.
+    // Swapping the dim anyway yields in(dt.smartscape.X, classicEntitySelector(…)),
+    // which matches a Smartscape id against classic ids: parses, returns nothing.
+    const r = rewriteDql(
+      'timeseries avg(cloud.aws.lambda.duration), by:{dt.entity.custom_device}, ' +
+        'filter:{ in(dt.entity.custom_device,classicEntitySelector(concat("type(CUSTOM_DEVICE),tags([AWS]App",$appci,")"))) }',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /in\(dt\.entity\.custom_device,\s*classicEntitySelector/);
+    assert.doesNotMatch(r.rewritten, /in\(dt\.smartscape\.[\w.]+,\s*classicEntitySelector/);
+  });
+
+  it('still converts dimensions OUTSIDE the selector', () => {
+    const r = rewriteDql(
+      'timeseries avg(m), by:{dt.entity.ec2_instance}, filter: in(dt.entity.ec2_instance, classicEntitySelector("type(EC2_INSTANCE)"))',
+      buildIndex([])
+    );
+    assert.match(r.rewritten.replace(/\s/g, ''), /by:\{dt\.smartscape\.aws_ec2_instance\}/);
+  });
+
+  it('is quote-aware — parens inside a string literal do not end the region', () => {
+    // `concat("…tags([AWS]X:", $v, ")")` carries unbalanced parens inside
+    // strings; a naive walker ends the region early and the guard misses.
+    const r = rewriteDql(
+      'timeseries avg(cloud.aws.lambda.duration), filter:{ in(dt.entity.custom_device,classicEntitySelector(concat("type(CUSTOM_DEVICE),tags([AWS]CI:",$v,")"))) }',
+      buildIndex([])
+    );
+    assert.doesNotMatch(r.rewritten, /in\(dt\.smartscape\.[\w.]+,\s*classicEntitySelector/);
   });
 });

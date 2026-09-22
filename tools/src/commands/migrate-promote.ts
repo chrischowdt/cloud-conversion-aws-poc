@@ -77,8 +77,11 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
       const dec = decisions.get(id)?.decision;
       const ready = isReadyToPublish(dec);
       const done = isPublished(dec) || r['status'] === 'promoted' || r['status'] === 'verified';
-      const lane = r['lane'];
-      return ready && !done && (lane === 'fast' || lane === 'review') && (!idFilter || idFilter.has(id));
+      // Lane is OUR assessment; `Ready To Publish` is a person's. When they
+      // disagree, the person wins — a reviewer who marks a blocked-lane asset
+      // ready has usually fixed it somewhere we cannot see. The real guards
+      // (drift, lint, and the no-op check below) still apply.
+      return ready && !done && (!idFilter || idFilter.has(id));
     })
     .map(([id, r]) => ({
       id,
@@ -117,13 +120,11 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
   for (const c of candidates) {
     // Resolve content to cut over.
     let content: unknown;
-    if (c.lane === 'review') {
-      const revPath = join(reviewedDir, `${c.id}.json`);
-      if (!existsSync(revPath)) {
-        console.log(`  ! ${c.id} (${c.name}) — no pulled copy; run \`cct migrate-pull\` first. Skipping.`);
-        skipped++;
-        continue;
-      }
+    // Prefer a pulled review copy whenever one exists — including for an asset
+    // our lane called `blocked`, since a reviewer marking it ready means they
+    // know something we do not.
+    const revPath = join(reviewedDir, `${c.id}.json`);
+    if (existsSync(revPath)) {
       const rev = JSON.parse(await readFile(revPath, 'utf8')) as Record<string, unknown>;
       content = (rev['content'] as unknown) ?? rev;
     } else {
@@ -206,6 +207,22 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
       skipped++;
       continue;
     }
+    // Refuse a no-op cutover. Now that a reviewer's `Ready To Publish` can pull
+    // in an asset our lane called blocked, it is possible to reach here with
+    // content identical to what is already live — nothing was ever converted.
+    // Writing it would bump the version and stamp the row `Published`, claiming
+    // a migration that did not happen. Skip and say so.
+    const liveText = typeof live.content === 'string' ? live.content : JSON.stringify(live.content);
+    const applyText = typeof apply.content === 'string' ? apply.content : JSON.stringify(apply.content);
+    if (liveText === applyText) {
+      console.log(
+        `  ! ${c.id} (${c.name}) — content already matches live; nothing was converted. ` +
+          `Skipping rather than stamping it Published.`
+      );
+      skipped++;
+      continue;
+    }
+
     await mkdir(prePromoteDir, { recursive: true });
     await writeFile(join(prePromoteDir, `${c.id}.json`), JSON.stringify({ content: live.content, owner: live.metadata.owner }, null, 2));
 

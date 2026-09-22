@@ -109,3 +109,17 @@ describe('output-lint — mechanics', () => {
     assert.equal(s.advisory, 1);
   });
 });
+
+describe('output-lint — ignores code the engine never runs', () => {
+  it('skips constructs parked inside a /* … */ block', () => {
+    // Reviewers keep an old version of a query in a block comment. Flagging it
+    // trains people to ignore the lint.
+    const q = '/* filter getNodeField(dt.smartscape.service, "tags:aws")[a] == "b" */\ntimeseries v=avg(m)';
+    assert.deepEqual(lintQuery(q).map((f) => f.ruleId), []);
+  });
+
+  it('still flags the same construct when it is live', () => {
+    const q = '/* an old note */\nfilter getNodeField(dt.smartscape.service, "tags:aws")[a] == "b"';
+    assert.ok(lintQuery(q).some((f) => f.ruleId === 'service-tags-null'));
+  });
+});

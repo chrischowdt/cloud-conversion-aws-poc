@@ -29,10 +29,16 @@ export interface LintRule {
 
 /** Strip `//` reference comments — we lint what RUNS, not the annotation. */
 export function liveQuery(q: string): string {
-  return q
-    .split(/\r?\n/)
-    .filter((l) => !/^\s*\/\//.test(l))
-    .join('\n');
+  return (
+    q
+      .split(/\r?\n/)
+      .filter((l) => !/^\s*\/\//.test(l))
+      .join('\n')
+      // Also drop /* … */ blocks: reviewers park an old version of a query in
+      // one, and flagging code the engine never runs trains people to ignore
+      // the lint.
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+  );
 }
 
 export const LINT_RULES: LintRule[] = [
@@ -60,8 +66,10 @@ export const LINT_RULES: LintRule[] = [
     id: 'classic-relationship-smartscape-dim',
     severity: 'blocking',
     message:
-      'A classic relationship projection with a Smartscape dimension inside it. Verified live: ' +
-      'DQL 400 FIELD_DOES_NOT_EXIST. Classic relationship arrays only exist on classic entity records.',
+      'A relationship projection mixing the two models. On a classic `fetch` it is fatal — verified ' +
+      'live: DQL 400 FIELD_DOES_NOT_EXIST. On a `smartscapeNodes` query it parses but the field is ' +
+      'always null: can_access[dt.smartscape.…] and references[can_access.…] both returned 0 non-null ' +
+      'across all 996 AWS_ACCOUNT nodes.',
     fix: 'Collapse the chain to the resource node’s own field (e.g. aws.account.id), or keep it classic.',
     test: (q) =>
       /\b(accessible_by|belongs_to|runs|instance_of|clustered_by|can_access)\s*\[\s*`?dt\.smartscape\./.test(q),
