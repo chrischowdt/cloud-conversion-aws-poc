@@ -989,7 +989,12 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   //   classic `tags`              6 rows
   //   matchesPhrase(tags, …)      0 rows   <- record passed to a string matcher
   //   matchesPhrase(toString(tags), …)  12 rows   <- the fix
-  if (fetchContext.didRewriteFetch) {
+  // Condition is "the query reads Smartscape nodes", not "WE restructured the
+  // fetch". Pass 0.8 emits `smartscapeNodes "AWS*"` for the metric-less
+  // custom_device list idiom without setting didRewriteFetch, so its output kept
+  // a bare `tags` and rendered empty — found on prod in ecsProcess and two
+  // copies of it.
+  if (fetchContext.didRewriteFetch || /\bsmartscapeNodes\b/.test(rewritten)) {
     const STRING_FNS = /\b(matchesPhrase|matchesValue|contains|startsWith|endsWith|lower|upper)\(\s*tags\s*(?=[,)])/g;
     if (STRING_FNS.test(rewritten)) {
       STRING_FNS.lastIndex = 0;

@@ -1932,3 +1932,30 @@ describe('a surviving classicEntitySelector keeps its classic dimension', () => 
     assert.doesNotMatch(r.rewritten, /in\(dt\.smartscape\.[\w.]+,\s*classicEntitySelector/);
   });
 });
+
+describe('toString(tags) fires on any smartscapeNodes query', () => {
+  it('wraps tags even when another pass produced the smartscapeNodes query', () => {
+    // Pass 0.8 emits `smartscapeNodes "AWS*"` for the metric-less custom_device
+    // list idiom WITHOUT setting didRewriteFetch. Gating on that flag left a
+    // bare `tags` in its output, which renders empty (classic 6 rows, unwrapped
+    // 0, toString 12). Seen on prod in ecsProcess and two copies of it.
+    const r = rewriteDql(
+      'smartscapeNodes "AWS*" | fields id, tags | filter matchesPhrase(tags, "letter")',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /matchesPhrase\(toString\(tags\)/);
+  });
+
+  it('does not double-wrap an already-correct query', () => {
+    const r = rewriteDql(
+      'smartscapeNodes "AWS*" | filter matchesPhrase(toString(tags), "letter")',
+      buildIndex([])
+    );
+    assert.doesNotMatch(r.rewritten, /toString\(toString\(/);
+  });
+
+  it('leaves a non-Smartscape query alone', () => {
+    const q = 'fetch dt.entity.service | filter matchesPhrase(tags, "x")';
+    assert.equal(rewriteDql(q, buildIndex([])).rewritten, q);
+  });
+});
