@@ -36,6 +36,12 @@ export interface DetectorReviewItem {
   eventTemplateChanges: EventTemplateChange[];
   warnings: Warning[];
   bucket: ReviewBucket;
+  /**
+   * Blocking output-lint findings on the REWRITTEN query. These are shapes we
+   * have measured returning nothing, so the reviewer has to see them: unlike a
+   * warning, the query here is known-bad rather than merely unverified.
+   */
+  lint?: Array<{ ruleId: string; message: string; fix?: string }>;
 }
 
 /** Minimal notebook `content` shape the Document Service accepts (`type: notebook`). */
@@ -168,6 +174,14 @@ export function buildDetectorMarkdown(item: DetectorReviewItem): string {
         '(and what BigPanda reads). No query-side `fieldsAdd` is needed — the `by:{}` clause below ' +
         'already emits the dimension.'
     );
+  }
+  if (item.lint?.length) {
+    lines.push('');
+    lines.push('**⛔ This conversion returns NO DATA as written — it needs a human fix:**');
+    for (const f of item.lint) {
+      lines.push(`- \`${f.ruleId}\` — ${f.message}`);
+      if (f.fix) lines.push(`  <br/>Suggested: ${f.fix}`);
+    }
   }
   const blocking = item.warnings.filter((w) => isBlockingWarning(w.kind));
   const soft = item.warnings.filter((w) => !isBlockingWarning(w.kind));

@@ -27,6 +27,7 @@ import { enrichedTagsPathIfPresent } from '../lib/enriched-tags.ts';
 import { entityCandidatesPathIfPresent } from '../lib/entity-candidates.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { isBlockingWarning } from '../lib/dql-rewriter.ts';
+import { lintAsset } from '../lib/output-lint.ts';
 import { rewriteDetector, detectorQuery } from '../lib/detector-rewrite.ts';
 import {
   buildDetectorNotebook,
@@ -133,6 +134,9 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
       eventTemplateChanges: r.eventTemplateChanges,
       warnings: r.warnings,
       bucket,
+      lint: lintAsset({ query: r.query.rewritten })
+        .filter((f) => f.severity === 'blocking')
+        .map((f) => ({ ruleId: f.ruleId, message: f.message, fix: f.fix })),
     });
   }
 
@@ -235,9 +239,25 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
     }
     flush();
   } else {
+    // Continue numbering from the batches already published. Restarting at 01
+    // every run collides with a live notebook: the label names the prepared
+    // file AND the notebook, so a second run silently overwrote batch-01's
+    // payload and added a duplicate manifest entry.
+    let nextBatch = 1;
+    try {
+      const prior = (JSON.parse(await readFile(join(reviewDir, 'manifest.json'), 'utf8')) as {
+        batches?: ManifestEntry[];
+      }).batches ?? [];
+      for (const b of prior) {
+        const m = /^batch-(\d+)$/.exec(String(b.batch ?? ''));
+        if (m) nextBatch = Math.max(nextBatch, Number(m[1]) + 1);
+      }
+    } catch {
+      /* first run */
+    }
     for (const [i, c] of chunk(scoped, batchSize).entries()) {
       batches.push(c);
-      labels.push(`batch-${String(i + 1).padStart(2, '0')}`);
+      labels.push(`batch-${String(nextBatch + i).padStart(2, '0')}`);
     }
   }
   console.log(
@@ -263,7 +283,9 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
     if (!args.apply) {
       const fileLabel = label.toLowerCase().replace(/[^a-z0-9]+/g, '-');
       await writeFile(join(reviewDir, `${fileLabel}.json`), JSON.stringify({ name, type: 'notebook', content }, null, 2));
-      manifest.push(entry);
+      // Deliberately NOT added to the manifest: a prepare run publishes nothing,
+      // and an id-less entry both pollutes the record of live notebooks and
+      // pushes the next run's batch numbering past a batch that never existed.
       continue;
     }
 
