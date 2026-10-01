@@ -37,6 +37,7 @@ import { runDownloadAnomalyDetectors } from './commands/download-anomaly-detecto
 import { runScanNotebooks } from './commands/scan-notebooks.ts';
 import { runScanAnomalyDetectors } from './commands/scan-anomaly-detectors.ts';
 import { runMigrateRefresh } from './commands/migrate-refresh.ts';
+import { runRefreshAlertTracker } from './commands/refresh-alert-tracker.ts';
 import { runMigrateStage } from './commands/migrate-stage.ts';
 import { runMigratePull } from './commands/migrate-pull.ts';
 import { runMigratePromote } from './commands/migrate-promote.ts';
@@ -172,6 +173,10 @@ COMMANDS
                     empty .By.<Dim> variants: if a DAC-mapped key has no data
                     but a sibling dim does, it prefers the populated one.
                     Flags: --from, --da-source.
+  refresh-alert-tracker
+                    Build an alert tracker (.xlsx) of AWS anomaly detectors,
+                    using the SAME columns as the asset tracker so rows paste
+                    straight in. Flags: --tracker <path>.
   migrate-refresh   Build/refresh the shared migration tracker (.xlsx) from
                     scan + compare + manifest artifacts already on disk. Read-only
                     (no tenant/dtctl). Assigns each AWS asset a confidence + lane
@@ -613,6 +618,18 @@ async function main(): Promise<void> {
       });
       return;
     }
+    case 'refresh-alert-tracker': {
+      // Alerts get their OWN tracker: a detector is a Settings object, not a
+      // document, so it never travels the stage/promote pipeline. Same columns
+      // though, so the rows paste into the asset tracker if that is preferred.
+      const baseUrl = getString(args.flags, 'base-url') ?? process.env.DT_BASE_URL ?? '';
+      await runRefreshAlertTracker({
+        outDir: tenantOut(args.flags, baseUrl),
+        trackerPath: getString(args.flags, 'tracker'),
+        baseUrl,
+      });
+      return;
+    }
     case 'migrate-refresh': {
       // Offline: builds the .xlsx tracker from scan/compare/manifest artifacts.
       const outDir = offlineTenantOut(args.flags);
@@ -639,6 +656,7 @@ async function main(): Promise<void> {
         limit: getNumber(args.flags, 'limit'),
         apply: args.flags.get('apply') === true,
         restage: args.flags.get('restage') === true,
+        includeInReview: args.flags.get('include-in-review') === true,
         assetType: getString(args.flags, 'asset-type') as any,
         shareGroupId: getString(args.flags, 'share-group') ?? process.env.DT_SHARE_GROUP_ID,
         mappingPath: getString(args.flags, 'mapping'),

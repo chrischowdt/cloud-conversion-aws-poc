@@ -77,9 +77,17 @@ export const HUMAN_COLUMNS = [
 const ALL_COLUMNS = [...TOOL_COLUMNS, ...HUMAN_COLUMNS];
 const TOOL_KEYS = new Set(TOOL_COLUMNS.map((c) => c.key));
 
+/**
+ * What the TRACKER can hold. Wider than `AssetType`, which is deliberately the
+ * document types only (`doc-apply` builds Document API payloads and a Davis
+ * anomaly detector is a Settings 2.0 object, never a document). Alerts are
+ * tracked for status but never travel the stage/promote pipeline.
+ */
+export type TrackedAssetType = AssetType | 'anomaly-detector';
+
 export interface TrackerRow {
   asset_id: string;
-  asset_type: AssetType;
+  asset_type: TrackedAssetType;
   name: string;
   /**
    * Deep link to the LIVE asset. Written as a plain URL string — Excel turns it
