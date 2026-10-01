@@ -2579,9 +2579,14 @@ function rewriteClassicTagExpandIdiom(input: string, transforms: Transform[]): s
     // Drop the expand only once nothing treats the var as a tag STRING any
     // more. A survivor means we did not understand the query, and removing the
     // expand would change its meaning rather than preserve it.
+    // The use may be WRAPPED — `contains(lower(tags), "applicationci:bbt")` is
+    // still treating the var as a string, and dropping the expand there leaves
+    // a filter that matches nothing. Found on BBT - SNS
+    // NumberOfNotificationsFailed, where this guard let the expand go.
     const stillStringy = new RegExp(
-      `(?:contains|splitString|matchesPhrase|matchesValue|startsWith|endsWith)\\(\\s*${V}\\s*,`
-    ).test(out);
+      `(?:contains|splitString|matchesPhrase|matchesValue|startsWith|endsWith)\\(\\s*` +
+        `(?:(?:lower|upper|toString|arraySort)\\(\\s*)?${V}\\s*[,)]`
+    ).test(out) || new RegExp(`(?:lower|upper|arraySort)\\(\\s*${V}\\s*\\)`).test(out);
     if (stillStringy) continue;
     const expandRe = new RegExp(`\\s*\\|\\s*expand\\s+${V}\\b[^\\n|]*`, 'g');
     if (expandRe.test(out)) {

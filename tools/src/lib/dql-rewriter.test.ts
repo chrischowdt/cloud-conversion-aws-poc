@@ -2065,3 +2065,17 @@ describe('classic `expand tags` + splitString extraction', () => {
     assert.match(r.rewritten, /expand tags/);
   });
 });
+
+describe('expand is kept when the tag var is used as a string through a wrapper', () => {
+  it('keeps expand for contains(lower(tags), "key:value")', () => {
+    // BBT - SNS NumberOfNotificationsFailed. Removing the expand here left a
+    // filter matching 0 of 343 series; the lint rule blocks it for a human.
+    const q =
+      'timeseries failed = sum(cloud.aws.sns.number_of_notifications_failed_sum), by:{dt.entity.custom_device}\n' +
+      '| fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")\n' +
+      '| expand tags\n' +
+      '| filter contains(lower(tags), "applicationci:bbt")';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /expand tags/);
+  });
+});
