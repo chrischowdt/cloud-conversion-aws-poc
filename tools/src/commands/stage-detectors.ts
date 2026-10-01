@@ -113,12 +113,33 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   }
   const objects = file.objects ?? [];
 
+  // Detectors already sitting in a published review notebook. Without this a
+  // plain run re-stages the same first N into a second notebook, giving the
+  // same detector two verdict cards in two places. `--ids` and `--restage` are
+  // explicit about what they want, so they opt out.
+  const alreadyStaged = new Set<string>();
+  if (!idFilter && !args.restage) {
+    try {
+      const prior = (JSON.parse(await readFile(join(reviewDir, 'manifest.json'), 'utf8')) as {
+        batches?: ManifestEntry[];
+      }).batches ?? [];
+      for (const b of prior) {
+        if (!b.notebookId) continue;
+        for (const d of b.detectors ?? []) alreadyStaged.add(d.objectId);
+      }
+    } catch {
+      /* first run */
+    }
+  }
+
   // Rewrite every AWS detector; keep the ones in the wanted buckets.
   const items: DetectorReviewItem[] = [];
+  let skippedStaged = 0;
   for (const o of objects) {
     const q = detectorQuery(o.value);
     if (!q || !/cloud\.aws\./.test(q)) continue;
     if (idFilter && !idFilter.has(o.objectId)) continue;
+    if (alreadyStaged.has(o.objectId)) { skippedStaged++; continue; }
     const r = rewriteDetector(o.value, index);
     if (!r.query) continue;
     const bucket = bucketOf(r.warnings);
@@ -262,7 +283,8 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   }
   console.log(
     `${args.apply ? 'Staging' : 'Preparing'} ${scoped.length} AWS detector(s) into ${batches.length} review notebook(s) ` +
-      `(batch size ${batchSize}, buckets [${[...wantBuckets].join(', ')}])…`
+      `(batch size ${batchSize}, buckets [${[...wantBuckets].join(', ')}])…` +
+      (skippedStaged ? ` — skipped ${skippedStaged} already in a published batch` : '')
   );
 
   const client = args.apply ? new DocumentClient({ baseUrl: args.baseUrl, token: args.token }) : null;
