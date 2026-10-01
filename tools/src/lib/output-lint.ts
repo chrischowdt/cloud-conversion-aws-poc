@@ -43,6 +43,28 @@ export function liveQuery(q: string): string {
 
 export const LINT_RULES: LintRule[] = [
   {
+    id: 'tags-record-treated-as-array',
+    severity: 'blocking',
+    message:
+      'Treats the Smartscape `tags:aws` RECORD as the classic tag ARRAY. Classic ' +
+      'entityAttr(x,"tags") returns a list of "Key:value" strings, so queries expand it, arraySort it, ' +
+      'or parse it; the new field is a record whose toString() is JSON ({"ApplicationCI":"bbt"}), so ' +
+      'those all yield nothing without erroring. Measured on a real corpus query (nic55601 Lambda ' +
+      'invocations by applicationci): classic 270 records, this form 0. `expand` of the record ' +
+      'returns a single null row.',
+    fix: 'Read the record by key instead: tags[ApplicationCI] — no expand/arraySort/parse needed.',
+    test: (q) => {
+      const vars = new Set<string>();
+      for (const m of q.matchAll(/\b(\w+)\s*=\s*getNodeField\([^,]+,\s*"tags:aws"\s*\)/g)) vars.add(m[1]!);
+      if (vars.size === 0) return false;
+      for (const v of vars) {
+        if (new RegExp(`\\|\\s*expand\\s+${v}\\b`).test(q)) return true;
+        if (new RegExp(`\\barraySort\\(\\s*${v}\\s*\\)`).test(q)) return true;
+      }
+      return false;
+    },
+  },
+  {
     id: 'service-tags-null',
     severity: 'blocking',
     message:

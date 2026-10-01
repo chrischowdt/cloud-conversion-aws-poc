@@ -1959,3 +1959,51 @@ describe('toString(tags) fires on any smartscapeNodes query', () => {
     assert.equal(rewriteDql(q, buildIndex([])).rewritten, q);
   });
 });
+
+describe('classic `contains(tags, "Key:value")` substring filters', () => {
+  // Classic tags serialise to "Key:value" strings; the new tags:aws record
+  // serialises to JSON (`{"ApplicationCI":"bbt"}`), so the classic substring
+  // never appears. Measured on AWS_MSK_CLUSTER: classic 9 of 102 matched,
+  // our toString() output 0 of 110, the record read 9 of 110.
+  const q = (f: string) =>
+    'timeseries avg = avg(cloud.aws.kafka.offline_partitions_count), by:{ dt.entity.custom_device}\n' +
+    '| fieldsAdd tags = toString(entityAttr(dt.entity.custom_device, "tags"))\n' + f;
+
+  it('reads the tag record by key instead of substring-matching it', () => {
+    const r = rewriteDql(q('| filter contains(tags, "ApplicationCI:bbt")'), buildIndex([]));
+    assert.match(r.rewritten, /contains\(tags\[ApplicationCI\], "bbt"\)/);
+    assert.doesNotMatch(r.rewritten, /toString\(/);
+  });
+
+  it('strips the classic [AWS] tag prefix', () => {
+    const r = rewriteDql(q('| filter contains(tags, "[AWS]env:prod")'), buildIndex([]));
+    assert.match(r.rewritten, /contains\(tags\[env\], "prod"\)/);
+  });
+
+  it('resolves `location` from the node field, not a tag', () => {
+    // location is the classic region auto-tag and is not universally present;
+    // aws.region is a field on every AWS node.
+    const r = rewriteDql(q('| filter contains(tags, "location:us-east-2")'), buildIndex([]));
+    assert.match(r.rewritten, /matchesValue\(getNodeField\(dt\.smartscape\.aws_msk_cluster, "aws\.region"\), "us-east-2"\)/);
+    assert.doesNotMatch(r.rewritten, /tags\[location\]/);
+  });
+
+  it('leaves ARN substring matches alone — `arn` is a value, not a tag key', () => {
+    // 120 uses in the corpus. The value carries colons, which is the signal.
+    const r = rewriteDql(q('| filter contains(tags, "arn:aws:kafka:us-east-2")'), buildIndex([]));
+    assert.match(r.rewritten, /contains\(tags, "arn:aws:kafka:us-east-2"\)/);
+    assert.doesNotMatch(r.rewritten, /tags\[arn\]/);
+  });
+
+  it('keeps toString() when the var is still used as a string elsewhere', () => {
+    const r = rewriteDql(
+      q('| filter contains(tags, "env:prod")\n| filter matchesPhrase(tags, "something")'),
+      buildIndex([])
+    );
+    // The record is indexed inline so the surviving string use stays valid:
+    // `tags` keeps its toString() binding and matchesPhrase still gets a string.
+    assert.match(r.rewritten, /getNodeField\(dt\.smartscape\.aws_msk_cluster, "tags:aws"\)\[env\]/);
+    assert.match(r.rewritten, /tags = toString\(getNodeField\(/);
+    assert.match(r.rewritten, /matchesPhrase\(tags, "something"\)/);
+  });
+});

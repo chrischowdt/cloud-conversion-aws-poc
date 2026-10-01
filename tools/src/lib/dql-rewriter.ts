@@ -976,6 +976,12 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     }
   }
 
+  // Pass 2.73: classic `contains(<tags>, "Key:value")` → tag-record key read.
+  //
+  // Must run BEFORE 2.75: left alone, that pass wraps these in toString() and
+  // produces a filter that parses, runs, and matches nothing.
+  rewritten = rewriteClassicTagSubstringFilters(rewritten, transforms);
+
   // Pass 2.75: `tags` is a RECORD on the new side — string functions need toString().
   //
   // The classic entity's `tags` behaved like a string, so dashboards wrote
@@ -2418,6 +2424,90 @@ function rewriteLeftoverAccountColumn(input: string, transforms: Transform[]): s
 // non-AWS `tags` usage is never touched (reviewer caught an over-reach on spans).
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ─── Pass 2.73: classic `contains(<tags>, "Key:value")` → tag-record key read ──
+//
+// Classic `entityAttr(x,"tags")` serialises to a list of "Key:value" strings, so
+// dashboards and alerts filter it with a substring test. On the new side the AWS
+// tag field is a RECORD whose toString() is JSON — `{"ApplicationCI":"bbt"}` —
+// so the classic substring never appears and the filter silently matches zero.
+//
+// Measured on AWS_MSK_CLUSTER (nic55601):
+//   classic  contains(tags, "ApplicationCI:bbt")               9 of 102
+//   ours     contains(toString(tags), "ApplicationCI:bbt")     0 of 110  <- silent
+//   fixed    contains(tags[ApplicationCI], "bbt")              9 of 110  <- parity
+//
+// `location` is not an AWS tag: it is the classic region auto-tag, and it is not
+// universally present. Region is a FIELD on every AWS node, so read it there —
+// the entity is the reliable source, the tag is not:
+//   classic  contains(tags, "location:us-east-2")             47 of 102
+//   ours     contains(toString(tags), "location:…")            0 of 110  <- silent
+//   fixed    matchesValue(getNodeField(d,"aws.region"), "…")  51 of 110
+//
+// Scoped to values containing NO colon, which is what keeps ARNs out of here
+// (`contains(tags, "arn:aws:kafka:…")` — 120 uses in the corpus, where `arn` is
+// a value fragment rather than a tag key).
+const CLASSIC_REGION_TAG = /^location$/i;
+/** `tags` passed bare to a string function — the shape Pass 2.75 fixes. */
+const STRING_FN_NAMES = 'matchesPhrase|matchesValue|contains|startsWith|endsWith|lower|upper';
+
+function rewriteClassicTagSubstringFilters(input: string, transforms: Transform[]): string {
+  // Only vars bound to a STRINGIFIED AWS tag record carry the classic idiom.
+  const assignRe =
+    /\b([A-Za-z_]\w*)\s*=\s*toString\(\s*getNodeField\(\s*([^,()]+?)\s*,\s*"tags:aws"\s*\)\s*\)/g;
+  const bound = new Map<string, string>();
+  for (let m = assignRe.exec(input); m; m = assignRe.exec(input)) bound.set(m[1]!, m[2]!.trim());
+  if (bound.size === 0) return input;
+
+  let out = input;
+  for (const [v, dim] of bound) {
+    const filterRe = new RegExp(
+      `contains\\(\\s*${escapeRegExp(v)}\\s*,\\s*"(?:\\[AWS\\])?([A-Za-z][\\w-]*):([^":]*)"\\s*\\)`,
+      'g'
+    );
+    // Placeholder first: whether the var can hold a record depends on whether
+    // any string-function use of it SURVIVES this rewrite.
+    const marker = `\u0001TAGREC:${v}\u0001`;
+    const pending: Array<{ before: string; key: string; value: string; region: boolean }> = [];
+    out = out.replace(filterRe, (full, key: string, value: string) => {
+      const region = CLASSIC_REGION_TAG.test(key);
+      pending.push({ before: full, key, value, region });
+      return region
+        ? `matchesValue(getNodeField(${dim}, "aws.region"), ${JSON.stringify(value)})`
+        : `contains(${marker}[${key}], ${JSON.stringify(value)})`;
+    });
+    if (pending.length === 0) continue;
+
+    // If nothing else treats the var as a string, drop the toString() so it
+    // holds the record and reads cleanly as `tags[Key]`. Otherwise leave the
+    // var alone and index the record inline — unwrapping it would silently
+    // break the remaining string use.
+    const stillString = new RegExp(`\\b(?:${STRING_FN_NAMES})\\(\\s*${escapeRegExp(v)}\\s*[,)]`).test(out);
+    if (stillString) {
+      out = out.split(marker).join(`getNodeField(${dim}, "tags:aws")`);
+    } else {
+      out = out.split(marker).join(v);
+      out = out.replace(
+        new RegExp(`\\b${escapeRegExp(v)}\\s*=\\s*toString\\(\\s*(getNodeField\\(\\s*[^,()]+?\\s*,\\s*"tags:aws"\\s*\\))\\s*\\)`, 'g'),
+        (_m, gnf: string) => `${v} = ${gnf}`
+      );
+    }
+
+    for (const p of pending) {
+      transforms.push({
+        kind: 'entity-dim',
+        before: p.before,
+        after: p.region
+          ? `matchesValue(getNodeField(${dim}, "aws.region"), ${JSON.stringify(p.value)})`
+          : `contains(${stillString ? `getNodeField(${dim}, "tags:aws")` : v}[${p.key}], ${JSON.stringify(p.value)})`,
+        detail: p.region
+          ? 'classic `location` tag → aws.region field (region is a node field, not a universally present tag)'
+          : `classic tag substring → tag-record key read (${p.key}); the serialized record is JSON, so "Key:value" never matches`,
+      });
+    }
+  }
+  return out;
 }
 
 function rewriteAwsTagFilters(input: string, transforms: Transform[]): string {

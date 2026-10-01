@@ -77,7 +77,10 @@ describe('buildDetectorMarkdown', () => {
     );
     assert.match(md, /AWS_RDS_DBINSTANCE/);
     assert.match(md, /auto-rescaled 10 → 5/);
-    assert.match(md, /binding rewritten/i);
+    // The reviewer makes the event-property edit by hand in the detector
+    // settings, so the exact before → after has to be in the card.
+    assert.match(md, /Event properties — apply these in the detector settings/i);
+    assert.match(md, /dt\.smartscape_source\.id/);
     assert.match(md, /assumed aws context/);
   });
 

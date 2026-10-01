@@ -126,10 +126,33 @@ describe('rewriteDetector — eventTemplate binding sync', () => {
     const r = rewriteDetector(v, buildIndex([]));
     const props = (r.rewrittenValue.eventTemplate as any).properties as Array<{ key: string; value: string }>;
     const name = props.find((p) => p.key === 'event.name')!.value;
-    const bind = props.find((p) => p.key === 'dt.source_entity')!.value;
+    // Message text keeps the {dims:...} form; the BINDING is renamed to the
+    // 3rd-gen key and takes the plain form — the only one measured to bind.
     assert.equal(name, 'Deadlocks high {dims:dt.smartscape.aws_rds_dbinstance.name}');
-    assert.equal(bind, '{dims:dt.smartscape.aws_rds_dbinstance}');
+    assert.equal(props.find((p) => p.key === 'dt.source_entity'), undefined);
+    const bind = props.find((p) => p.key === 'dt.smartscape_source.id')!.value;
+    assert.equal(bind, '{dt.smartscape.aws_rds_dbinstance}');
     assert.ok(r.eventTemplateChanges.length >= 2);
+  });
+
+  it('repairs the self-referencing binding that never resolves', () => {
+    const v = detector({
+      query: 'timeseries avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}',
+      template: [{ key: 'dt.smartscape_source.id', value: '{dt.smartscape_source.id}' }],
+    });
+    const r = rewriteDetector(v, buildIndex([]));
+    const props = (r.rewrittenValue.eventTemplate as any).properties as Array<{ key: string; value: string }>;
+    assert.equal(props.find((p) => p.key === 'dt.smartscape_source.id')!.value, '{dt.smartscape.aws_rds_dbinstance}');
+  });
+
+  it('adds a binding when the detector carries none', () => {
+    const v = detector({
+      query: 'timeseries avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}',
+      template: [{ key: 'event.name', value: 'Deadlocks high' }],
+    });
+    const r = rewriteDetector(v, buildIndex([]));
+    const props = (r.rewrittenValue.eventTemplate as any).properties as Array<{ key: string; value: string }>;
+    assert.equal(props.find((p) => p.key === 'dt.smartscape_source.id')!.value, '{dt.smartscape.aws_rds_dbinstance}');
   });
 
   it('flags (does not guess) when the query did not resolve to a smartscape dim', () => {

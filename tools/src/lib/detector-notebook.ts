@@ -154,9 +154,19 @@ export function buildDetectorMarkdown(item: DetectorReviewItem): string {
   if (item.nodeType) lines.push(`**Resolved node:** \`${item.nodeType}\` (\`${item.targetDim}\`)`);
   lines.push(thresholdLine(item.thresholdAction));
   if (item.eventTemplateChanges.length) {
+    // The notebook carries the QUERY only — the event template lives in the
+    // detector's settings, so the reviewer has to make these edits by hand.
+    // Spell them out rather than summarising: an alert whose binding is wrong
+    // still fires, just attached to nothing, which nobody notices.
+    lines.push('');
+    lines.push('**Event properties — apply these in the detector settings:**');
+    for (const c of item.eventTemplateChanges) {
+      lines.push(`- \`${c.field}\`: \`${c.before}\` → \`${c.after}\``);
+    }
     lines.push(
-      `**Alert binding rewritten:** ${item.eventTemplateChanges.length} placeholder(s) → the Smartscape dim ` +
-        `(incl. \`dt.source_entity\`). Verify the fired-event entity looks right.`
+      '  <br/>The `dt.smartscape_source.id` property is what attaches a fired alert to the new entity ' +
+        '(and what BigPanda reads). No query-side `fieldsAdd` is needed — the `by:{}` clause below ' +
+        'already emits the dimension.'
     );
   }
   const blocking = item.warnings.filter((w) => isBlockingWarning(w.kind));

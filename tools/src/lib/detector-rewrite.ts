@@ -123,6 +123,80 @@ function rewriteEventTemplateString(
   return { text, subs };
 }
 
+/** The event-template property that ties a fired alert to an entity. */
+const CLASSIC_BINDING_KEY = 'dt.source_entity';
+const SMARTSCAPE_BINDING_KEY = 'dt.smartscape_source.id';
+
+/**
+ * Point the alert's entity binding at the Smartscape node the rewritten query
+ * emits. This property IS the binding mechanism — nothing else is needed.
+ *
+ * Measured on nic55601 across 30 days of CUSTOM_ALERT events, grouped by the
+ * value form of the `dt.smartscape_source.id` property:
+ *
+ *   {dt.smartscape.<type>}      49 detectors   2,089 events   2,086 bound
+ *   {dt.smartscape_source.id}   38 detectors      64 events       0 bound
+ *   {dims:dt.smartscape.<type>}  0 detectors       — no evidence either way
+ *
+ * "Bound" means the event carries `smartscape.affected_entity.ids` — the field
+ * the BigPanda workflow reads. Presence of this property correlates 1:1 with
+ * binding, zero exceptions in 2.9M events, so a query-side
+ * `| fieldsAdd dt.smartscape_source.id = ...` is NOT required and none of the
+ * 49 working detectors has one. What the query must do is emit the dimension
+ * in its `by:{}` clause, which the query rewrite above already ensures.
+ *
+ * Hence the plain form here rather than the `{dims:...}` form we use for
+ * message TEXT: for text it is the documented way to read a dimension, but for
+ * the binding it has no working precedent and the failure mode is an alert
+ * that fires attached to nothing, which nobody notices.
+ *
+ * The self-referencing form is a hand-migration that has silently never bound;
+ * repair it wherever we find it.
+ */
+function rewriteEntityBinding(
+  props: Array<{ key?: string; value?: unknown }>,
+  targetDim: string,
+  changes: EventTemplateChange[]
+): void {
+  const bindingValue = `{${targetDim}}`;
+  const existing = props.find((p) => String(p?.key ?? '') === SMARTSCAPE_BINDING_KEY);
+  const classic = props.find((p) => String(p?.key ?? '') === CLASSIC_BINDING_KEY);
+
+  // A leftover classic binding is inert once the query reads Smartscape nodes;
+  // drop it so the migrated detector carries exactly one unambiguous binding.
+  const dropClassic = () => {
+    if (!classic) return;
+    changes.push({ field: CLASSIC_BINDING_KEY, before: String(classic.value ?? ''), after: '(removed)' });
+    props.splice(props.indexOf(classic), 1);
+  };
+
+  if (existing) {
+    if (String(existing.value ?? '') !== bindingValue) {
+      changes.push({ field: SMARTSCAPE_BINDING_KEY, before: String(existing.value ?? ''), after: bindingValue });
+      existing.value = bindingValue;
+    }
+    dropClassic();
+    return;
+  }
+
+  if (classic) {
+    // Rename the key in place — the classic field name no longer resolves.
+    changes.push({
+      field: `${CLASSIC_BINDING_KEY} → ${SMARTSCAPE_BINDING_KEY}`,
+      before: String(classic.value ?? ''),
+      after: bindingValue,
+    });
+    classic.key = SMARTSCAPE_BINDING_KEY;
+    classic.value = bindingValue;
+    return;
+  }
+
+  // No binding at all. Add one: without it the migrated alert attributes to
+  // ENVIRONMENT and BigPanda receives no entity metadata to key on.
+  changes.push({ field: SMARTSCAPE_BINDING_KEY, before: '(absent)', after: bindingValue });
+  props.push({ key: SMARTSCAPE_BINDING_KEY, value: bindingValue });
+}
+
 /**
  * Compute the threshold action for a detector, given the primary classic metric
  * key's recipe. Rescales on a clean scalar; blocks on an aggregation flip or a
@@ -224,26 +298,29 @@ export function rewriteDetector(
   const needsSync = props.some(
     (p) => typeof p?.value === 'string' && (p.value as string).includes('{dims:dt.entity.custom_device')
   );
-  if (needsSync) {
-    if (!targetDim) {
-      // The query didn't resolve to a Smartscape dim (bailed / non-AWS), so we
-      // can't safely rewrite the binding — flag it rather than guess.
-      warnings.push({
-        kind: 'custom-device-disambiguated',
-        text:
-          'Event template references {dims:dt.entity.custom_device} but the query did not resolve to a ' +
-          'dt.smartscape.<type> dimension — the alert binding could not be rewritten automatically. Verify manually.',
-      });
-    } else {
-      for (const p of props) {
-        if (typeof p?.value !== 'string') continue;
-        const { text, subs } = rewriteEventTemplateString(p.value, targetDim);
-        if (subs.length) {
-          for (const s of subs) eventTemplateChanges.push({ field: String(p.key ?? ''), before: s.before, after: s.after });
-          p.value = text;
-        }
+  if (targetDim) {
+    // The binding is rewritten whenever the query resolved to a Smartscape dim,
+    // not only when a classic `{dims:...}` placeholder is present: a detector
+    // can carry `{dt.source_entity}`, or no binding at all, and still need one.
+    rewriteEntityBinding(props, targetDim, eventTemplateChanges);
+    for (const p of props) {
+      if (typeof p?.value !== 'string') continue;
+      const { text, subs } = rewriteEventTemplateString(p.value, targetDim);
+      if (subs.length) {
+        for (const s of subs) eventTemplateChanges.push({ field: String(p.key ?? ''), before: s.before, after: s.after });
+        p.value = text;
       }
     }
+  } else if (needsSync || (query.rewritten !== query.original && props.some((p) => String(p?.key ?? '') === CLASSIC_BINDING_KEY))) {
+    // We converted the query but it didn't resolve to a Smartscape dim, so the
+    // binding can't be rewritten safely. Flag it rather than guess — the
+    // failure mode is an alert that still fires but attaches to nothing.
+    warnings.push({
+      kind: 'custom-device-disambiguated',
+      text:
+        'Event template carries a classic entity binding but the query did not resolve to a ' +
+        'dt.smartscape.<type> dimension — the alert binding could not be rewritten automatically. Verify manually.',
+    });
   }
 
   // 3. Threshold.
