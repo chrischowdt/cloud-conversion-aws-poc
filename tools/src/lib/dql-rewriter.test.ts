@@ -2007,3 +2007,61 @@ describe('classic `contains(tags, "Key:value")` substring filters', () => {
     assert.match(r.rewritten, /matchesPhrase\(tags, "something"\)/);
   });
 });
+
+describe('by-clause pruning is scoped to the timeseries command', () => {
+  // The dims come from the metric key, so they say nothing about any other
+  // command's grouping. Pruning a `summarize … by:{}` dropped the value
+  // columns the detector thresholds on — found on ZScaler EC2 Network
+  // Throughput, where the author listed timeframe/interval/NetworkIn/
+  // NetworkOut precisely so they would survive the summarize.
+  const key = 'cloud.aws.ec2.NetworkIn.By.InstanceId';
+
+  it('leaves a summarize by-clause untouched', () => {
+    const q =
+      `timeseries {NetworkIn = avg(${key})}, by:{dt.entity.custom_device}\n` +
+      '| summarize {AppCI = takeFirst(AppCI)}, by:{timeframe, interval, NetworkIn, dt.entity.custom_device}';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /by:\{timeframe, interval, NetworkIn, dt\.smartscape\.aws_ec2_instance\}/);
+  });
+
+  it('still prunes the timeseries by-clause', () => {
+    const q = `timeseries {NetworkIn = avg(${key})}, by:{dt.entity.custom_device, SomeOtherDim}`;
+    const r = rewriteDql(q, buildIndex([]));
+    assert.doesNotMatch(r.rewritten, /SomeOtherDim/);
+  });
+});
+
+describe('classic `expand tags` + splitString extraction', () => {
+  // expand of a record yields a single null row, so the whole block produces
+  // nothing. Direct translation: read the key, drop the expand, change nothing
+  // else — the surrounding summarize/takeFirst stays as the author wrote it.
+  const q =
+    'timeseries {CPU = avg(cloud.aws.ec2.cpu_utilization)}, by:{dt.entity.custom_device}\n' +
+    '| fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")\n' +
+    '| expand tags\n' +
+    '| fieldsAdd AppCI = if(contains(tags, "[AWS]ApplicationCI"), splitString(tags, "[AWS]ApplicationCI:")[1])\n' +
+    '| fieldsAdd Region = if(contains(tags, "location:"), splitString(tags, "location:")[1])\n' +
+    '| summarize {AppCI = takeFirst(AppCI)}, by:{dt.entity.custom_device}';
+
+  it('reads the tag key directly and drops the expand', () => {
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /AppCI = tags\[ApplicationCI\]/);
+    assert.doesNotMatch(r.rewritten, /expand tags/);
+    assert.doesNotMatch(r.rewritten, /splitString/);
+  });
+
+  it('takes region from the node field, not the tag', () => {
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /Region = getNodeField\(dt\.smartscape\.aws_ec2_instance, "aws\.region"\)/);
+  });
+
+  it('preserves the surrounding shape rather than reworking it', () => {
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /summarize \{AppCI = takeFirst\(AppCI\)\}/);
+  });
+
+  it('keeps the expand when something still treats tags as a string', () => {
+    const r = rewriteDql(q + '\n| filter contains(tags, "raw")', buildIndex([]));
+    assert.match(r.rewritten, /expand tags/);
+  });
+});

@@ -981,6 +981,7 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // Must run BEFORE 2.75: left alone, that pass wraps these in toString() and
   // produces a filter that parses, runs, and matches nothing.
   rewritten = rewriteClassicTagSubstringFilters(rewritten, transforms);
+  rewritten = rewriteClassicTagExpandIdiom(rewritten, transforms);
 
   // Pass 2.75: `tags` is a RECORD on the new side — string functions need toString().
   //
@@ -2510,6 +2511,93 @@ function rewriteClassicTagSubstringFilters(input: string, transforms: Transform[
   return out;
 }
 
+// ─── Pass 2.73b: classic `expand tags` + splitString extraction → record read ─
+//
+// The other half of the array→record change. Where the classic query kept the
+// tag ARRAY (no toString), it expanded one row per tag and picked values out
+// with splitString:
+//
+//   | expand tags
+//   | fieldsAdd AppCI  = if(contains(tags, "[AWS]ApplicationCI"), splitString(tags, "[AWS]ApplicationCI:")[1])
+//   | fieldsAdd Region = if(contains(tags, "location:"),          splitString(tags, "location:")[1])
+//
+// `expand` of a record yields a single null row, so the whole block produces
+// nothing. The record makes the scaffolding unnecessary: read the key directly
+// and drop the expand.
+//
+// Deliberately a DIRECT translation, not a rewrite: the surrounding shape —
+// including the `summarize … takeFirst(…)` that existed only to collapse the
+// expanded rows — is left exactly as the author wrote it. Converting the
+// constructs the data model forces and nothing else keeps the diff reviewable
+// and keeps us out of the business of second-guessing query intent.
+function rewriteClassicTagExpandIdiom(input: string, transforms: Transform[]): string {
+  // The array idiom binds the tag field WITHOUT toString().
+  const assignRe = /\b([A-Za-z_]\w*)\s*=\s*getNodeField\(\s*([^,()]+?)\s*,\s*"tags:aws"\s*\)/g;
+  const bound = new Map<string, string>();
+  for (let m = assignRe.exec(input); m; m = assignRe.exec(input)) bound.set(m[1]!, m[2]!.trim());
+  if (bound.size === 0) return input;
+
+  let out = input;
+  for (const [v, dim] of bound) {
+    const V = escapeRegExp(v);
+    if (!new RegExp(`\\|\\s*expand\\s+${V}\\b`).test(out)) continue;
+
+    const replaceKey = (key: string): string =>
+      CLASSIC_REGION_TAG.test(key) ? `getNodeField(${dim}, "aws.region")` : `${v}[${key}]`;
+    const note = (before: string, after: string, key: string) =>
+      transforms.push({
+        kind: 'entity-dim',
+        before,
+        after,
+        detail: CLASSIC_REGION_TAG.test(key)
+          ? 'classic `location` tag → aws.region field (region is a node field, not a universally present tag)'
+          : `classic expand+splitString tag extraction → tag-record key read (${key})`,
+      });
+
+    // `if(contains(tags, "<K>"), splitString(tags, "<K>:")[1])` — the guarded form.
+    out = out.replace(
+      new RegExp(
+        `if\\(\\s*contains\\(\\s*${V}\\s*,\\s*"[^"]*"\\s*\\)\\s*,\\s*splitString\\(\\s*${V}\\s*,\\s*"(?:\\[AWS\\])?([^":]+):"\\s*\\)\\s*\\[\\s*1\\s*\\]\\s*\\)`,
+        'g'
+      ),
+      (full, key: string) => {
+        const repl = replaceKey(key.trim());
+        note(full, repl, key.trim());
+        return repl;
+      }
+    );
+    // Bare `splitString(tags, "<K>:")[1]` with no guard.
+    out = out.replace(
+      new RegExp(`splitString\\(\\s*${V}\\s*,\\s*"(?:\\[AWS\\])?([^":]+):"\\s*\\)\\s*\\[\\s*1\\s*\\]`, 'g'),
+      (full, key: string) => {
+        const repl = replaceKey(key.trim());
+        note(full, repl, key.trim());
+        return repl;
+      }
+    );
+
+    // Drop the expand only once nothing treats the var as a tag STRING any
+    // more. A survivor means we did not understand the query, and removing the
+    // expand would change its meaning rather than preserve it.
+    const stillStringy = new RegExp(
+      `(?:contains|splitString|matchesPhrase|matchesValue|startsWith|endsWith)\\(\\s*${V}\\s*,`
+    ).test(out);
+    if (stillStringy) continue;
+    const expandRe = new RegExp(`\\s*\\|\\s*expand\\s+${V}\\b[^\\n|]*`, 'g');
+    if (expandRe.test(out)) {
+      expandRe.lastIndex = 0;
+      out = out.replace(expandRe, '');
+      transforms.push({
+        kind: 'entity-dim',
+        before: `| expand ${v}`,
+        after: '(removed)',
+        detail: 'tags:aws is a record, not the classic array — expand yields one null row, and the key reads above no longer need it',
+      });
+    }
+  }
+  return out;
+}
+
 function rewriteAwsTagFilters(input: string, transforms: Transform[]): string {
   // Vars assigned an AWS tag record become additional safe tag sources.
   const tagVars = new Set<string>();
@@ -2785,7 +2873,15 @@ function pruneByDimsNotOnKey(input: string, transforms: Transform[], warnings: W
   if (dims.size === 0) return input;
 
   const dropped: string[] = [];
-  const out = input.replace(/\bby\s*:\s*\{([^}]*)\}/g, (full, body: string) => {
+  // ONLY the `by:{}` of a `timeseries` command. The dims in question come from
+  // the metric key, so they say nothing about any other command's grouping —
+  // and `summarize … by:{timeframe, interval, NetworkIn, NetworkOut, <entity>}`
+  // (a real shape: ZScaler EC2 Network Throughput) lists the value columns it
+  // must carry through. Pruning those dropped the metric the detector thresholds
+  // on, leaving an alert that could never fire. `[^|]` keeps the match inside a
+  // single pipeline stage; if it fails to match we simply prune nothing, which
+  // is the safe direction.
+  const out = input.replace(/\btimeseries\b[^|]*?\bby\s*:\s*\{([^}]*)\}/g, (full, body: string) => {
     const parts = splitTopLevel(body).map((p) => p.trim()).filter(Boolean);
     const kept = parts.filter((p) => {
       const bare = p.replace(/`/g, '');
@@ -2801,7 +2897,8 @@ function pruneByDimsNotOnKey(input: string, transforms: Transform[], warnings: W
       return false;
     });
     if (kept.length === parts.length || kept.length === 0) return full;
-    return `by:{${kept.join(', ')}}`;
+    // `full` spans `timeseries … by:{…}`, so rewrite only its trailing clause.
+    return full.replace(/\bby\s*:\s*\{[^}]*\}$/, `by:{${kept.join(', ')}}`);
   });
 
   if (dropped.length) {
