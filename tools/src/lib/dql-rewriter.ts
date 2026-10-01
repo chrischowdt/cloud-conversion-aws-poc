@@ -32,6 +32,7 @@ import { ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE } from './entity-field-mappings.ts';
 import { classicEntityToSmartscape, lookupByDimRef, entityScope } from './entity-mappings.ts';
 import { lookupEolForClassicKey } from './eol-lookup.ts';
 import { isMetricCarrier, isKnownNonCarrier } from './metric-dim-carriers.ts';
+import { canonicalTagKey } from './tag-key-casing.ts';
 import { findEdgesBetween } from './smartscape-edges.ts';
 import {
   type DetectedRecipe,
@@ -1660,7 +1661,7 @@ function rewriteCustomDeviceTopologyList(
   //   (matchesValue|in)(tags, concat("[AWS]<Key>:", <expr>)) → in(`tags:aws`[<Key>], array(<expr>))
   out = out.replace(
     /\b(?:matchesValue|in)\(\s*tags\s*,\s*concat\(\s*"\[AWS\]([^:"]+):"\s*,\s*([^()]+?)\)\s*\)/g,
-    (_full, key: string, expr: string) => `in(\`tags:aws\`[${key.trim()}], array(${expr.trim()}))`
+    (_full, key: string, expr: string) => `in(\`tags:aws\`[${canonicalTagKey(key)}], array(${expr.trim()}))`
   );
   // customProperties[REGION*] (bare) → the native aws.region field.
   out = out.replace(/\bcustomProperties\s*\[\s*[A-Za-z_]*REGION[A-Za-z_]*\s*\]/g, 'aws.region');
@@ -2189,7 +2190,7 @@ function rewriteTagExtraction(input: string, transforms: Transform[]): string {
     // The literal [AWS] prefix is itself an unambiguous AWS tag marker;
     // classic span/service tag reads carry no prefix (plain "applicationci:").
     if (!isDirectNodeRead && !awsVars.has(varName) && !awsPrefix) return full;
-    const repl = `${varName}[${key}]`;
+    const repl = `${varName}[${canonicalTagKey(key)}]`;
     transforms.push({
       kind: 'entity-dim',
       before: full,
@@ -2476,7 +2477,7 @@ function rewriteClassicTagSubstringFilters(input: string, transforms: Transform[
       pending.push({ before: full, key, value, region });
       return region
         ? `matchesValue(getNodeField(${dim}, "aws.region"), ${JSON.stringify(value)})`
-        : `contains(${marker}[${key}], ${JSON.stringify(value)})`;
+        : `contains(${marker}[${canonicalTagKey(key)}], ${JSON.stringify(value)})`;
     });
     if (pending.length === 0) continue;
 
@@ -2501,7 +2502,7 @@ function rewriteClassicTagSubstringFilters(input: string, transforms: Transform[
         before: p.before,
         after: p.region
           ? `matchesValue(getNodeField(${dim}, "aws.region"), ${JSON.stringify(p.value)})`
-          : `contains(${stillString ? `getNodeField(${dim}, "tags:aws")` : v}[${p.key}], ${JSON.stringify(p.value)})`,
+          : `contains(${stillString ? `getNodeField(${dim}, "tags:aws")` : v}[${canonicalTagKey(p.key)}], ${JSON.stringify(p.value)})`,
         detail: p.region
           ? 'classic `location` tag → aws.region field (region is a node field, not a universally present tag)'
           : `classic tag substring → tag-record key read (${p.key}); the serialized record is JSON, so "Key:value" never matches`,
@@ -2543,7 +2544,7 @@ function rewriteClassicTagExpandIdiom(input: string, transforms: Transform[]): s
     if (!new RegExp(`\\|\\s*expand\\s+${V}\\b`).test(out)) continue;
 
     const replaceKey = (key: string): string =>
-      CLASSIC_REGION_TAG.test(key) ? `getNodeField(${dim}, "aws.region")` : `${v}[${key}]`;
+      CLASSIC_REGION_TAG.test(key) ? `getNodeField(${dim}, "aws.region")` : `${v}[${canonicalTagKey(key)}]`;
     const note = (before: string, after: string, key: string) =>
       transforms.push({
         kind: 'entity-dim',
@@ -2616,7 +2617,7 @@ function rewriteAwsTagFilters(input: string, transforms: Transform[]): string {
 
   let out = input;
   const eq = (full: string, te: string, key: string, value: string): string => {
-    const repl = `${te.trim()}[${key.trim()}] == ${value.trim()}`;
+    const repl = `${te.trim()}[${canonicalTagKey(key)}] == ${value.trim()}`;
     transforms.push({
       kind: 'entity-dim',
       before: full,

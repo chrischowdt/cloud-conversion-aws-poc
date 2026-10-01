@@ -2079,3 +2079,29 @@ describe('expand is kept when the tag var is used as a string through a wrapper'
     assert.match(r.rewritten, /expand tags/);
   });
 });
+
+describe('tag keys are read with the casing resources actually use', () => {
+  // Record access is case-sensitive, and classic queries spell the key however
+  // the lowercased-string match let them. Measured on nic55601 across 1,484,907
+  // AWS nodes: ApplicationCI 912,089 vs applicationci 62.
+  const q = (lit: string) =>
+    'timeseries avg = avg(cloud.aws.kafka.offline_partitions_count), by:{ dt.entity.custom_device}\n' +
+    '| fieldsAdd tags = toString(entityAttr(dt.entity.custom_device, "tags"))\n' +
+    `| filter contains(tags, "${lit}")`;
+
+  it('corrects a lower-case applicationci literal', () => {
+    const r = rewriteDql(q('applicationci:bbt'), buildIndex([]));
+    assert.match(r.rewritten, /tags\[ApplicationCI\]/);
+  });
+
+  it('keeps env lower-case, which is what resources carry', () => {
+    // env 883,673 vs Env 7,766 — the canonical form here is NOT capitalised.
+    const r = rewriteDql(q('ENV:prod'), buildIndex([]));
+    assert.match(r.rewritten, /tags\[env\]/);
+  });
+
+  it('leaves an unmeasured key exactly as written', () => {
+    const r = rewriteDql(q('CostCentre:1234'), buildIndex([]));
+    assert.match(r.rewritten, /tags\[CostCentre\]/);
+  });
+});
