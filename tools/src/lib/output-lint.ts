@@ -43,6 +43,39 @@ export function liveQuery(q: string): string {
 
 export const LINT_RULES: LintRule[] = [
   {
+    id: 'tag-record-in-string-comparison',
+    severity: 'blocking',
+    message:
+      'Passes the `tags:aws` RECORD to a string function, or matches it against a classic ' +
+      '"Key:value" literal. Classic tags were text, so `contains(lower(tags), "applicationci:bbt")` ' +
+      'worked; the record stringifies to JSON ("ApplicationCI":"bbt"), so the literal never appears ' +
+      'and lower() of a record is not a string. Measured on cloud.aws.sns.NumberOfNotificationsFailed: ' +
+      'this form 0 of 343 series, the key read 4.',
+    fix:
+      'Read the key: tags[ApplicationCI] == "bbt". Case folding on the KEY is not needed — ' +
+      '6,584 of the 6,584 SNS topics carrying any casing of the tag use ApplicationCI. If you do want ' +
+      'it case-free, the enriched metric dimension aws.tags.applicationci is already lowercased.',
+    test: (q) => {
+      const vars = new Set<string>();
+      for (const m of q.matchAll(/\b(\w+)\s*=\s*getNodeField\([^,]+,\s*"tags:aws"\s*\)/g)) vars.add(m[1]!);
+      if (vars.size === 0) return false;
+      for (const v of vars) {
+        // lower()/upper() applied to the record itself (not to a key read).
+        if (new RegExp(`\\b(?:lower|upper)\\(\\s*${v}\\s*\\)`).test(q)) return true;
+        // A classic "Key:value" literal tested against the record, bare or wrapped.
+        // The value must be colon-free so ARN substring matches stay out of scope.
+        if (
+          new RegExp(
+            `\\b(?:contains|matchesPhrase|matchesValue|startsWith|endsWith)\\(\\s*(?:(?:lower|upper|toString)\\(\\s*)?${v}\\s*\\)?\\s*,\\s*"(?:\\[AWS\\])?[^":]+:[^":]*"`
+          ).test(q)
+        ) {
+          return true;
+        }
+      }
+      return false;
+    },
+  },
+  {
     id: 'tags-record-treated-as-array',
     severity: 'blocking',
     message:

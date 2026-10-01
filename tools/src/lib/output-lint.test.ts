@@ -123,3 +123,32 @@ describe('output-lint — ignores code the engine never runs', () => {
     assert.ok(lintQuery(q).some((f) => f.ruleId === 'service-tags-null'));
   });
 });
+
+describe('tag-record-in-string-comparison', () => {
+  const base =
+    'timeseries failed = sum(`cloud.aws.sns.NumberOfNotificationsFailed.By.TopicName`), by:{dt.smartscape.aws_sns_topic}\n' +
+    '| fieldsAdd tags = getNodeField(dt.smartscape.aws_sns_topic, "tags:aws")\n';
+  const fires = (q: string) =>
+    lintAsset({ query: q }).some((f) => f.ruleId === 'tag-record-in-string-comparison');
+
+  it('flags lower() applied to the record', () => {
+    // Measured: 0 of 343 series vs 4 for the key read.
+    assert.equal(fires(base + '| filter contains(lower(tags), "applicationci:bbt")'), true);
+  });
+
+  it('flags a classic "Key:value" literal matched against the record', () => {
+    assert.equal(fires(base + '| filter contains(toString(tags), "ApplicationCI:bbt")'), true);
+  });
+
+  it('passes the corrected key read', () => {
+    assert.equal(fires(base + '| filter tags[ApplicationCI] == "bbt"'), false);
+  });
+
+  it('passes case-folding on the VALUE, which is a string', () => {
+    assert.equal(fires(base + '| filter lower(tags[ApplicationCI]) == "bbt"'), false);
+  });
+
+  it('leaves ARN substring matches alone — the value carries colons', () => {
+    assert.equal(fires(base + '| filter contains(toString(tags), "arn:aws:sns:us-east-2")'), false);
+  });
+});
