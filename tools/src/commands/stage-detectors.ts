@@ -175,9 +175,17 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   // Rewrite every AWS detector; keep the ones in the wanted buckets.
   const items: DetectorReviewItem[] = [];
   let skippedStaged = 0;
+  let unreadable = 0;
   for (const o of objects) {
     const q = detectorQuery(o.value);
-    if (!q || !/cloud\.aws\./.test(q)) continue;
+    if (!q) {
+      // No recognised query input. If the detector still MENTIONS cloud.aws
+      // anywhere, it is an AWS detector we cannot read — say so, instead of
+      // dropping it the way the query.expression variant was dropped for months.
+      if (JSON.stringify((o.value?.analyzer as { input?: unknown } | undefined)?.input ?? []).includes('cloud.aws.')) unreadable++;
+      continue;
+    }
+    if (!/cloud\.aws\./.test(q)) continue;
     if (idFilter && !idFilter.has(o.objectId)) continue;
     if (alreadyStaged.has(o.objectId)) { skippedStaged++; continue; }
     const r = rewriteDetector(o.value, index);
@@ -363,7 +371,8 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   console.log(
     `${args.apply ? 'Staging' : 'Preparing'} ${scoped.length} AWS detector(s) into ${batches.length} review notebook(s) ` +
       `(batch size ${batchSize}, buckets [${[...wantBuckets].join(', ')}])…` +
-      (skippedStaged ? ` — skipped ${skippedStaged} already in a published batch` : '')
+      (skippedStaged ? ` — skipped ${skippedStaged} already in a published batch` : '') +
+      (unreadable ? ` — ${unreadable} AWS detector(s) have no readable query input and were NOT considered` : '')
   );
 
   const client = args.apply ? new DocumentClient({ baseUrl: args.baseUrl, token: args.token }) : null;

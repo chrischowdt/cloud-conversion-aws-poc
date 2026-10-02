@@ -81,11 +81,26 @@ function findInput(inputs: AnalyzerInput[], key: string): AnalyzerInput | undefi
   return inputs.find((i) => i && i.key === key);
 }
 
+/**
+ * The input that holds the detector's DQL. The Settings schema has stored it
+ * under TWO keys: `query` and `query.expression`. Measured on nic55601 across
+ * 1,605 detectors: `query` 828, `query.expression` 777 — so reading only the
+ * first silently dropped ~464 AWS detectors from the rewriter and the stager
+ * (they showed up in the scan, which accepts any DQL-looking input, but were
+ * never converted or staged, and nothing reported the gap).
+ *
+ * Exact keys only: `query.filterSegments[0].id` is a segment id, not DQL.
+ * `query` wins if a detector somehow carries both.
+ */
+export function findQueryInput(inputs: AnalyzerInput[]): AnalyzerInput | undefined {
+  return findInput(inputs, 'query') ?? findInput(inputs, 'query.expression');
+}
+
 /** Pull the DQL query string out of a detector value, if present. */
 export function detectorQuery(value: Record<string, unknown>): string | undefined {
   const analyzer = value?.analyzer as { input?: AnalyzerInput[] } | undefined;
   const inputs = Array.isArray(analyzer?.input) ? analyzer!.input! : [];
-  const q = findInput(inputs, 'query')?.value;
+  const q = findQueryInput(inputs)?.value;
   return typeof q === 'string' ? q : undefined;
 }
 
@@ -266,7 +281,8 @@ export function rewriteDetector(
 
   const analyzer = rewrittenValue.analyzer as { input?: AnalyzerInput[] } | undefined;
   const inputs = Array.isArray(analyzer?.input) ? analyzer!.input! : [];
-  const queryInput = findInput(inputs, 'query');
+  // Write-back goes to the SAME input the query was read from (query or query.expression).
+  const queryInput = findQueryInput(inputs);
   const originalQuery = typeof queryInput?.value === 'string' ? queryInput.value : undefined;
 
   if (!originalQuery) {

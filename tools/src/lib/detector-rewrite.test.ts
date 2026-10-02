@@ -249,3 +249,54 @@ describe('rewriteDetector — no-op safety', () => {
     assert.equal(JSON.stringify(v), before);
   });
 });
+
+describe('detectors that store their DQL under `query.expression`', () => {
+  // The Settings schema has used two keys. Reading only `query` silently dropped
+  // 777 detectors (~464 of them AWS) from the rewriter and the stager.
+  const asExpression = (v: Record<string, unknown>) => {
+    const out = structuredClone(v) as any;
+    for (const i of out.analyzer.input) if (i.key === 'query') i.key = 'query.expression';
+    return out as Record<string, unknown>;
+  };
+  const base = () =>
+    detector({
+      query: 'timeseries avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}',
+      threshold: '10',
+      template: [{ key: 'dt.source_entity', value: '{dims:dt.entity.custom_device}' }],
+    });
+
+  it('reads the query from query.expression', () => {
+    const v = asExpression(base());
+    assert.match(detectorQuery(v)!, /cloud\.aws\.rds\.deadlocks/);
+  });
+
+  it('converts it exactly as it converts the `query` form', () => {
+    const viaQuery = rewriteDetector(base(), buildIndex([]));
+    const viaExpr = rewriteDetector(asExpression(base()), buildIndex([]));
+    assert.equal(viaExpr.query?.rewritten, viaQuery.query?.rewritten);
+    assert.equal(viaExpr.targetDim, viaQuery.targetDim);
+    assert.deepEqual(viaExpr.eventTemplateChanges, viaQuery.eventTemplateChanges);
+  });
+
+  it('writes the rewritten query back to query.expression, not a new `query` input', () => {
+    const r = rewriteDetector(asExpression(base()), buildIndex([]));
+    const inputs = (r.rewrittenValue.analyzer as any).input as Array<{ key: string; value: string }>;
+    assert.equal(inputs.some((i) => i.key === 'query'), false);
+    const expr = inputs.find((i) => i.key === 'query.expression')!;
+    assert.match(expr.value, /dt\.smartscape\.aws_rds_dbinstance/);
+    assert.doesNotMatch(expr.value, /dt\.entity\.custom_device/);
+  });
+
+  it('prefers `query` when a detector carries both', () => {
+    const v = base() as any;
+    v.analyzer.input.push({ key: 'query.expression', value: 'timeseries avg(cloud.aws.other.thing)' });
+    assert.match(detectorQuery(v)!, /rds\.deadlocks/);
+  });
+
+  it('does not treat a filter-segment id as DQL', () => {
+    const v = {
+      analyzer: { name: 'x', input: [{ key: 'query.filterSegments[0].id', value: 'abc123' }] },
+    } as Record<string, unknown>;
+    assert.equal(detectorQuery(v), undefined);
+  });
+});
