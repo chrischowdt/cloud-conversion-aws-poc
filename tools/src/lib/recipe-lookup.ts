@@ -31,6 +31,7 @@ import { correctServiceNamespace } from './service-namespace-corrections.ts';
 import { buildMzIndex, type MzTagIndex } from './mz-tags.ts';
 import { loadEnrichedTags, type EnrichedTagIndex } from './enriched-tags.ts';
 import { loadEntityCandidates } from './entity-candidates.ts';
+import { loadEntityArns, type EntityArnIndex } from './entity-arns.ts';
 import { buildPullIndex, type PullIndex } from './metric-streams.ts';
 import { registerDiscoveredMappings } from './entity-mappings.ts';
 
@@ -151,6 +152,12 @@ export interface RecipeIndex {
    * a case-sensitive entity lookup that silently returns null.
    */
   enrichedTags?: EnrichedTagIndex;
+  /**
+   * Classic entity id → the ARN of the resource it named (`discover-entity-arns`).
+   * Lets the rewriter turn a pin by classic id into a filter on the metric's
+   * `aws.arn`, instead of leaving a literal that can never equal a Smartscape id.
+   */
+  entityArns?: EntityArnIndex;
 }
 
 export async function loadRecipeIndex(
@@ -163,6 +170,7 @@ export async function loadRecipeIndex(
     minOverrideSeries?: number;
     mzTagsPath?: string;
     enrichedTagsPath?: string;
+    entityArnsPath?: string;
     /**
      * Verified classic->Smartscape entity mappings from
      * `discover-entity-candidates`. Registered into the entity table rather
@@ -215,6 +223,13 @@ export async function loadRecipeIndex(
       result.enrichedTags = await loadEnrichedTags(options.enrichedTagsPath);
     } catch {
       // Absent/malformed → we keep the entity lookup, which is the status quo.
+    }
+  }
+  if (options.entityArnsPath) {
+    try {
+      result.entityArns = await loadEntityArns(options.entityArnsPath);
+    } catch {
+      // Absent/malformed → pins stay unresolved and are warned about, never guessed.
     }
   }
   if (options.entityCandidatesPath) {

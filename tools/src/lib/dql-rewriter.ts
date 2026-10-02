@@ -33,6 +33,7 @@ import { classicEntityToSmartscape, lookupByDimRef, entityScope } from './entity
 import { lookupEolForClassicKey } from './eol-lookup.ts';
 import { isMetricCarrier, isKnownNonCarrier } from './metric-dim-carriers.ts';
 import { canonicalTagKey } from './tag-key-casing.ts';
+import { rewriteEntityIdPins } from './entity-id-pins.ts';
 import { findEdgesBetween } from './smartscape-edges.ts';
 import {
   type DetectedRecipe,
@@ -61,6 +62,7 @@ export interface Warning {
     | 'entity-not-planned'
     | 'entity-name-attr'
     | 'classic-id-literal'
+    | 'entity-id-unresolved'
     | 'recipe-aggregation-mismatch'
     | 'verdict-not-exact'
     | 'dim-variant-override'
@@ -94,6 +96,9 @@ export const BLOCKING_WARNING_KINDS: ReadonlySet<Warning['kind']> = new Set([
   'classic-entity-selector',
   'entity-relationship-traversal',
   'classic-id-literal',
+  // A pin by classic entity id we could not resolve to an ARN: converting the
+  // dimension around it yields a filter that can never match.
+  'entity-id-unresolved',
 ]);
 
 /** True when a warning means the query can't be auto-converted (vs a verify-me caveat). */
@@ -672,6 +677,15 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     warnings,
     metricUnmapped ? undefined : index.mzTags
   );
+
+  // Pass 1.52: classic entity-id PINS → a filter on the metric's `aws.arn`.
+  // Classic ids and Smartscape ids are different id spaces, so converting the
+  // dimension around `== "CUSTOM_DEVICE-…"` yields a comparison that can never
+  // match. Only when the metric key was swapped: classic series carry no aws.arn.
+  // See entity-id-pins.ts / entity-arns.ts for the evidence.
+  if (!metricUnmapped && (transforms.some((t) => t.kind === 'metric-key') || NEW_KEY_RE.test(rewritten))) {
+    rewritten = rewriteEntityIdPins(rewritten, index.entityArns, transforms, warnings);
+  }
 
   // Pass 1.55: disambiguate classic `dt.entity.custom_device` to a real
   // Smartscape node type. Custom_device is "not planned" in Smartscape, but in

@@ -27,6 +27,7 @@ import { runDiscoverEntityTypes } from './commands/discover-entity-types.ts';
 import { runDiscoverFields } from './commands/discover-fields.ts';
 import { runDiscoverMetrics } from './commands/discover-metrics.ts';
 import { runDiscoverTags } from './commands/discover-tags.ts';
+import { runDiscoverEntityArns } from './commands/discover-entity-arns.ts';
 import { runDiscoverEntityCandidates } from './commands/discover-entity-candidates.ts';
 import { runRewriteDashboard } from './commands/rewrite-dashboard.ts';
 import { runRewriteDql } from './commands/rewrite-dql.ts';
@@ -163,6 +164,13 @@ COMMANDS
                     entity file and VERIFY each candidate node type against the
                     tenant. Fills gaps in the curated table without overwriting
                     it. Flags: --entities <path>, --limit <n>.
+  discover-entity-arns
+                    Resolve every classic entity id found in the downloaded
+                    assets to the ARN of the resource it named (writes
+                    entity-arns.json). A query pinned to one resource by id
+                    becomes a filter on the metric's aws.arn — classic and
+                    Smartscape ids are different id spaces and never match.
+                    Flags: --lookback-days <n> (default 30).
   discover-tags     Find which AWS tags the new connection enriches onto
                     metrics (writes enriched-tags.json). Enriched tags become
                     cheap aws.tags.<key> dim filters; others need a
@@ -828,6 +836,16 @@ async function main(): Promise<void> {
         token,
         outDir: tenantOut(args.flags, baseUrl),
         filter: getString(args.flags, 'filter'),
+      });
+      return;
+    }
+    case 'discover-entity-arns': {
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runDiscoverEntityArns({
+        baseUrl,
+        token,
+        outDir: tenantOut(args.flags, baseUrl),
+        lookbackDays: getNumber(args.flags, 'lookback-days'),
       });
       return;
     }

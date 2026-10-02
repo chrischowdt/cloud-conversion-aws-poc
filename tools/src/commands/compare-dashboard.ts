@@ -33,6 +33,7 @@ import {
 } from '../lib/paths.ts';
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { enrichedTagsPathIfPresent } from '../lib/enriched-tags.ts';
+import { entityArnsPathIfPresent } from '../lib/entity-arns.ts';
 import { entityCandidatesPathIfPresent } from '../lib/entity-candidates.ts';
 import { mzTagsPathIfPresent } from '../lib/mz-tags.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
@@ -323,6 +324,7 @@ export async function runCompareDashboard(args: CompareDashboardArgs): Promise<v
     perKeyPath: SKILL_PER_KEY_AWS_METRICS,
     liveMetricsPath,
     enrichedTagsPath: enrichedTagsPathIfPresent(args.outDir),
+    entityArnsPath: entityArnsPathIfPresent(args.outDir),
     entityCandidatesPath: entityCandidatesPathIfPresent(args.outDir),
     mzTagsPath: mzTagsPathIfPresent(args.outDir),
     minOverrideSeries: args.minOverrideSeries,

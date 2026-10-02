@@ -14,56 +14,10 @@
  * string work only — no I/O — so it can be tested without a tenant.
  */
 
-export interface CommandRange {
-  /** Index just after the `timeseries` keyword. */
-  start: number;
-  /** Index of the first top-level `|`, or the end of the query. */
-  end: number;
-}
+import { hasTopLevelBy, timeseriesCommand } from '../lib/dql-command.ts';
 
-/** Locate the first `timeseries` command: from the keyword to its first top-level pipe. */
-export function timeseriesCommand(q: string): CommandRange | null {
-  const m = /\btimeseries\b/.exec(q);
-  if (!m) return null;
-  const start = m.index + m[0].length;
-  let depth = 0;
-  let quote: string | null = null;
-  for (let i = start; i < q.length; i++) {
-    const c = q[i]!;
-    if (quote) {
-      if (c === '\\') { i++; continue; }
-      if (c === quote) quote = null;
-      continue;
-    }
-    if (c === '"' || c === "'") { quote = c; continue; }
-    if (c === '(' || c === '{' || c === '[') depth++;
-    else if (c === ')' || c === '}' || c === ']') depth--;
-    else if (c === '|' && depth === 0) return { start, end: i };
-  }
-  return { start, end: q.length };
-}
-
-/** True when the timeseries command already carries a TOP-LEVEL `by:` clause. */
-export function hasTopLevelBy(q: string): boolean {
-  const range = timeseriesCommand(q);
-  if (!range) return false;
-  const s = q.slice(range.start, range.end);
-  let depth = 0;
-  let quote: string | null = null;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i]!;
-    if (quote) {
-      if (c === '\\') { i++; continue; }
-      if (c === quote) quote = null;
-      continue;
-    }
-    if (c === '"' || c === "'") { quote = c; continue; }
-    if (c === '(' || c === '{' || c === '[') { depth++; continue; }
-    if (c === ')' || c === '}' || c === ']') { depth--; continue; }
-    if (depth === 0 && /^by\s*:/.test(s.slice(i)) && (i === 0 || /[\s,]/.test(s[i - 1]!))) return true;
-  }
-  return false;
-}
+// Re-exported so callers (and the tests) keep one import site.
+export { hasTopLevelBy, timeseriesCommand };
 
 export type SplitResult =
   | { ok: true; query: string }

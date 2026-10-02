@@ -21,6 +21,7 @@ import {
 } from '../lib/paths.ts';
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
 import { enrichedTagsPathIfPresent } from '../lib/enriched-tags.ts';
+import { entityArnsPathIfPresent } from '../lib/entity-arns.ts';
 import { entityCandidatesPathIfPresent } from '../lib/entity-candidates.ts';
 import { mzTagsPathIfPresent } from '../lib/mz-tags.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
@@ -49,6 +50,7 @@ export async function runScanNotebooks(args: ScanNotebooksArgs): Promise<void> {
     perKeyPath: SKILL_PER_KEY_AWS_METRICS,
     liveMetricsPath,
     enrichedTagsPath: enrichedTagsPathIfPresent(base),
+    entityArnsPath: entityArnsPathIfPresent(base),
     entityCandidatesPath: entityCandidatesPathIfPresent(base),
     mzTagsPath: mzTagsPathIfPresent(base),
     minOverrideSeries: args.minOverrideSeries,
