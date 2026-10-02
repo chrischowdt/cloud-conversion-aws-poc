@@ -112,6 +112,68 @@ export class SettingsClient {
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
+  private objectUrl(objectId: string): URL {
+    return new URL(`${this.baseUrl}/platform/classic/environment-api/v2/settings/objects/${encodeURIComponent(objectId)}`);
+  }
+
+  /**
+   * Fetch ONE object, including the `updateToken` a write needs for optimistic
+   * concurrency. Single attempt — callers decide whether to re-read.
+   */
+  async getObject(objectId: string): Promise<SettingsObject> {
+    const url = this.objectUrl(objectId);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${this.token}`, Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      const text = await res.text();
+      if (!res.ok) throw new SettingsApiError(res.status, url.toString(), text);
+      return JSON.parse(text) as SettingsObject;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Replace one object's value. `updateToken` makes the write fail if the object
+   * changed since it was read, instead of silently overwriting someone's edit.
+   * `validateOnly` runs the full server-side validation (scope, schema, token)
+   * WITHOUT persisting — the way to prove a write would succeed before doing it.
+   *
+   * Deliberately NO automatic retry: re-sending a write after an ambiguous
+   * failure is how a change gets applied twice.
+   */
+  async putObject(
+    objectId: string,
+    body: { value: Record<string, unknown>; updateToken?: string; schemaVersion?: string },
+    opts: { validateOnly?: boolean } = {}
+  ): Promise<void> {
+    const url = this.objectUrl(objectId);
+    if (opts.validateOnly) url.searchParams.set('validateOnly', 'true');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const text = await res.text();
+      if (!res.ok) throw new SettingsApiError(res.status, url.toString(), text);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** Fetch all objects for a schema, following nextPageKey. */
   async listAllObjects(opts: {
     schemaId: string;
