@@ -43,6 +43,30 @@ export function liveQuery(q: string): string {
 
 export const LINT_RULES: LintRule[] = [
   {
+    id: 'classic-entity-id-vs-smartscape-dim',
+    severity: 'blocking',
+    message:
+      'Compares a Smartscape dimension to a CLASSIC entity id literal ("CUSTOM_DEVICE-…", "HOST-…"). ' +
+      'Smartscape ids are a different id space ("AWS_OPENSEARCH_DOMAIN-…"), so the comparison can never ' +
+      'match — the filter parses, runs, and returns nothing. Measured on two OpenSearch detectors pinned ' +
+      'to one resource: classic query 1 record, rewritten query 0. No warning accompanied it, because the ' +
+      'dimension had been converted but the literal beside it had not.',
+    fix:
+      'Resolve the classic id to the resource it named (its entity name), then filter on the Smartscape ' +
+      'node by name or by its Smartscape id: getNodeName(dt.smartscape.<type>) == "<name>".',
+    test: (q) => {
+      // The classic literal: UPPER_TYPE-<16 hex>, and NOT an AWS_* Smartscape id.
+      const ID = '"(?!AWS_)[A-Z][A-Z0-9_:]*-[0-9A-F]{16}"';
+      const DIM = '`?dt\\.smartscape\\.[a-z0-9_]+`?';
+      return (
+        // dim == "ID" / != "ID", optionally inside toString(...)
+        new RegExp(`(?:toString\\(\\s*)?${DIM}\\s*\\)?\\s*[!=]=\\s*${ID}`).test(q) ||
+        // in(dim, "ID", …) / in(dim, array("ID", …))
+        new RegExp(`\\bin\\(\\s*(?:toString\\(\\s*)?${DIM}\\s*\\)?\\s*,\\s*(?:array\\(\\s*)?${ID}`).test(q)
+      );
+    },
+  },
+  {
     id: 'tag-record-in-string-comparison',
     severity: 'blocking',
     message:

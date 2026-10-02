@@ -152,3 +152,41 @@ describe('tag-record-in-string-comparison', () => {
     assert.equal(fires(base + '| filter contains(toString(tags), "arn:aws:sns:us-east-2")'), false);
   });
 });
+
+describe('classic-entity-id-vs-smartscape-dim', () => {
+  const fires = (q: string) =>
+    lintAsset({ query: q }).some((f) => f.ruleId === 'classic-entity-id-vs-smartscape-dim');
+
+  it('flags a Smartscape dim compared to a classic CUSTOM_DEVICE id (the pinned OpenSearch detector)', () => {
+    // Measured: classic query 1 record, this form 0.
+    assert.equal(
+      fires('timeseries min(`cloud.aws.es.FreeStorageSpace.By.ClientId`), filter: { dt.smartscape.aws_opensearch_domain == "CUSTOM_DEVICE-CFF4D22E40425D17" }'),
+      true
+    );
+  });
+
+  it('flags != and in() forms, including a toString-wrapped dim', () => {
+    assert.equal(fires('| filter dt.smartscape.aws_ec2_instance != "HOST-0123456789ABCDEF"'), true);
+    assert.equal(fires('| filter in(dt.smartscape.aws_ec2_instance, "HOST-0123456789ABCDEF")'), true);
+    assert.equal(fires('| filter toString(dt.smartscape.aws_ec2_instance) == "HOST-0123456789ABCDEF"'), true);
+  });
+
+  it('passes a Smartscape id literal, which IS in the right id space', () => {
+    assert.equal(fires('| filter dt.smartscape.aws_ec2_instance == "AWS_EC2_INSTANCE-0123456789ABCDEF"'), false);
+  });
+
+  it('does not fire on a legitimate classic filter beside an unrelated converted dim', () => {
+    // Non-AWS entities are left classic on purpose; only a DIRECT comparison is the defect.
+    assert.equal(
+      fires('timeseries avg(x), by:{dt.smartscape.aws_ec2_instance}\n| filter dt.entity.host == "HOST-0123456789ABCDEF"'),
+      false
+    );
+  });
+
+  it('ignores a classic id inside a // comment', () => {
+    assert.equal(
+      fires('timeseries avg(x), by:{dt.smartscape.aws_ec2_instance}\n// was: dt.smartscape.aws_ec2_instance == "HOST-0123456789ABCDEF"'),
+      false
+    );
+  });
+});
