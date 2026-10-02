@@ -37,7 +37,7 @@ import {
   type ReviewBucket,
 } from '../lib/detector-notebook.ts';
 import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
-import { readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { ALERTS_SHEET, readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import type { SettingsObject } from '../dynatrace/settings.ts';
 
 export interface StageDetectorsArgs {
@@ -65,8 +65,10 @@ export interface StageDetectorsArgs {
   /**
    * The alert tracker. This is the RECORD of which detectors are already in a
    * review notebook — the manifest is only a fallback for when the file is
-   * absent or a reviewer has it open (xlsx locks on write). Defaults to
-   * <tenant>/alert-tracker.xlsx; point it at the team's sheet with --tracker.
+   * absent or a reviewer has it open (xlsx locks on write). Read and written on
+   * the `alerts` SHEET of the team workbook; dashboards/notebooks keep
+   * `migration`. Defaults to <tenant>/migration-tracker.xlsx — point --tracker
+   * (or DT_TRACKER_PATH) at the shared copy.
    */
   trackerPath?: string;
   /** Record already-published detectors in the tracker and stop; stage nothing. */
@@ -95,7 +97,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   const base = args.outDir;
   const inputFile = args.inputFile ?? join(base, 'anomaly-detectors', 'objects.json');
   const reviewDir = join(base, 'migration', 'detector-review');
-  const trackerPath = args.trackerPath ?? join(base, 'alert-tracker.xlsx');
+  const trackerPath = args.trackerPath ?? join(base, 'migration-tracker.xlsx');
   await mkdir(reviewDir, { recursive: true });
 
   const batchSize = args.batchSize ?? 10;
@@ -140,7 +142,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   if (!idFilter && !args.restage) {
     const tracked = new Set<string>();
     try {
-      for (const [id, r] of await readRows(trackerPath)) {
+      for (const [id, r] of await readRows(trackerPath, ALERTS_SHEET)) {
         if (String(r['asset_type'] ?? '') !== 'anomaly-detector') continue;
         if (String(r['review_copy_url'] ?? '').trim()) tracked.add(id);
       }
@@ -223,7 +225,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
       console.log(`Would record ${backfill.length} published detector(s) in ${trackerPath}. No writes made; re-run with --apply.`);
       return;
     }
-    const { added, updated } = await upsertRows(trackerPath, backfill, 'migration');
+    const { added, updated } = await upsertRows(trackerPath, backfill, ALERTS_SHEET);
     console.log(`Recorded ${backfill.length} published detector(s) in ${trackerPath} (${added} added, ${updated} updated).`);
     return;
   }
@@ -289,7 +291,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
     }
     if (args.apply && restageTrackerRows.length) {
       try {
-        const { added, updated: upd } = await upsertRows(trackerPath, restageTrackerRows, 'migration');
+        const { added, updated: upd } = await upsertRows(trackerPath, restageTrackerRows, ALERTS_SHEET);
         console.log(`  Tracker ${trackerPath}: ${added} added, ${upd} updated.`);
       } catch (e) {
         console.log(`  ! Could not write ${trackerPath}: ${(e as Error).message.slice(0, 120)}`);
@@ -446,7 +448,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   if (args.apply && trackerUpdates.length) {
     if (backfill.length) console.log(`  Backfilling ${backfill.length} detector(s) published while the tracker was unwritable.`);
     try {
-      const { added, updated } = await upsertRows(trackerPath, trackerUpdates, 'migration');
+      const { added, updated } = await upsertRows(trackerPath, trackerUpdates, ALERTS_SHEET);
       console.log(`  Tracker ${trackerPath}: ${added} added, ${updated} updated.`);
     } catch (e) {
       // An xlsx a reviewer has open cannot be written. Say so loudly rather

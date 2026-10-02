@@ -134,7 +134,22 @@ export interface Decision {
   notes: string;
 }
 
-const DEFAULT_SHEET = 'migration';
+/**
+ * The team keeps ONE workbook with a sheet per asset family:
+ *   `migration` — dashboards + notebooks, which travel the stage/promote pipeline
+ *   `alerts`    — Davis anomaly detectors, which do not (a detector is a Settings
+ *                 object, so there is no inert copy to stage; see refresh-alert-tracker)
+ * They are separate sheets because the two have different lifecycles and the
+ * review teams differ, but they share one file so a reviewer opens one thing.
+ */
+export const MIGRATION_SHEET = 'migration';
+export const ALERTS_SHEET = 'alerts';
+const DEFAULT_SHEET = MIGRATION_SHEET;
+
+/** The sheet an asset type belongs on. */
+export function sheetForAssetType(type: TrackedAssetType): string {
+  return type === 'anomaly-detector' ? ALERTS_SHEET : MIGRATION_SHEET;
+}
 
 /**
  * Snapshot the tracker before the first write of this process.
@@ -221,7 +236,12 @@ function ensureInstructions(wb: ExcelJS.Workbook): void {
   const lines: Array<[string] | string> = [
     'Migration tracker — how to use it (5-person team)',
     '',
-    'WHAT THIS IS: one row per AWS dashboard/notebook we can migrate to the new Smartscape integration.',
+    'WHAT THIS IS: the AWS assets we are migrating to the new Smartscape integration, one row each.',
+    '  SHEET "migration" — dashboards + notebooks. These are staged as a review COPY, then cut over in place.',
+    '  SHEET "alerts"    — Davis anomaly detectors. A detector is a settings object, not a document, so there is',
+    '                      no inert copy to stage: the converted queries go into a review NOTEBOOK (batches of 25),',
+    '                      and "review_copy_url" on each row points at the batch notebook holding that alert.',
+    '                      Everything else — assignee / decision / reviewer / notes — works exactly the same.',
     'The tooling owns the grey/left columns (asset info, confidence, lane, status, review-copy link, timestamps).',
     'YOU own: assignee, decision, reviewer, notes. The tool reads "decision"; the only value it WRITES is "Published" (after it cuts a row over).',
     '',
@@ -296,6 +316,18 @@ export async function upsertRows(
   }
 
   ensureInstructions(wb);
+
+  // One workbook, two sheets: refuse to write a row onto the wrong one. Mixing
+  // 990 detector rows into the dashboards sheet (or vice versa) is tedious to
+  // undo by hand in a file the team has open, so fail loudly instead.
+  const misplaced = rows.filter((r) => r.asset_type && sheetForAssetType(r.asset_type) !== sheetName);
+  if (misplaced.length) {
+    const kinds = [...new Set(misplaced.map((r) => r.asset_type))].join(', ');
+    throw new Error(
+      `upsertRows: refusing to write ${misplaced.length} ${kinds} row(s) to sheet "${sheetName}" — ` +
+        `they belong on "${sheetForAssetType(misplaced[0]!.asset_type)}". Pass the right sheet name.`
+    );
+  }
 
   const idCol = header.get('asset_id')!;
   const idToRow = new Map<string, number>();

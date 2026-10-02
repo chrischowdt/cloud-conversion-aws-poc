@@ -92,6 +92,16 @@ function getNumber(flags: Map<string, string | boolean>, key: string): number | 
   return v === undefined ? undefined : Number(v);
 }
 
+/**
+ * Where the tracker workbook lives. The team's copy is a shared file outside the
+ * repo, and every tracker command needs the SAME one — retyping the path invites
+ * writing the stale per-tenant copy instead, so DT_TRACKER_PATH can set it once.
+ * An explicit --tracker still wins.
+ */
+function trackerPath(flags: Map<string, string | boolean>): string | undefined {
+  return getString(flags, 'tracker') ?? process.env['DT_TRACKER_PATH'] ?? undefined;
+}
+
 function requireBaseAndToken(flags: Map<string, string | boolean>): {
   baseUrl: string;
   token: string;
@@ -633,7 +643,7 @@ async function main(): Promise<void> {
       const baseUrl = getString(args.flags, 'base-url') ?? process.env.DT_BASE_URL ?? '';
       await runRefreshAlertTracker({
         outDir: tenantOut(args.flags, baseUrl),
-        trackerPath: getString(args.flags, 'tracker'),
+        trackerPath: trackerPath(args.flags),
         baseUrl,
       });
       return;
@@ -648,7 +658,7 @@ async function main(): Promise<void> {
       }
       await runMigrateRefresh({
         outDir,
-        trackerPath: getString(args.flags, 'tracker'),
+        trackerPath: trackerPath(args.flags),
       });
       return;
     }
@@ -659,7 +669,7 @@ async function main(): Promise<void> {
         outDir: tenantOut(args.flags, baseUrl),
         baseUrl,
         token,
-        trackerPath: getString(args.flags, 'tracker'),
+        trackerPath: trackerPath(args.flags),
         ids: idsFlag ? idsFlag.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
         apply: args.flags.get('apply') === true,
@@ -714,7 +724,7 @@ async function main(): Promise<void> {
           : undefined,
         ids: idsFlag ? idsFlag.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
-        trackerPath: getString(args.flags, 'tracker'),
+        trackerPath: trackerPath(args.flags),
         recordOnly: args.flags.get('record-only') === true,
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
@@ -729,7 +739,7 @@ async function main(): Promise<void> {
         outDir: tenantOut(args.flags, baseUrl),
         baseUrl,
         token,
-        trackerPath: getString(args.flags, 'tracker'),
+        trackerPath: trackerPath(args.flags),
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
       });
@@ -742,7 +752,7 @@ async function main(): Promise<void> {
         outDir: tenantOut(args.flags, baseUrl),
         baseUrl,
         token,
-        trackerPath: getString(args.flags, 'tracker'),
+        trackerPath: trackerPath(args.flags),
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         apply: args.flags.get('apply') === true,
       });
@@ -757,7 +767,7 @@ async function main(): Promise<void> {
         outDir: tenantOut(args.flags, baseUrl),
         baseUrl,
         token,
-        trackerPath: getString(args.flags, 'tracker'),
+        trackerPath: trackerPath(args.flags),
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
         apply: args.flags.get('apply') === true,
@@ -776,7 +786,7 @@ async function main(): Promise<void> {
         outDir: tenantOut(args.flags, baseUrl),
         baseUrl,
         token,
-        trackerPath: getString(args.flags, 'tracker'),
+        trackerPath: trackerPath(args.flags),
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
       });
@@ -789,7 +799,7 @@ async function main(): Promise<void> {
         outDir: tenantOut(args.flags, baseUrl),
         baseUrl,
         token,
-        trackerPath: getString(args.flags, 'tracker'),
+        trackerPath: trackerPath(args.flags),
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         all: args.flags.get('all') === true,
         apply: args.flags.get('apply') === true,

@@ -22,11 +22,15 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { assetConfidence, rollupBuckets, type QueryDetailLike } from '../lib/asset-confidence.ts';
-import { upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
+import { ALERTS_SHEET, readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 
 export interface RefreshAlertTrackerArgs {
   outDir: string;
-  /** Defaults to <tenant>/alert-tracker.xlsx — deliberately NOT the asset tracker. */
+  /**
+   * The team workbook. Alerts live on its `alerts` sheet, dashboards/notebooks on
+   * `migration` — one file, two sheets, so a reviewer opens one thing. Defaults to
+   * <tenant>/migration-tracker.xlsx; point --tracker at the shared copy.
+   */
   trackerPath?: string;
   /** Tenant base URL, for the deep link. Falls back to the download manifest. */
   baseUrl?: string;
@@ -96,6 +100,27 @@ ${queryText ?? ''}`;
   return { team: '', source: 'unknown' };
 }
 
+/**
+ * Status on a refresh. Only the two not-yet-started states are re-evaluated: as
+ * the rewriter improves, a detector first seen as `blocked` can become
+ * convertible and must become selectable again (and the reverse). Anything in
+ * flight — staged / in-review / promoted / verified — is real progress and is
+ * left alone, exactly as `migrate-refresh` treats dashboards.
+ */
+export function nextStatus(current: string | undefined, level: string): string {
+  const want = level === 'blocked' ? 'blocked' : 'candidate';
+  const cur = String(current ?? '').trim();
+  if (!cur) return want;
+  return cur === 'blocked' || cur === 'candidate' ? want : cur;
+}
+
+/** True when `reasons` holds a review-batch label written by stage-detectors. */
+const BATCH_LABEL_RE = /review batch\s+\S+/;
+
+export function keepsBatchLabel(reasons: string | undefined): boolean {
+  return BATCH_LABEL_RE.test(String(reasons ?? ''));
+}
+
 /** Deep link to the detector's settings object. */
 function detectorUrl(baseUrl: string | undefined, id: string): string | undefined {
   if (!baseUrl) return undefined;
@@ -108,7 +133,7 @@ export async function runRefreshAlertTracker(args: RefreshAlertTrackerArgs): Pro
   if (!existsSync(scanPath)) {
     throw new Error(`No detector scan at ${scanPath}. Run \`cct scan-anomaly-detectors\` first.`);
   }
-  const trackerPath = args.trackerPath ?? join(base, 'alert-tracker.xlsx');
+  const trackerPath = args.trackerPath ?? join(base, 'migration-tracker.xlsx');
 
   let baseUrl = args.baseUrl;
   if (!baseUrl) {
@@ -119,6 +144,12 @@ export async function runRefreshAlertTracker(args: RefreshAlertTrackerArgs): Pro
       } catch { /* link is optional */ }
     }
   }
+
+  // What the sheet already says. A refresh re-derives confidence from a fresh
+  // scan, but it must not rewind work: `stage-detectors` sets status=staged and
+  // writes the batch label into `reasons`, and blindly rebuilding both wiped
+  // them for all 55 staged alerts on the first run against the team workbook.
+  const existing = await readRows(trackerPath, ALERTS_SHEET).catch(() => new Map<string, Record<string, string>>());
 
   const results = (await readFile(scanPath, 'utf8'))
     .split('\n')
@@ -161,18 +192,22 @@ export async function runRefreshAlertTracker(args: RefreshAlertTrackerArgs): Pro
       confidence: conf.level,
       lane: conf.lane,
       priority: conf.level === 'blocked' ? 'low' : 'medium',
-      status: conf.level === 'blocked' ? 'blocked' : 'candidate',
-      reasons: conf.reasons.join('; '),
+      status: nextStatus(existing.get(r.id)?.['status'], conf.level),
+      // Keep the batch label a staged row carries; `reasons` is the only place
+      // the sheet records which review notebook an alert is in.
+      reasons: keepsBatchLabel(existing.get(r.id)?.['reasons'])
+        ? String(existing.get(r.id)!['reasons'])
+        : conf.reasons.join('; '),
     });
   }
 
-  const { added, updated } = await upsertRows(trackerPath, rows, 'migration');
+  const { added, updated } = await upsertRows(trackerPath, rows, ALERTS_SHEET);
 
-  console.log(`Alert tracker: ${trackerPath}`);
+  console.log(`Alert tracker: ${trackerPath} [sheet "${ALERTS_SHEET}"]`);
   console.log(`  AWS detectors: ${rows.length} (${added} added, ${updated} updated)`);
   console.log(`  lanes: review ${laneTally['review'] ?? 0}, blocked ${laneTally['blocked'] ?? 0}, fast ${laneTally['fast'] ?? 0}`);
   const teams = Object.entries(teamTally).sort((a, b) => b[1] - a[1]);
   console.log(`  teams: ${teams.length} distinct code(s); largest ${teams.slice(0, 3).map(([t, n]) => `${t}=${n}`).join(', ')}`);
   console.log(`  owner derived from: ${Object.entries(sourceTally).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}=${n}`).join(', ')}`);
-  console.log('  Columns match the asset tracker, so these rows paste straight in.');
+  console.log(`  Dashboards/notebooks stay on the "migration" sheet; these rows only touch "${ALERTS_SHEET}".`);
 }

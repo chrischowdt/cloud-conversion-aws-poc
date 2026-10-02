@@ -6,7 +6,7 @@ import { readdir } from 'node:fs/promises';
 import { rm, mkdtemp } from 'node:fs/promises';
 
 import ExcelJS from 'exceljs';
-import { upsertRows, readDecisions, cellStr, isReadyToPublish, isPublished, PUBLISHED, pruneRowsNotInScope, pruneReviewCopyRows, readRows, type TrackerRow, snapshotTracker } from './tracker-xlsx.ts';
+import { ALERTS_SHEET, MIGRATION_SHEET, sheetForAssetType, upsertRows, readDecisions, cellStr, isReadyToPublish, isPublished, PUBLISHED, pruneRowsNotInScope, pruneReviewCopyRows, readRows, type TrackerRow, snapshotTracker } from './tracker-xlsx.ts';
 
 let dir: string;
 let path: string;
@@ -261,5 +261,68 @@ describe('snapshotTracker', () => {
 
   it('does not invent a backup for a file that does not exist', () => {
     assert.equal(snapshotTracker(join(dir, 'absent.xlsx')), undefined);
+  });
+});
+
+describe('one workbook, two sheets', () => {
+  // Dashboards/notebooks live on `migration`, detectors on `alerts`. The team
+  // moved the alert rows into the shared workbook, so a write to the wrong
+  // sheet now lands in a file five people have open.
+  it('routes each asset type to its sheet', () => {
+    assert.equal(sheetForAssetType('dashboard'), MIGRATION_SHEET);
+    assert.equal(sheetForAssetType('notebook'), MIGRATION_SHEET);
+    assert.equal(sheetForAssetType('anomaly-detector'), ALERTS_SHEET);
+  });
+
+  it('keeps the two sheets independent in one file', async () => {
+    const p = join(dir, 'two-sheets.xlsx');
+    await upsertRows(p, [row('D-1'), row('N-1', { asset_type: 'notebook' })], MIGRATION_SHEET);
+    await upsertRows(p, [row('A-1', { asset_type: 'anomaly-detector' })], ALERTS_SHEET);
+
+    const assets = await readRows(p, MIGRATION_SHEET);
+    const alerts = await readRows(p, ALERTS_SHEET);
+    assert.deepEqual([...assets.keys()].sort(), ['D-1', 'N-1']);
+    assert.deepEqual([...alerts.keys()], ['A-1']);
+
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    assert.deepEqual(wb.worksheets.map((w) => w.name).sort(), ['alerts', 'how-to', 'migration']);
+  });
+
+  it('refuses to write detector rows onto the migration sheet', async () => {
+    const p = join(dir, 'guard-a.xlsx');
+    await assert.rejects(
+      () => upsertRows(p, [row('A-2', { asset_type: 'anomaly-detector' })], MIGRATION_SHEET),
+      /refusing to write 1 anomaly-detector row\(s\) to sheet "migration"/
+    );
+  });
+
+  it('refuses to write dashboard rows onto the alerts sheet', async () => {
+    const p = join(dir, 'guard-b.xlsx');
+    await assert.rejects(() => upsertRows(p, [row('D-2')], ALERTS_SHEET), /they belong on "migration"/);
+  });
+
+  it('rejects the whole batch if any row is misplaced — no partial write', async () => {
+    const p = join(dir, 'guard-c.xlsx');
+    await upsertRows(p, [row('A-3', { asset_type: 'anomaly-detector' })], ALERTS_SHEET);
+    await assert.rejects(
+      () => upsertRows(p, [row('A-4', { asset_type: 'anomaly-detector' }), row('D-3')], ALERTS_SHEET),
+      /refusing to write/
+    );
+    assert.deepEqual([...(await readRows(p, ALERTS_SHEET)).keys()], ['A-3'], 'A-4 must not have landed');
+  });
+
+  it('writes the decision dropdown and the how-to sheet for the alerts sheet too', async () => {
+    const p = join(dir, 'alerts-only.xlsx');
+    await upsertRows(p, [row('A-5', { asset_type: 'anomaly-detector' })], ALERTS_SHEET);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    const ws = wb.getWorksheet(ALERTS_SHEET)!;
+    const header = (ws.getRow(1).values as ExcelJS.CellValue[]).slice(1).map((v) => cellStr(v));
+    const dv = (ws.getCell(2, header.indexOf('decision') + 1) as any).dataValidation;
+    assert.ok(dv, 'decision dropdown present on the alerts sheet');
+    const how = wb.getWorksheet('how-to')!;
+    const text = (how.getColumn(1).values as ExcelJS.CellValue[]).map((v) => cellStr(v)).join('\n');
+    assert.match(text, /SHEET "alerts"/, 'the guidance explains the alerts sheet');
   });
 });
