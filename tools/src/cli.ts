@@ -706,6 +706,8 @@ async function main(): Promise<void> {
           : undefined,
         ids: idsFlag ? idsFlag.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         limit: getNumber(args.flags, 'limit'),
+        trackerPath: getString(args.flags, 'tracker'),
+        recordOnly: args.flags.get('record-only') === true,
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),

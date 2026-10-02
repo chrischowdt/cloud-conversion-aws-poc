@@ -36,6 +36,7 @@ import {
   type ReviewBucket,
 } from '../lib/detector-notebook.ts';
 import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
+import { readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import type { SettingsObject } from '../dynatrace/settings.ts';
 
 export interface StageDetectorsArgs {
@@ -60,6 +61,15 @@ export interface StageDetectorsArgs {
   buckets?: ReviewBucket[];
   ids?: string[];
   limit?: number;
+  /**
+   * The alert tracker. This is the RECORD of which detectors are already in a
+   * review notebook — the manifest is only a fallback for when the file is
+   * absent or a reviewer has it open (xlsx locks on write). Defaults to
+   * <tenant>/alert-tracker.xlsx; point it at the team's sheet with --tracker.
+   */
+  trackerPath?: string;
+  /** Record already-published detectors in the tracker and stop; stage nothing. */
+  recordOnly?: boolean;
   mappingPath?: string;
   liveMetricsPath?: string;
   minOverrideSeries?: number;
@@ -84,6 +94,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   const base = args.outDir;
   const inputFile = args.inputFile ?? join(base, 'anomaly-detectors', 'objects.json');
   const reviewDir = join(base, 'migration', 'detector-review');
+  const trackerPath = args.trackerPath ?? join(base, 'alert-tracker.xlsx');
   await mkdir(reviewDir, { recursive: true });
 
   const batchSize = args.batchSize ?? 10;
@@ -117,15 +128,44 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   // plain run re-stages the same first N into a second notebook, giving the
   // same detector two verdict cards in two places. `--ids` and `--restage` are
   // explicit about what they want, so they opt out.
+  // What is already in a reviewer's notebook. The TRACKER is the record — but
+  // it is an xlsx a human can have open, so a publish can succeed while the
+  // write-back fails. The manifest covers that gap, and anything it knows that
+  // the tracker does not is queued as a backfill, which makes the sheet
+  // self-healing rather than something we have to remember to repair.
   const alreadyStaged = new Set<string>();
+  const backfill: TrackerRow[] = [];
   if (!idFilter && !args.restage) {
+    const tracked = new Set<string>();
+    try {
+      for (const [id, r] of await readRows(trackerPath)) {
+        if (String(r['asset_type'] ?? '') !== 'anomaly-detector') continue;
+        if (String(r['review_copy_url'] ?? '').trim()) tracked.add(id);
+      }
+    } catch {
+      /* no tracker yet, or a reviewer has it open */
+    }
+    for (const id of tracked) alreadyStaged.add(id);
+
     try {
       const prior = (JSON.parse(await readFile(join(reviewDir, 'manifest.json'), 'utf8')) as {
         batches?: ManifestEntry[];
       }).batches ?? [];
       for (const b of prior) {
         if (!b.notebookId) continue;
-        for (const d of b.detectors ?? []) alreadyStaged.add(d.objectId);
+        for (const d of b.detectors ?? []) {
+          alreadyStaged.add(d.objectId);
+          if (tracked.has(d.objectId)) continue;
+          backfill.push({
+            asset_id: d.objectId,
+            asset_type: 'anomaly-detector',
+            name: d.title,
+            status: 'staged',
+            review_copy_id: b.notebookId,
+            review_copy_url: b.notebookUrl ?? notebookUiUrl(args.baseUrl, b.notebookId),
+            reasons: `review batch ${b.batch}`,
+          });
+        }
       }
     } catch {
       /* first run */
@@ -161,6 +201,23 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
     });
   }
 
+  // Record what is already published into the tracker and stop. The way to
+  // repair the sheet after a publish that could not write it, without
+  // re-rendering notebook content and discarding reviewers' in-place fixes.
+  if (args.recordOnly) {
+    if (backfill.length === 0) {
+      console.log(`Tracker ${trackerPath} already records every published detector (${alreadyStaged.size}).`);
+      return;
+    }
+    if (!args.apply) {
+      console.log(`Would record ${backfill.length} published detector(s) in ${trackerPath}. No writes made; re-run with --apply.`);
+      return;
+    }
+    const { added, updated } = await upsertRows(trackerPath, backfill, 'migration');
+    console.log(`Recorded ${backfill.length} published detector(s) in ${trackerPath} (${added} added, ${updated} updated).`);
+    return;
+  }
+
   if (items.length === 0) {
     console.log(`No AWS detectors matched buckets [${[...wantBuckets].join(', ')}]${idFilter ? ' + id filter' : ''}.`);
     return;
@@ -176,6 +233,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
     if (!published.length) throw new Error('stage-detectors --restage: no published notebooks in the manifest.');
     const byId = new Map(items.map((it) => [it.objectId, it]));
     const client2 = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
+    const restageTrackerRows: TrackerRow[] = [];
     let updated = 0;
     for (const b of published) {
       const batch = b.detectors.map((d) => byId.get(d.objectId)).filter((x): x is DetectorReviewItem => !!x);
@@ -200,10 +258,31 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
           adminAccess: true,
         });
         updated++;
+        // Restage doubles as the tracker BACKFILL: batches published before the
+        // sheet was wired up — or while a reviewer had it locked — land here.
+        for (const it of batch) {
+          restageTrackerRows.push({
+            asset_id: it.objectId,
+            asset_type: 'anomaly-detector',
+            name: it.title,
+            status: 'staged',
+            review_copy_id: b.notebookId!,
+            review_copy_url: b.notebookUrl ?? notebookUiUrl(args.baseUrl, b.notebookId!),
+            reasons: `review batch ${b.batch}`,
+          });
+        }
         console.log(`  ✓ ${b.batch}: refreshed notebook ${b.notebookId} in place (${batch.length} detectors)`);
       } catch (e) {
         const msg = e instanceof DocumentApiError ? `HTTP ${e.status}: ${e.body.slice(0, 120)}` : (e as Error).message;
         console.log(`  ! ${b.batch}: refresh failed — ${msg}`);
+      }
+    }
+    if (args.apply && restageTrackerRows.length) {
+      try {
+        const { added, updated: upd } = await upsertRows(trackerPath, restageTrackerRows, 'migration');
+        console.log(`  Tracker ${trackerPath}: ${added} added, ${upd} updated.`);
+      } catch (e) {
+        console.log(`  ! Could not write ${trackerPath}: ${(e as Error).message.slice(0, 120)}`);
       }
     }
     console.log(
@@ -289,6 +368,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
 
   const client = args.apply ? new DocumentClient({ baseUrl: args.baseUrl, token: args.token }) : null;
   const manifest: ManifestEntry[] = [];
+  const trackerUpdates: TrackerRow[] = [...backfill];
   const total = batches.length;
   let created = 0;
 
@@ -324,6 +404,20 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
       entry.notebookId = doc.id;
       entry.notebookUrl = notebookUiUrl(args.baseUrl, doc.id);
       manifest.push(entry);
+      // Record the placement in the tracker, so the next run's scope comes from
+      // the sheet the team actually reads rather than a file only we know about.
+      for (const it of batch) {
+        trackerUpdates.push({
+          asset_id: it.objectId,
+          asset_type: 'anomaly-detector',
+          name: it.title,
+          status: 'staged',
+          review_copy_id: doc.id,
+          review_copy_url: entry.notebookUrl,
+          staged_at: new Date().toISOString(),
+          reasons: `review batch ${label}`,
+        });
+      }
       created++;
       console.log(`  ✓ ${label}: notebook ${doc.id} (${batch.length} detectors)`);
     } catch (e) {
@@ -338,6 +432,34 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   // wholesale overwrite would orphan every previously published notebook. Keyed
   // by notebookId (batch labels repeat across runs); prepare-mode entries have
   // no id and are not persisted over prior ones.
+  if (args.apply && trackerUpdates.length) {
+    if (backfill.length) console.log(`  Backfilling ${backfill.length} detector(s) published while the tracker was unwritable.`);
+    try {
+      const { added, updated } = await upsertRows(trackerPath, trackerUpdates, 'migration');
+      console.log(`  Tracker ${trackerPath}: ${added} added, ${updated} updated.`);
+    } catch (e) {
+      // An xlsx a reviewer has open cannot be written. Say so loudly rather
+      // than leaving the sheet quietly out of step with what is published.
+      // Don't suggest --restage here: it re-renders notebook CONTENT and would
+      // discard a reviewer's in-place fixes just to record a URL.
+      console.log(
+        `  ! Could not write ${trackerPath}: ${(e as Error).message.slice(0, 120)}\n` +
+          `    The notebooks ARE published; only the tracker is behind. Close the file (or pass ` +
+          `--tracker <path>) and run \`cct stage-detectors --record-only --apply\` to repair the sheet.`
+      );
+    }
+  }
+
+  // A prepare run publishes nothing, so it must not touch the manifest. It used
+  // to rewrite it from an empty set of fresh entries, which wiped the record of
+  // every published notebook — and with it the fallback the tracker relies on
+  // when a reviewer has the sheet open.
+  if (!args.apply) {
+    console.log('');
+    console.log(`Prepared ${batches.length} notebook payload(s) in ${reviewDir}; no writes made. Inspect them, then re-run with --apply.`);
+    return;
+  }
+
   const manifestPath = join(reviewDir, 'manifest.json');
   let priorBatches: ManifestEntry[] = [];
   try {
