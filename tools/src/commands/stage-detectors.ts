@@ -254,7 +254,10 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
         continue;
       }
       const content = buildDetectorNotebook(`${b.batch} of ${published.length}`, batch);
-      const name = `[MIGRATION REVIEW] AWS alerts — ${b.batch} of ${published.length}`;
+      // Same name the batch was created with. Adding "of N" here used to be
+      // ignored by the API; now that renames take effect it would rename every
+      // review notebook on each restage, and again whenever a batch is added.
+      const name = `[MIGRATION REVIEW] AWS alerts — ${b.batch}`;
       if (!args.apply) {
         await writeFile(join(reviewDir, `${b.batch}.json`), JSON.stringify({ name, type: 'notebook', content }, null, 2));
         console.log(`  · ${b.batch}: prepared refresh for notebook ${b.notebookId} (${batch.length} detectors)`);

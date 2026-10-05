@@ -34,6 +34,7 @@ import { buildApply, type AssetType } from '../lib/doc-apply.ts';
 import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { findOriginal } from '../lib/migrate-support.ts';
 import { lintAsset, summarize } from '../lib/output-lint.ts';
+import { publishNotebookAsNew, PUBLISHED_NEW_STATUS } from './publish-notebook.ts';
 import { readRows, readDecisions, upsertRows, isReadyToPublish, isPublished, PUBLISHED, type TrackerRow } from '../lib/tracker-xlsx.ts';
 
 export interface MigratePromoteArgs {
@@ -58,6 +59,10 @@ interface Candidate {
   name: string;
   lane: string;
   basedOn?: number;
+  /** Notebooks only: the reviewed copy that becomes the new notebook. */
+  reviewCopyId?: string;
+  assetUrl?: string;
+  reviewer?: string;
 }
 
 export async function runMigratePromote(args: MigratePromoteArgs): Promise<void> {
@@ -77,7 +82,8 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
     .filter(([id, r]) => {
       const dec = decisions.get(id)?.decision;
       const ready = isReadyToPublish(dec);
-      const done = isPublished(dec) || r['status'] === 'promoted' || r['status'] === 'verified';
+      const done =
+        isPublished(dec) || r['status'] === 'promoted' || r['status'] === 'verified' || r['status'] === PUBLISHED_NEW_STATUS;
       // Lane is OUR assessment; `Ready To Publish` is a person's. When they
       // disagree, the person wins — a reviewer who marks a blocked-lane asset
       // ready has usually fixed it somewhere we cannot see. The real guards
@@ -90,6 +96,9 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
       name: r['name'] ?? id,
       lane: r['lane'] ?? 'review',
       basedOn: r['based_on_version'] ? Number(r['based_on_version']) : undefined,
+      reviewCopyId: String(r['review_copy_id'] ?? '').trim() || undefined,
+      assetUrl: String(r['asset_url'] ?? '').trim() || undefined,
+      reviewer: String(decisions.get(id)?.reviewer ?? '').trim() || undefined,
     }));
   if (args.limit) candidates = candidates.slice(0, args.limit);
 
@@ -97,7 +106,12 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
     console.log('No assets to publish (need decision="Ready To Publish" and not already Published/promoted).');
     return;
   }
-  console.log(`${args.apply ? 'Publishing (in-place cutover)' : 'Preparing cutover for'} ${candidates.length} ready asset(s)…`);
+  const nbCount = candidates.filter((c) => c.type === 'notebook').length;
+  console.log(
+    `${args.apply ? 'Publishing' : 'Preparing'} ${candidates.length} ready asset(s)` +
+      (nbCount ? ` — ${candidates.length - nbCount} by in-place cutover, ${nbCount} notebook(s) as a NEW notebook (originals untouched)` : ' by in-place cutover') +
+      '…'
+  );
 
   const client = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
   const mappingPath = args.mappingPath ?? join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
@@ -120,6 +134,23 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
   let skipped = 0;
 
   for (const c of candidates) {
+    // Notebooks are never cut over in place: a notebook keeps the results of its
+    // past runs, and overwriting it would destroy them. The reviewed copy is
+    // published as a new notebook instead — see publish-notebook.ts.
+    if (c.type === 'notebook') {
+      const out = await publishNotebookAsNew(c, {
+        client,
+        apply: !!args.apply,
+        ignoreLint: !!args.ignoreLint,
+        publishDir: join(base, 'migration', 'publish-new'),
+        prePublishDir: join(base, 'migration', 'pre-publish'),
+      });
+      if (out.kind === 'published') { updates.push(out.row); promoted++; }
+      else if (out.kind === 'prepared') prepared++;
+      else { console.log(`  ! ${c.id} (${c.name}) — ${out.reason}. Skipping.`); skipped++; }
+      continue;
+    }
+
     // Resolve content to cut over.
     let content: unknown;
     // Prefer a pulled review copy whenever one exists — including for an asset
@@ -251,13 +282,30 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
     console.log(`  ✓ cut over ${c.id} (${c.name}) in place${liveVersion !== undefined ? ` (was v${liveVersion})` : ''}`);
   }
 
-  if (args.apply && updates.length) await upsertRows(trackerPath, updates);
+  if (args.apply && updates.length) {
+    try {
+      await upsertRows(trackerPath, updates);
+    } catch (e) {
+      // Everything above is ALREADY live. Say so loudly rather than leave the
+      // sheet silently behind. Re-running is safe: publishing is idempotent.
+      console.log(
+        `\n  ! Published, but could not write the tracker (${(e as Error).message.slice(0, 100)}).` +
+          `\n    Close ${trackerPath} and re-run with the same --ids to record: ${updates.map((u) => u.asset_id).join(', ')}`
+      );
+    }
+  }
 
   console.log('');
   if (args.apply) {
-    console.log(`Promoted ${promoted} asset(s) in place; ${skipped} skipped.`);
-    console.log('Run `cct migrate-verify` to confirm, or `cct migrate-rollback --ids <id>` to revert.');
+    console.log(`Published ${promoted} asset(s); ${skipped} skipped.`);
+    console.log(
+      'Dashboards: `cct migrate-verify` confirms the cutover. Any asset: `cct migrate-rollback --ids <id> --apply` reverts ' +
+        '(for a notebook that restores the review copy; its original was never changed).'
+    );
   } else {
-    console.log(`Prepared ${prepared} cutover payload(s) in ${promoteDir}; ${skipped} skipped. No writes made. Re-run with --apply.`);
+    console.log(
+      `Prepared ${prepared} payload(s) — dashboards in ${promoteDir}, notebooks in ${join(base, 'migration', 'publish-new')}; ` +
+        `${skipped} skipped. No writes made. Re-run with --apply.`
+    );
   }
 }

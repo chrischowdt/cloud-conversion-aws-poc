@@ -191,9 +191,12 @@ export class DocumentClient {
 
   /** Get document metadata (no content). */
   async getMetadata(id: string, adminAccess = true): Promise<Document> {
+    // `/metadata`, not the bare document path: `GET /documents/{id}` answers with
+    // the multipart metadata+content body, which is not JSON. This method had no
+    // callers until the notebook publish path, so the mistake was never hit.
     const res = await this.request(
       'GET',
-      `/documents/${encodeURIComponent(id)}`,
+      `/documents/${encodeURIComponent(id)}/metadata`,
       adminAccess ? { 'admin-access': 'true' } : undefined
     );
     return JSON.parse(res.text) as Document;
@@ -279,10 +282,12 @@ export class DocumentClient {
   ): Promise<{ id: string; version?: number }> {
     const contentStr = typeof opts.content === 'string' ? opts.content : JSON.stringify(opts.content);
     const fd = new FormData();
-    fd.append(
-      'metadata',
-      new Blob([JSON.stringify({ name: opts.name, type: opts.type })], { type: 'application/json' })
-    );
+    // The name must be a plain form FIELD. It used to go in a JSON `metadata`
+    // part, which the PATCH silently ignores — harmless while every caller passed
+    // the name the document already had, but a notebook published as new was left
+    // called "[MIGRATION REVIEW] …". Verified on nic55601: the field renames, and
+    // a PATCH carrying only the field leaves content untouched.
+    fd.append('name', opts.name);
     fd.append('content', new Blob([contentStr], { type: 'application/json' }), 'content.json');
     const query: Record<string, string> = {};
     if (opts.adminAccess !== false) query['admin-access'] = 'true';
@@ -355,6 +360,27 @@ export class DocumentClient {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ documentId: id, access, recipients: [{ id: groupId, type: 'group' }] }),
+    });
+    if (res.ok || res.status === 409) return;
+    throw new DocumentApiError(res.status, url, await res.text());
+  }
+
+  /**
+   * Share a document with ONE user (direct share, recipient type `user`). Used to
+   * give the original owner access to a notebook we published on their behalf.
+   * 409 (already shared) is OK. `notify` defaults to false, as above.
+   */
+  async shareWithUser(
+    id: string,
+    userId: string,
+    access: 'read' | 'read-write' = 'read-write',
+    notify = false
+  ): Promise<void> {
+    const url = `${this.baseUrl}/platform/document/v1/direct-shares?send-notification=${notify}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ documentId: id, access, recipients: [{ id: userId, type: 'user' }] }),
     });
     if (res.ok || res.status === 409) return;
     throw new DocumentApiError(res.status, url, await res.text());
