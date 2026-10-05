@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 
 import {
   NOTICE_SECTION_ID,
+  POINTER_SECTION_ID,
   buildMigrationNotice,
+  buildOriginalPointer,
+  sameSectionsExcept,
+  withoutSection,
   countReferenceBlocks,
   publishedNotebookName,
   withMigrationNotice,
@@ -32,10 +36,10 @@ describe('buildMigrationNotice', () => {
     date: '2026-10-05',
   });
 
-  it('links the original and says plainly that it was not modified', () => {
+  it('links the original and says its queries and results were left as they were', () => {
     assert.match(md, /\[Kiran's Notebook\]\(https:\/\/x\.apps\.dynatrace\.com\/.+\/abc\)/);
-    assert.match(md, /original notebook was not modified/i);
-    assert.match(md, /results of its past query runs/);
+    assert.match(md, /results of its past runs were left exactly as they were/i);
+    assert.match(md, /link to this notebook at the top/);
   });
 
   it('records when and by whom', () => {
@@ -85,5 +89,49 @@ describe('countReferenceBlocks', () => {
     const c = { sections: [{ state: { input: { value: '//>>> ORIGINAL CLASSIC QUERY (migration reference — safe to delete) >>>\n// q\n//<<<\ntimeseries x' } } }] };
     assert.equal(countReferenceBlocks(c), 1);
     assert.equal(countReferenceBlocks({ sections: [] }), 0);
+  });
+});
+
+describe('the pointer tile on the ORIGINAL notebook', () => {
+  const original = {
+    version: '7',
+    sections: [
+      { id: 'q1', type: 'dql', state: { input: { value: 'timeseries classic' }, result: { rows: [1, 2, 3] } } },
+      { id: 'm1', type: 'markdown', markdown: 'what we found in May' },
+    ],
+  };
+  const md = buildOriginalPointer({
+    newName: 'EIF Notebook (new AWS integration)',
+    newUrl: 'https://x.apps.dynatrace.com/ui/apps/dynatrace.notebooks/notebook/new-id',
+    date: '2026-10-05',
+  });
+
+  it('links to the new notebook and says nothing else changed', () => {
+    assert.match(md, /\[EIF Notebook \(new AWS integration\)\]\(https:\/\/x\.apps\.dynatrace\.com\/.+\/new-id\)/);
+    assert.match(md, /Nothing else in this notebook was changed/);
+    assert.ok(md.includes('\n'), 'multi-line markdown');
+  });
+
+  it('goes first, and leaves every existing section — stored results included — identical', () => {
+    const out = withMigrationNotice(original, md, POINTER_SECTION_ID);
+    assert.equal(out.sections![0]!['id'], POINTER_SECTION_ID);
+    assert.equal(sameSectionsExcept(original, out, POINTER_SECTION_ID), true);
+    assert.deepEqual(out.sections!.slice(1), original.sections);
+  });
+
+  it('notices if anything other than the pointer differs', () => {
+    const tampered = withMigrationNotice(original, md, POINTER_SECTION_ID) as any;
+    tampered.sections[1].state.result = { rows: [] };
+    assert.equal(sameSectionsExcept(original, tampered, POINTER_SECTION_ID), false);
+  });
+
+  it('is removable exactly, which is what rollback relies on', () => {
+    const back = withoutSection(withMigrationNotice(original, md, POINTER_SECTION_ID), POINTER_SECTION_ID);
+    assert.deepEqual(back, original);
+  });
+
+  it('keeps the pointer and the new-notebook notice independent', () => {
+    const both = withMigrationNotice(withMigrationNotice(original, 'N', NOTICE_SECTION_ID), md, POINTER_SECTION_ID);
+    assert.deepEqual(both.sections!.map((s) => s['id']), [POINTER_SECTION_ID, NOTICE_SECTION_ID, 'q1', 'm1']);
   });
 });

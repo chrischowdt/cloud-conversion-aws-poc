@@ -61,6 +61,7 @@ interface Candidate {
   basedOn?: number;
   /** Notebooks only: the reviewed copy that becomes the new notebook. */
   reviewCopyId?: string;
+  reviewCopyUrl?: string;
   assetUrl?: string;
   reviewer?: string;
 }
@@ -97,6 +98,7 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
       lane: r['lane'] ?? 'review',
       basedOn: r['based_on_version'] ? Number(r['based_on_version']) : undefined,
       reviewCopyId: String(r['review_copy_id'] ?? '').trim() || undefined,
+      reviewCopyUrl: String(r['review_copy_url'] ?? '').trim() || undefined,
       assetUrl: String(r['asset_url'] ?? '').trim() || undefined,
       reviewer: String(decisions.get(id)?.reviewer ?? '').trim() || undefined,
     }));

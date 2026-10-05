@@ -10,10 +10,15 @@
  *   - the `//` original-query reference blocks stripped, as in a dashboard cutover
  *   - a notice tile added at the top explaining what happened, linking the original
  *   - shared with the original's owner, so the person who owns the notebook can use it
- * The ORIGINAL is read (to prove it is untouched) but never written.
+ * The ORIGINAL gets exactly one change: a pointer tile at the top linking to the
+ * new notebook (otherwise its owner would never find it). That write is
+ * version-locked, and the original is re-read afterwards to prove every other
+ * section — every query, setting and stored result — came through byte-identical.
  *
  * Reversible: the copy's pre-publish state is snapshotted to
- * migration/pre-publish/<originalId>.json, which migrate-rollback restores.
+ * migration/pre-publish/<originalId>.json and the original's to
+ * <originalId>.original.json; migrate-rollback restores the copy and takes the
+ * pointer back out of the original.
  */
 
 import { existsSync } from 'node:fs';
@@ -24,9 +29,12 @@ import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { stripOriginalCommentsInPlace } from './rewrite-dashboard.ts';
 import { lintAsset, summarize } from '../lib/output-lint.ts';
 import {
+  POINTER_SECTION_ID,
   buildMigrationNotice,
+  buildOriginalPointer,
   countReferenceBlocks,
   publishedNotebookName,
+  sameSectionsExcept,
   withMigrationNotice,
 } from '../lib/notebook-publish.ts';
 import { PUBLISHED, type TrackerRow } from '../lib/tracker-xlsx.ts';
@@ -40,6 +48,8 @@ export interface NotebookPublishCandidate {
   id: string;
   name: string;
   reviewCopyId?: string;
+  /** Link to the review copy — after publishing, the NEW notebook. Used in the pointer. */
+  reviewCopyUrl?: string;
   assetUrl?: string;
   reviewer?: string;
 }
@@ -62,6 +72,64 @@ export type NotebookPublishOutcome =
 const today = () => new Date().toISOString().slice(0, 10);
 const errText = (e: unknown) =>
   e instanceof DocumentApiError ? `HTTP ${e.status}: ${e.body.slice(0, 140)}` : (e as Error).message;
+
+/**
+ * Add the pointer tile to the top of the original, then PROVE nothing else moved.
+ * Version-locked to what we read at the start: if the owner edited the notebook
+ * in the meantime, we leave it alone rather than race their change.
+ */
+async function addPointerToOriginal(
+  c: NotebookPublishCandidate,
+  versionReadAtStart: number | undefined,
+  pointer: string,
+  ctx: NotebookPublishContext
+): Promise<string> {
+  let orig;
+  try {
+    orig = await ctx.client.getDocumentFull(c.id, true);
+  } catch (e) {
+    return `! pointer NOT added — original not readable (${errText(e)})`;
+  }
+  if (versionReadAtStart !== undefined && orig.metadata.version !== versionReadAtStart) {
+    return `! pointer NOT added — the original changed while publishing (v${versionReadAtStart} → v${orig.metadata.version}); re-run to add it`;
+  }
+  const before = typeof orig.content === 'string' ? JSON.parse(orig.content) : orig.content;
+
+  // First snapshot wins, so a republish keeps the true pre-pointer state.
+  const snapPath = join(ctx.prePublishDir, `${c.id}.original.json`);
+  if (!existsSync(snapPath)) {
+    await writeFile(snapPath, JSON.stringify({ originalId: c.id, name: orig.metadata.name, version: orig.metadata.version, content: orig.content }, null, 2));
+  }
+
+  const withPointer = withMigrationNotice(before, pointer, POINTER_SECTION_ID);
+  try {
+    await ctx.client.updateContent(c.id, {
+      name: String(orig.metadata.name ?? c.name), // unchanged — the original keeps its name
+      type: 'notebook',
+      content: withPointer,
+      version: orig.metadata.version,
+      adminAccess: true,
+    });
+  } catch (e) {
+    return `! pointer NOT added (${errText(e)})`;
+  }
+
+  // Re-read and compare: every section other than the pointer must be identical.
+  try {
+    const after = await ctx.client.getDocumentFull(c.id, true);
+    const ac = typeof after.content === 'string' ? JSON.parse(after.content) : after.content;
+    const n = ((before as { sections?: unknown[] }).sections ?? []).filter((s: any) => s?.id !== POINTER_SECTION_ID).length;
+    if (!sameSectionsExcept(before, ac, POINTER_SECTION_ID)) {
+      return `! ORIGINAL CHANGED BEYOND THE POINTER — investigate; snapshot at ${snapPath}`;
+    }
+    if (String(after.metadata.name) !== String(orig.metadata.name)) {
+      return `! original was RENAMED to "${after.metadata.name}" — investigate`;
+    }
+    return `pointer added to the original (v${orig.metadata.version} → v${after.metadata.version}); its ${n} other section(s) are byte-identical`;
+  } catch (e) {
+    return `pointer added, but could not re-read the original to confirm (${errText(e)})`;
+  }
+}
 
 export async function publishNotebookAsNew(
   c: NotebookPublishCandidate,
@@ -105,6 +173,7 @@ export async function publishNotebookAsNew(
   const notice = buildMigrationNotice({ originalName: c.name, originalUrl: c.assetUrl, reviewer: c.reviewer, date: today() });
   const published = withMigrationNotice(content, notice);
   const name = publishedNotebookName(c.name);
+  const pointer = buildOriginalPointer({ newName: name, newUrl: c.reviewCopyUrl, date: today() });
 
   if (!ctx.apply) {
     await mkdir(ctx.publishDir, { recursive: true });
@@ -112,9 +181,18 @@ export async function publishNotebookAsNew(
       join(ctx.publishDir, `${c.id}.json`),
       JSON.stringify({ originalId: c.id, reviewCopyId: c.reviewCopyId, name, content: published }, null, 2)
     );
+    try {
+      const orig = await ctx.client.getDocumentFull(c.id, true);
+      const oc = typeof orig.content === 'string' ? JSON.parse(orig.content) : orig.content;
+      await writeFile(
+        join(ctx.publishDir, `${c.id}.original.json`),
+        JSON.stringify({ originalId: c.id, name: orig.metadata.name, content: withMigrationNotice(oc, pointer, POINTER_SECTION_ID) }, null, 2)
+      );
+    } catch { /* the original was readable a moment ago; the apply path re-checks */ }
     console.log(
       `  · ${c.name} → would publish copy ${c.reviewCopyId} as "${name}"` +
-        `${leftover ? ` (! ${leftover} reference block(s) not stripped)` : ''}; original v${origVersion} left as is`
+        `${leftover ? ` (! ${leftover} reference block(s) not stripped)` : ''}; ` +
+        `would add a pointer tile to the top of the original (v${origVersion}), changing nothing else`
     );
     return { kind: 'prepared' };
   }
@@ -153,17 +231,11 @@ export async function publishNotebookAsNew(
     }
   }
 
-  // Prove the original was not touched.
-  let untouched = 'original untouched';
-  try {
-    const after = await ctx.client.getMetadata(c.id, true);
-    if (after.version !== origVersion) untouched = `! ORIGINAL VERSION CHANGED v${origVersion} → v${after.version} — investigate`;
-    else untouched = `original untouched (still v${origVersion})`;
-  } catch (e) {
-    untouched = `could not re-read the original (${errText(e)})`;
-  }
+  // The pointer on the ORIGINAL — the one change it gets. Non-fatal: the new
+  // notebook is already published and correct whether or not this succeeds.
+  const pointerNote = await addPointerToOriginal(c, origVersion, pointer, ctx);
 
-  console.log(`  ✓ ${c.name} → published "${name}" (${c.reviewCopyId})${shareNote}; ${untouched}`);
+  console.log(`  ✓ ${c.name} → published "${name}" (${c.reviewCopyId})${shareNote}; ${pointerNote}`);
   return {
     kind: 'published',
     row: {

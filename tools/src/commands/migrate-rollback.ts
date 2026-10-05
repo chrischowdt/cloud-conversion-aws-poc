@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { readRows, upsertRows, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { PUBLISHED_NEW_STATUS } from './publish-notebook.ts';
+import { POINTER_SECTION_ID, withoutSection } from '../lib/notebook-publish.ts';
 
 export interface MigrateRollbackArgs {
   outDir: string;
@@ -71,7 +72,7 @@ export async function runMigrateRollback(args: MigrateRollbackArgs): Promise<voi
       }
       const snap = JSON.parse(await readFile(snapPath, 'utf8')) as { reviewCopyId: string; name: string; content: unknown };
       if (!args.apply) {
-        console.log(`  would restore review copy ${snap.reviewCopyId} of ${t.name} to "${snap.name}" (the original is untouched either way)`);
+        console.log(`  would restore review copy ${snap.reviewCopyId} of ${t.name} to "${snap.name}" and remove the pointer tile from the original`);
         continue;
       }
       try {
@@ -83,9 +84,29 @@ export async function runMigrateRollback(args: MigrateRollbackArgs): Promise<voi
           version: live.metadata.version,
           adminAccess: true,
         });
+        // Take the pointer back out of the original. Remove only that section,
+        // rather than restoring a snapshot, so any edit the owner made since
+        // publication survives the rollback.
+        let ptr = 'original had no pointer';
+        try {
+          const orig = await client.getDocumentFull(t.id, true);
+          const oc = (typeof orig.content === 'string' ? JSON.parse(orig.content) : orig.content) as { sections?: Array<{ id?: string }> };
+          if ((oc.sections ?? []).some((s) => s?.id === POINTER_SECTION_ID)) {
+            await client.updateContent(t.id, {
+              name: String(orig.metadata.name ?? t.name),
+              type: 'notebook',
+              content: withoutSection(oc, POINTER_SECTION_ID),
+              version: orig.metadata.version,
+              adminAccess: true,
+            });
+            ptr = 'pointer removed from the original';
+          }
+        } catch (e) {
+          ptr = `! could not remove the pointer from the original (${e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message})`;
+        }
         updates.push({ asset_id: t.id, asset_type: t.type, name: t.name, status: 'rolled-back' });
         done++;
-        console.log(`  ✓ restored review copy ${snap.reviewCopyId} to "${snap.name}" (original untouched)`);
+        console.log(`  ✓ restored review copy ${snap.reviewCopyId} to "${snap.name}"; ${ptr}`);
       } catch (e) {
         const msg = e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message;
         console.log(`  ! ${t.id}: ${msg}`);
