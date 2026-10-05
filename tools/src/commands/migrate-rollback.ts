@@ -14,7 +14,9 @@ import { join } from 'node:path';
 
 import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
 import { readRows, upsertRows, type AssetType, type TrackerRow } from '../lib/tracker-xlsx.ts';
-import { PUBLISHED_NEW_STATUS } from './publish-notebook.ts';
+import { PUBLISHED_NEW_STATUS, applySharingPlan } from './publish-notebook.ts';
+import { planSharingMirror, sameSharing } from '../lib/doc-sharing.ts';
+import type { SharingState } from '../dynatrace/document.ts';
 import { POINTER_SECTION_ID, withoutSection } from '../lib/notebook-publish.ts';
 
 export interface MigrateRollbackArgs {
@@ -104,9 +106,34 @@ export async function runMigrateRollback(args: MigrateRollbackArgs): Promise<voi
         } catch (e) {
           ptr = `! could not remove the pointer from the original (${e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message})`;
         }
+        // Put the review copy's owner and sharing back as they were before publish:
+        // ownership first (the flags are owner-only), then the shares and flags.
+        let acc = 'no pre-publish sharing snapshot; owner/sharing left as is';
+        const shPath = join(prePublishDir, `${t.id}.sharing.json`);
+        if (existsSync(shPath)) {
+          const pre = (JSON.parse(await readFile(shPath, 'utf8')) as { sharing: SharingState }).sharing;
+          const errs: string[] = [];
+          try {
+            let cur = await client.getSharingState(snap.reviewCopyId);
+            if (pre.owner && cur.owner !== pre.owner) {
+              try { await client.transferOwner(snap.reviewCopyId, pre.owner); }
+              catch (e) { errs.push(`transfer back: ${e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message}`); }
+              cur = await client.getSharingState(snap.reviewCopyId);
+            }
+            errs.push(...(await applySharingPlan(client, snap.reviewCopyId, planSharingMirror(pre, cur))));
+            const after = await client.getSharingState(snap.reviewCopyId);
+            acc = after.owner === pre.owner && sameSharing(pre, after)
+              ? 'review copy owner and sharing restored'
+              : '! review copy owner/sharing NOT fully restored';
+          } catch (e) {
+            errs.push(e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message);
+            acc = '! could not restore owner/sharing';
+          }
+          if (errs.length) acc += ` (${errs.join(' | ')})`;
+        }
         updates.push({ asset_id: t.id, asset_type: t.type, name: t.name, status: 'rolled-back' });
         done++;
-        console.log(`  ✓ restored review copy ${snap.reviewCopyId} to "${snap.name}"; ${ptr}`);
+        console.log(`  ✓ restored review copy ${snap.reviewCopyId} to "${snap.name}"; ${ptr}; ${acc}`);
       } catch (e) {
         const msg = e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message;
         console.log(`  ! ${t.id}: ${msg}`);

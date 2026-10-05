@@ -9,7 +9,8 @@
  *   - renamed  "[MIGRATION REVIEW] X"  →  "X (new AWS integration)"
  *   - the `//` original-query reference blocks stripped, as in a dashboard cutover
  *   - a notice tile added at the top explaining what happened, linking the original
- *   - shared with the original's owner, so the person who owns the notebook can use it
+ *   - given the original's OWNER and exactly the original's sharing settings (public
+ *     flag, re-share flag, direct and environment shares) — not the review group's
  * The ORIGINAL gets exactly one change: a pointer tile at the top linking to the
  * new notebook (otherwise its owner would never find it). That write is
  * version-locked, and the original is re-read afterwards to prove every other
@@ -25,7 +26,8 @@ import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { DocumentClient, DocumentApiError } from '../dynatrace/document.ts';
+import { DocumentClient, DocumentApiError, type SharingState } from '../dynatrace/document.ts';
+import { describeSharing, planSharingMirror, sameSharing, type SharingPlan } from '../lib/doc-sharing.ts';
 import { stripOriginalCommentsInPlace } from './rewrite-dashboard.ts';
 import { lintAsset, summarize } from '../lib/output-lint.ts';
 import {
@@ -72,6 +74,90 @@ export type NotebookPublishOutcome =
 const today = () => new Date().toISOString().slice(0, 10);
 const errText = (e: unknown) =>
   e instanceof DocumentApiError ? `HTTP ${e.status}: ${e.body.slice(0, 140)}` : (e as Error).message;
+
+/**
+ * Perform a sharing plan on one document. Every step is attempted; failures are
+ * returned rather than thrown so the caller can verify and report the end state.
+ * The flags are owner-only — call this while the tool owns the document.
+ */
+export async function applySharingPlan(client: DocumentClient, docId: string, plan: SharingPlan): Promise<string[]> {
+  const failures: string[] = [];
+  const attempt = async (what: string, fn: () => Promise<unknown>) => {
+    try { await fn(); } catch (e) { failures.push(`${what}: ${errText(e)}`); }
+  };
+  if (plan.flags) {
+    await attempt('set private/reshareable flags', async () => {
+      const meta = await client.getMetadata(docId, true);
+      await client.setSharingFlags(docId, plan.flags!, Number(meta.version));
+    });
+  }
+  for (const id of plan.deleteDirect) await attempt('remove a direct share', () => client.deleteDirectShare(id));
+  for (const s of plan.createDirect) await attempt('add a direct share', () => client.createDirectShare(docId, s.access, s.recipients));
+  for (const id of plan.deleteEnvironment) await attempt('remove an environment share', () => client.deleteEnvironmentShare(id));
+  for (const a of plan.createEnvironment) await attempt('add an environment share', () => client.shareEnvironment(docId, a));
+  return failures;
+}
+
+/** Human summary of what a sharing plan will do, including the ownership move. */
+function describePlan(p: SharingPlan, target: SharingState, current: SharingState): string {
+  const steps: string[] = [];
+  if (p.flags) steps.push(`set ${p.flags.isPrivate ? 'private' : 'public'}, ${p.flags.isReshareable ? 'reshareable' : 'not reshareable'}`);
+  if (p.deleteDirect.length) steps.push(`remove ${p.deleteDirect.length} direct share(s)`);
+  if (p.createDirect.length) steps.push(`add ${p.createDirect.length} direct share(s)`);
+  if (p.deleteEnvironment.length) steps.push(`remove ${p.deleteEnvironment.length} environment share(s)`);
+  if (p.createEnvironment.length) steps.push(`add ${p.createEnvironment.length} environment share(s)`);
+  if (target.owner && target.owner !== current.owner) steps.push(`transfer ownership ${current.owner.slice(0, 8)} → ${target.owner.slice(0, 8)}`);
+  return `${steps.length ? steps.join('; ') : 'already identical'} [original: ${describeSharing(target)}]`;
+}
+
+/**
+ * Make the new notebook's owner and sharing identical to the original's, then
+ * PROVE it by re-reading both. Order matters: the public/re-share flags are
+ * owner-only, so they and the shares are set while we still own the copy, and
+ * the ownership transfer — which removes our own access — goes last.
+ *
+ * The copy's pre-publish owner and sharing are snapshotted (first wins) so
+ * migrate-rollback can put the review copy back as it was.
+ */
+async function mirrorOwnerAndSharing(c: NotebookPublishCandidate, copyId: string, ctx: NotebookPublishContext): Promise<string> {
+  let target: SharingState, current: SharingState;
+  try {
+    [target, current] = await Promise.all([ctx.client.getSharingState(c.id), ctx.client.getSharingState(copyId)]);
+  } catch (e) {
+    return `! owner/sharing NOT mirrored — could not read sharing (${errText(e)})`;
+  }
+  const snapPath = join(ctx.prePublishDir, `${c.id}.sharing.json`);
+  if (!existsSync(snapPath)) await writeFile(snapPath, JSON.stringify({ reviewCopyId: copyId, sharing: current }, null, 2));
+
+  const failures = await applySharingPlan(ctx.client, copyId, planSharingMirror(target, current));
+
+  let transferred = false;
+  if (target.owner && target.owner !== current.owner) {
+    try {
+      await ctx.client.transferOwner(copyId, target.owner);
+      transferred = true;
+    } catch (e) {
+      failures.push(`transfer ownership: ${errText(e)}`);
+      // Fallback so the owner can at least open it.
+      try { await ctx.client.shareWithUser(copyId, target.owner); }
+      catch (e2) { failures.push(`fallback share with the original owner: ${errText(e2)}`); }
+    }
+  }
+
+  // Prove it.
+  try {
+    const after = await ctx.client.getSharingState(copyId);
+    const ownerOk = after.owner === target.owner;
+    const shareOk = sameSharing(target, after);
+    const head = ownerOk && shareOk
+      ? `owner and sharing now match the original (${transferred ? 'ownership transferred' : 'same owner'}; ${describeSharing(after)})`
+      : `! owner/sharing do NOT match the original — owner ${ownerOk ? 'ok' : `${after.owner.slice(0, 8)} ≠ ${target.owner.slice(0, 8)}`}, ` +
+        `sharing ${shareOk ? 'ok' : `[new: ${describeSharing(after)}] vs [original: ${describeSharing(target)}]`}`;
+    return failures.length ? `${head}; errors: ${failures.join(' | ')}` : head;
+  } catch (e) {
+    return `could not re-read sharing to confirm (${errText(e)})${failures.length ? `; errors: ${failures.join(' | ')}` : ''}`;
+  }
+}
 
 /**
  * Add the pointer tile to the top of the original, then PROVE nothing else moved.
@@ -137,13 +223,11 @@ export async function publishNotebookAsNew(
 ): Promise<NotebookPublishOutcome> {
   if (!c.reviewCopyId) return { kind: 'skipped', reason: 'no review copy recorded — stage it first' };
 
-  // The original: read only, to prove later that it was not touched.
+  // The original's version now, so the pointer write can be locked to it.
   let origVersion: number | undefined;
-  let origOwner: string | undefined;
   try {
     const meta = await ctx.client.getMetadata(c.id, true);
     origVersion = meta.version;
-    origOwner = meta.owner;
   } catch (e) {
     return { kind: 'skipped', reason: `original not readable (${errText(e)})` };
   }
@@ -189,10 +273,21 @@ export async function publishNotebookAsNew(
         JSON.stringify({ originalId: c.id, name: orig.metadata.name, content: withMigrationNotice(oc, pointer, POINTER_SECTION_ID) }, null, 2)
       );
     } catch { /* the original was readable a moment ago; the apply path re-checks */ }
+    let accessPlan = '';
+    try {
+      const [target, current] = await Promise.all([
+        ctx.client.getSharingState(c.id),
+        ctx.client.getSharingState(c.reviewCopyId),
+      ]);
+      accessPlan = `would make it match the original — ${describePlan(planSharingMirror(target, current), target, current)}`;
+    } catch (e) {
+      accessPlan = `! could not read sharing to plan it (${errText(e)})`;
+    }
     console.log(
       `  · ${c.name} → would publish copy ${c.reviewCopyId} as "${name}"` +
-        `${leftover ? ` (! ${leftover} reference block(s) not stripped)` : ''}; ` +
-        `would add a pointer tile to the top of the original (v${origVersion}), changing nothing else`
+        `${leftover ? ` (! ${leftover} reference block(s) not stripped)` : ''}\n` +
+        `      would add a pointer tile to the top of the original (v${origVersion}), changing nothing else\n` +
+        `      ${accessPlan}`
     );
     return { kind: 'prepared' };
   }
@@ -220,22 +315,15 @@ export async function publishNotebookAsNew(
     return { kind: 'skipped', reason: `publish failed: ${errText(e)}` };
   }
 
-  // Give the original owner access. Non-fatal: the notebook is published either way.
-  let shareNote = '';
-  if (origOwner && origOwner !== live.metadata.owner) {
-    try {
-      await ctx.client.shareWithUser(c.reviewCopyId, origOwner, 'read-write');
-      shareNote = '; shared with the original owner';
-    } catch (e) {
-      shareNote = `; ! could not share with the original owner (${errText(e)})`;
-    }
-  }
-
   // The pointer on the ORIGINAL — the one change it gets. Non-fatal: the new
   // notebook is already published and correct whether or not this succeeds.
   const pointerNote = await addPointerToOriginal(c, origVersion, pointer, ctx);
 
-  console.log(`  ✓ ${c.name} → published "${name}" (${c.reviewCopyId})${shareNote}; ${pointerNote}`);
+  // Give the new notebook the original's owner and sharing. Last, because the
+  // flags are owner-only and the transfer removes our own access.
+  const accessNote = await mirrorOwnerAndSharing(c, c.reviewCopyId, ctx);
+
+  console.log(`  ✓ ${c.name} → published "${name}" (${c.reviewCopyId})\n      ${pointerNote}\n      ${accessNote}`);
   return {
     kind: 'published',
     row: {

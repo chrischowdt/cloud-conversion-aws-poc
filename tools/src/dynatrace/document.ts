@@ -46,6 +46,26 @@ export interface DocumentListResponse {
   documents?: Document[];
 }
 
+/** An SSO user or group (a share recipient). */
+export interface SsoEntity {
+  id: string;
+  type: string;
+}
+
+/** Everything that decides who can see a document. */
+export interface SharingState {
+  owner: string;
+  isPrivate: boolean;
+  isReshareable: boolean;
+  direct: Array<{ shareId: string; access: 'read' | 'read-write'; recipients: SsoEntity[] }>;
+  environment: Array<{ shareId: string; access: 'read' | 'read-write' }>;
+}
+
+/** A share's access array (`['read','write']`) as the create-share value (`'read-write'`). */
+export function shareAccess(access: string[] | undefined): 'read' | 'read-write' {
+  return (access ?? []).includes('write') ? 'read-write' : 'read';
+}
+
 export class DocumentApiError extends Error {
   readonly status: number;
   readonly url: string;
@@ -384,6 +404,108 @@ export class DocumentClient {
     });
     if (res.ok || res.status === 409) return;
     throw new DocumentApiError(res.status, url, await res.text());
+  }
+
+  // ─── ownership + full sharing state (endpoints per @dynatrace-sdk/client-document 1.30) ───
+
+  /** JSON request against the Document API with Bearer auth; no retry (these are writes or cheap reads). */
+  private async json(
+    method: 'GET' | 'POST' | 'DELETE',
+    path: string,
+    query: Record<string, string> = {},
+    body?: unknown,
+    okStatuses: number[] = [200, 201, 204]
+  ): Promise<any> {
+    const url = new URL(`${this.baseUrl}/platform/document/v1${path}`);
+    for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        Accept: 'application/json',
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    if (!okStatuses.includes(res.status)) throw new DocumentApiError(res.status, url.toString(), text);
+    return text ? JSON.parse(text) : undefined;
+  }
+
+  /**
+   * Everything that decides who can see a document: the public flag, whether
+   * sharees may re-share, every direct share with its user/group recipients, and
+   * every environment share. Read with admin-access so it works for any owner.
+   */
+  async getSharingState(id: string): Promise<SharingState> {
+    const meta = await this.json('GET', `/documents/${encodeURIComponent(id)}/metadata`, { 'admin-access': 'true' });
+    const filter = `documentId=='${id}'`;
+    const pages = async (kind: 'direct-shares' | 'environment-shares') => {
+      const all: Array<{ id: string; access: string[] }> = [];
+      let pageKey: string | undefined;
+      do {
+        const q: Record<string, string> = pageKey ? { 'page-key': pageKey } : { filter, 'admin-access': 'true' };
+        const j = await this.json('GET', `/${kind}`, q);
+        all.push(...(j?.[kind] ?? []));
+        pageKey = j?.nextPageKey ?? undefined;
+      } while (pageKey);
+      return all;
+    };
+    const direct: SharingState['direct'] = [];
+    for (const s of await pages('direct-shares')) {
+      const recipients: SsoEntity[] = [];
+      let pageKey: string | undefined;
+      do {
+        const q: Record<string, string> = pageKey ? { 'page-key': pageKey } : { 'admin-access': 'true' };
+        const j = await this.json('GET', `/direct-shares/${encodeURIComponent(s.id)}/recipients`, q);
+        recipients.push(...((j?.recipients ?? []) as SsoEntity[]).map((r) => ({ id: r.id, type: r.type })));
+        pageKey = j?.nextPageKey ?? undefined;
+      } while (pageKey);
+      direct.push({ shareId: s.id, access: shareAccess(s.access), recipients });
+    }
+    const environment = (await pages('environment-shares')).map((s) => ({ shareId: s.id, access: shareAccess(s.access) }));
+    return {
+      owner: String(meta?.owner ?? ''),
+      isPrivate: !!meta?.isPrivate,
+      isReshareable: meta?.isReshareable !== false,
+      direct,
+      environment,
+    };
+  }
+
+  /** Set the public / re-share flags (owner-only per the API). Multipart PATCH fields, version-locked. */
+  async setSharingFlags(id: string, flags: { isPrivate: boolean; isReshareable: boolean }, version: number): Promise<void> {
+    const fd = new FormData();
+    fd.append('isPrivate', String(flags.isPrivate));
+    fd.append('isReshareable', String(flags.isReshareable));
+    await this.writeMultipart('PATCH', `/documents/${encodeURIComponent(id)}`, {
+      'admin-access': 'true',
+      'optimistic-locking-version': String(version),
+    }, fd);
+  }
+
+  /** Create a direct share with several recipients at once. No email by default. */
+  async createDirectShare(id: string, access: 'read' | 'read-write', recipients: SsoEntity[], notify = false): Promise<void> {
+    await this.json('POST', '/direct-shares', { 'send-notification': String(notify) }, { documentId: id, access, recipients }, [200, 201, 409]);
+  }
+
+  /** Delete a direct share (revokes all its recipients). 404 is OK. */
+  async deleteDirectShare(shareId: string): Promise<void> {
+    await this.json('DELETE', `/direct-shares/${encodeURIComponent(shareId)}`, { 'admin-access': 'true' }, undefined, [204, 404]);
+  }
+
+  /**
+   * Transfer ownership. Per the API the previous owner LOSES access; this tool
+   * keeps working on the document only through admin-access. No email by default.
+   */
+  async transferOwner(id: string, newOwnerId: string, notify = false): Promise<void> {
+    await this.json(
+      'POST',
+      `/documents/${encodeURIComponent(id)}:transfer-owner`,
+      { 'admin-access': 'true', 'send-notification': String(notify) },
+      { newOwnerId },
+      [204]
+    );
   }
 
   /** List the shares of one kind (`direct-shares` | `environment-shares`) for a document. */
