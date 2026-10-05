@@ -111,7 +111,7 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
   const nbCount = candidates.filter((c) => c.type === 'notebook').length;
   console.log(
     `${args.apply ? 'Publishing' : 'Preparing'} ${candidates.length} ready asset(s)` +
-      (nbCount ? ` — ${candidates.length - nbCount} by in-place cutover, ${nbCount} notebook(s) as a NEW notebook (originals untouched)` : ' by in-place cutover') +
+      (nbCount ? ` — ${candidates.length - nbCount} by in-place cutover, ${nbCount} notebook(s) as a NEW notebook (each original only gains a pointer tile)` : ' by in-place cutover') +
       '…'
   );
 
@@ -302,7 +302,7 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
     console.log(`Published ${promoted} asset(s); ${skipped} skipped.`);
     console.log(
       'Dashboards: `cct migrate-verify` confirms the cutover. Any asset: `cct migrate-rollback --ids <id> --apply` reverts ' +
-        '(for a notebook that restores the review copy; its original was never changed).'
+        '(for a notebook that restores the review copy and removes the pointer tile from the original).'
     );
   } else {
     console.log(
