@@ -161,11 +161,33 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
 
     // Resolve content to cut over.
     let content: unknown;
-    // Prefer a pulled review copy whenever one exists — including for an asset
-    // our lane called `blocked`, since a reviewer marking it ready means they
-    // know something we do not.
+    // Prefer the review copy whenever one exists — including for an asset our
+    // lane called `blocked`, since a reviewer marking it ready means they know
+    // something we do not. Read it LIVE: a pulled file is a snapshot, and
+    // reviewers keep working after a pull (all three Ready dashboards on
+    // 2026-10-06 had been edited for up to two weeks after theirs — one pull
+    // still held five tiles the reviewer had since fixed). Publishing the pull
+    // would silently revert that work.
     const revPath = join(reviewedDir, `${c.id}.json`);
-    if (existsSync(revPath)) {
+    let liveCopy: unknown;
+    if (c.reviewCopyId) {
+      try {
+        const rc = await client.getDocumentFull(c.reviewCopyId, true);
+        liveCopy = typeof rc.content === 'string' ? JSON.parse(rc.content) : rc.content;
+        // Keep the on-disk pull in step, so what was published is on record.
+        if (args.apply) {
+          await mkdir(reviewedDir, { recursive: true });
+          await writeFile(revPath, JSON.stringify({ content: liveCopy }, null, 2));
+        }
+      } catch (e) {
+        console.log(`  ! ${c.id} (${c.name}) — review copy ${c.reviewCopyId} not readable (${e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message}). Skipping.`);
+        skipped++;
+        continue;
+      }
+    }
+    if (liveCopy !== undefined) {
+      content = liveCopy;
+    } else if (existsSync(revPath)) {
       const rev = JSON.parse(await readFile(revPath, 'utf8')) as Record<string, unknown>;
       content = (rev['content'] as unknown) ?? rev;
     } else {
@@ -175,12 +197,51 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
         skipped++;
         continue;
       }
-      const wrapper = JSON.parse(await readFile(origPath, 'utf8')) as { content?: unknown };
-      const raw = typeof wrapper.content === 'string' ? JSON.parse(wrapper.content) : wrapper.content;
-      const clone = structuredClone(raw);
-      const hits: QueryHit[] = [];
-      rewriteInPlace(clone, index, hits, '');
-      content = clone;
+      const wrapper = JSON.parse(await readFile(origPath, 'utf8')) as { content?: unknown; metadata?: { version?: number } };
+      // No review copy, so the download is the base. If the original has moved
+      // on since, re-rewriting the download would overwrite whatever was done to
+      // it — and a reviewer with no copy may well have migrated the ORIGINAL by
+      // hand (2026-10-06: one had, 41 classicEntitySelector calls → 0; this path
+      // would have replaced their work with our broken auto-rewrite, and the row
+      // had no based_on_version for the drift guard to catch it).
+      const basis = c.basedOn ?? wrapper.metadata?.version;
+      let liveOrig;
+      try {
+        liveOrig = await client.getDocumentFull(c.id, true);
+      } catch (e) {
+        console.log(`  ! ${c.id} (${c.name}) — original not readable (${e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message}). Skipping.`);
+        skipped++;
+        continue;
+      }
+      if (basis !== undefined && liveOrig.metadata.version !== basis) {
+        // Edited since the download. Publishable only if it's already migrated:
+        // the rewriter would change nothing in it once our reference comments
+        // are gone. Then "publishing" it means stripping those comments.
+        const liveContent = typeof liveOrig.content === 'string' ? JSON.parse(liveOrig.content) : liveOrig.content;
+        const probe = structuredClone(liveContent);
+        stripOriginalCommentsInPlace(probe);
+        const hits: QueryHit[] = [];
+        const after = structuredClone(probe);
+        rewriteInPlace(after, index, hits, '');
+        if (JSON.stringify(after) !== JSON.stringify(probe) && !args.force) {
+          console.log(
+            `  ! ${c.id} (${c.name}) — DRIFT: the original is v${liveOrig.metadata.version}, our download v${basis}, and it still has classic queries. ` +
+              `Re-download and re-stage it rather than overwrite those edits. Skipping (--force to override).`
+          );
+          skipped++;
+          continue;
+        }
+        console.log(`    (the original was migrated in place since the download, v${basis} → v${liveOrig.metadata.version}; publishing the live original as is)`);
+        content = liveContent;
+        c.basedOn = liveOrig.metadata.version;
+      } else {
+        const raw = typeof wrapper.content === 'string' ? JSON.parse(wrapper.content) : wrapper.content;
+        const clone = structuredClone(raw);
+        const hits: QueryHit[] = [];
+        rewriteInPlace(clone, index, hits, '');
+        content = clone;
+        c.basedOn = basis;
+      }
     }
 
     // Gate: refuse shapes we have PROVEN return nothing. The rewriter is not the
