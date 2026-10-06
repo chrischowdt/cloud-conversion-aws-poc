@@ -160,6 +160,54 @@ export function sameSectionsExcept(a: NotebookContent, b: NotebookContent, ignor
   return keep(a) === keep(b);
 }
 
+/**
+ * What the owner AUTHORED in a section — its kind, title, query, markdown and
+ * chart type — and not what running it produced. A notebook's version moves
+ * every time a query runs and its results are stored, so version alone can't
+ * tell "the owner kept working on it" from "the owner looked at it".
+ *
+ * `visualizationSettings` (column widths, colours, axis labels) is left out on
+ * purpose: dragging a table column rewrites it (measured: 1576 → 1615 was the
+ * only change in one notebook), and that is not work worth holding a publish for.
+ */
+function authoredSection(s: Record<string, unknown>): string {
+  const st = (s['state'] ?? {}) as Record<string, unknown>;
+  const input = (st['input'] ?? {}) as Record<string, unknown>;
+  return JSON.stringify({
+    type: s['type'] ?? null,
+    title: s['title'] ?? null,
+    markdown: s['markdown'] ?? null,
+    query: input['value'] ?? null,
+    visualization: st['visualization'] ?? null,
+  });
+}
+
+/**
+ * The owner's edits between the notebook we staged from (`base`) and the
+ * original as it is now (`live`), ignoring stored results and our own tiles.
+ * Empty when there are none. A non-empty answer means the review copy is built
+ * on an out-of-date notebook: publishing it would hand the owner a new notebook
+ * that is missing their latest work (found after the first bulk publish — six
+ * of 42 owners had added or changed sections since the download).
+ */
+export function authoredChangesSince(base: NotebookContent, live: NotebookContent): string[] {
+  const ours = new Set([POINTER_SECTION_ID, NOTICE_SECTION_ID]);
+  const sections = (c: NotebookContent) => (c.sections ?? []).filter((s) => !ours.has(String(s?.['id'])));
+  const before = sections(base), now = sections(live);
+  const was = new Map(before.map((s) => [String(s['id']), authoredSection(s)]));
+  const added = now.filter((s) => !was.has(String(s['id']))).length;
+  const removed = before.filter((s) => !now.some((x) => x['id'] === s['id'])).length;
+  const edited = now.filter((s) => was.has(String(s['id'])) && was.get(String(s['id'])) !== authoredSection(s)).length;
+  const order = (c: Array<Record<string, unknown>>) => c.map((s) => s['id']).filter((id) => was.has(String(id)) && now.some((x) => x['id'] === id));
+  const reordered = JSON.stringify(order(before)) !== JSON.stringify(order(now));
+  return [
+    added && `${added} section(s) added`,
+    removed && `${removed} removed`,
+    edited && `${edited} edited`,
+    reordered && 'sections reordered',
+  ].filter((x): x is string => !!x);
+}
+
 /** How many migration reference-comment blocks remain (should be 0 once stripped). */
 export function countReferenceBlocks(content: unknown): number {
   return (JSON.stringify(content).match(/ORIGINAL CLASSIC QUERY \(migration reference/g) ?? []).length;

@@ -71,6 +71,28 @@ describe('planSharingMirror', () => {
     assert.equal(p.createDirect[0]!.access, 'read');
   });
 
+  it('adds users to the existing share at that access level instead of creating a second one', () => {
+    // The first bulk publish: the copy's only read-write share was the review
+    // group's; the original's read-write share was one user. A second read-write
+    // share is HTTP 409, so the user must join the group's share, then the group leaves.
+    const p = planSharingMirror(
+      state({ direct: [{ shareId: 'o', access: 'read-write', recipients: [{ id: 'u1', type: 'user' }] }] }),
+      state({ direct: [{ shareId: 'c', access: 'read-write', recipients: [{ id: 'review-group', type: 'group' }] }] })
+    );
+    assert.deepEqual(p.createDirect, []);
+    assert.deepEqual(p.deleteDirect, [], 'the share the user is joining must survive');
+    assert.deepEqual(p.addRecipients, [{ shareId: 'c', recipients: [{ id: 'u1', type: 'user' }] }]);
+    assert.deepEqual(p.removeRecipients, [{ shareId: 'c', ids: ['review-group'] }]);
+  });
+
+  it("leaves out the copy's current owner (the API refuses it) — the post-transfer pass adds them", () => {
+    const original = state({ owner: 'alice', direct: [{ shareId: 'o', access: 'read', recipients: [{ id: 'tool', type: 'user' }, { id: 'g', type: 'group' }] }] });
+    const copy = state({ owner: 'tool' });
+    assert.deepEqual(planSharingMirror(original, copy).createDirect, [{ access: 'read', recipients: [{ id: 'g', type: 'group' }] }]);
+    const afterTransfer = state({ owner: 'alice', direct: [{ shareId: 'c', access: 'read', recipients: [{ id: 'g', type: 'group' }] }] });
+    assert.deepEqual(planSharingMirror(original, afterTransfer).addRecipients, [{ shareId: 'c', recipients: [{ id: 'tool', type: 'user' }] }]);
+  });
+
   it('removes an environment share the original does not have, and adds one it does', () => {
     assert.deepEqual(planSharingMirror(state(), state({ environment: [{ shareId: 'e', access: 'read-write' }] })).deleteEnvironment, ['e']);
     assert.deepEqual(planSharingMirror(state({ environment: [{ shareId: 'o', access: 'read-write' }] }), state()).createEnvironment, ['read-write']);
@@ -86,17 +108,39 @@ describe('sameSharing', () => {
     assert.equal(sameSharing(a, { ...b, isReshareable: false }), false);
   });
 
+  it('treats a share with no recipients as no share', () => {
+    assert.equal(sameSharing(state(), state({ direct: [{ shareId: 'e', access: 'read-write', recipients: [] }] })), true);
+  });
+
   it('applying a plan yields equal sharing', () => {
-    const original = state({ isPrivate: false, environment: [{ shareId: 'e', access: 'read' }] });
-    const copy = state({ direct: [{ shareId: 'c', access: 'read-write', recipients: [{ id: 'g', type: 'group' }] }] });
-    const p = planSharingMirror(original, copy);
-    const after: typeof copy = {
+    const apply = (copy: SharingState, p: ReturnType<typeof planSharingMirror>): SharingState => ({
       ...copy,
       ...(p.flags ?? {}),
-      direct: copy.direct.filter((d) => !p.deleteDirect.includes(d.shareId)).concat(p.createDirect.map((d, i) => ({ shareId: `n${i}`, ...d }))),
+      direct: copy.direct
+        .filter((d) => !p.deleteDirect.includes(d.shareId))
+        .map((d) => ({
+          ...d,
+          recipients: d.recipients
+            .filter((r) => !p.removeRecipients.some((x) => x.shareId === d.shareId && x.ids.includes(r.id)))
+            .concat(p.addRecipients.filter((x) => x.shareId === d.shareId).flatMap((x) => x.recipients)),
+        }))
+        .concat(p.createDirect.map((d, i) => ({ shareId: `n${i}`, ...d }))),
       environment: copy.environment.filter((e) => !p.deleteEnvironment.includes(e.shareId)).concat(p.createEnvironment.map((a, i) => ({ shareId: `ne${i}`, access: a }))),
-    };
-    assert.equal(sameSharing(original, after), true);
+    });
+    const cases: Array<[SharingState, SharingState]> = [
+      [
+        state({ isPrivate: false, environment: [{ shareId: 'e', access: 'read' }] }),
+        state({ direct: [{ shareId: 'c', access: 'read-write', recipients: [{ id: 'g', type: 'group' }] }] }),
+      ],
+      [
+        state({ direct: [
+          { shareId: 'o1', access: 'read-write', recipients: [{ id: 'u1', type: 'user' }, { id: 'u2', type: 'user' }] },
+          { shareId: 'o2', access: 'read', recipients: [{ id: 'u3', type: 'user' }] },
+        ] }),
+        state({ direct: [{ shareId: 'c', access: 'read-write', recipients: [{ id: 'g', type: 'group' }, { id: 'u2', type: 'user' }] }] }),
+      ],
+    ];
+    for (const [original, copy] of cases) assert.equal(sameSharing(original, apply(copy, planSharingMirror(original, copy))), true);
   });
 });
 

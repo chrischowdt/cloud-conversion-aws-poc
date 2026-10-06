@@ -150,6 +150,8 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
         republish: !!args.republish,
         publishDir: join(base, 'migration', 'publish-new'),
         prePublishDir: join(base, 'migration', 'pre-publish'),
+        outDir: base,
+        force: !!args.force,
       });
       if (out.kind === 'published') { updates.push(out.row); if (out.recordedOnly) recorded++; else promoted++; }
       else if (out.kind === 'prepared') prepared++;

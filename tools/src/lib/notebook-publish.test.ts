@@ -6,6 +6,7 @@ import {
   POINTER_SECTION_ID,
   SUPERSEDED_LABEL,
   UPGRADED_LABEL,
+  authoredChangesSince,
   isSupersededOriginal,
   mergeLabels,
   removeLabels,
@@ -102,6 +103,41 @@ describe('withMigrationNotice', () => {
     const before = JSON.stringify(content);
     withMigrationNotice(content, 'N');
     assert.equal(JSON.stringify(content), before);
+  });
+});
+
+describe('authoredChangesSince (the notebook drift guard)', () => {
+  const q = (id: string, value: string, result: unknown = null) => ({ id, type: 'dql', state: { input: { value }, visualization: 'table', result, state: 'idle' } });
+  const base = { sections: [q('a', 'fetch logs'), { id: 'm', type: 'markdown', markdown: 'notes' }] };
+
+  it('ignores running the queries — new stored results are not an edit', () => {
+    // EYK Lambda Logs: v6 → v8 between download and publish, results only.
+    const ran = { sections: [q('a', 'fetch logs', { records: [1, 2] }), { id: 'm', type: 'markdown', markdown: 'notes' }] };
+    assert.deepEqual(authoredChangesSince(base, ran), []);
+  });
+
+  it('ignores presentation tweaks like a dragged column, but not a changed chart type', () => {
+    const tweak = structuredClone(base) as any;
+    tweak.sections[0].state.visualizationSettings = { table: { columnWidths: { content: 1615 } } };
+    assert.deepEqual(authoredChangesSince(base, tweak), []);
+    tweak.sections[0].state.visualization = 'lineChart';
+    assert.deepEqual(authoredChangesSince(base, tweak), ['1 edited']);
+  });
+
+  it('ignores our own pointer and notice tiles', () => {
+    assert.deepEqual(authoredChangesSince(base, withMigrationNotice(base, 'P', POINTER_SECTION_ID)), []);
+  });
+
+  it('reports sections the owner added — the new notebook would be missing them', () => {
+    // Julian notebook: 3 sections added after the download.
+    const grown = { sections: [...base.sections, q('b', 'timeseries x'), q('c', 'timeseries y')] };
+    assert.deepEqual(authoredChangesSince(base, grown), ['2 section(s) added']);
+  });
+
+  it('reports an edited query or markdown, a removed section, and a reorder', () => {
+    assert.deepEqual(authoredChangesSince(base, { sections: [q('a', 'fetch logs | limit 5'), base.sections[1]!] }), ['1 edited']);
+    assert.deepEqual(authoredChangesSince(base, { sections: [base.sections[0]!] }), ['1 removed']);
+    assert.deepEqual(authoredChangesSince(base, { sections: [base.sections[1]!, base.sections[0]!] }), ['sections reordered']);
   });
 });
 

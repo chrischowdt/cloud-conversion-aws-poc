@@ -385,9 +385,9 @@ export class DocumentClient {
   }
 
   /**
-   * Share a document with a specific group (or user) via a direct share.
-   * `POST /direct-shares {documentId, access, recipients:[{id,type}]}`. Default
-   * `read-write`. Needs `document:direct-shares:write`. 409 (already shared) is OK.
+   * Share a document with a specific group via a direct share (joining the
+   * existing share at that access level if there is one). Default `read-write`.
+   * Needs `document:direct-shares:write`.
    *
    * `notify` maps to the `send-notification` query param (API default: true). We
    * default it to FALSE so bulk staging doesn't spam the review team with emails.
@@ -398,20 +398,13 @@ export class DocumentClient {
     access: 'read' | 'read-write' = 'read-write',
     notify = false
   ): Promise<void> {
-    const url = `${this.baseUrl}/platform/document/v1/direct-shares?send-notification=${notify}&admin-access=true`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ documentId: id, access, recipients: [{ id: groupId, type: 'group' }] }),
-    });
-    if (res.ok || res.status === 409) return;
-    throw new DocumentApiError(res.status, url, await res.text());
+    await this.grantDirect(id, access, [{ id: groupId, type: 'group' }], notify);
   }
 
   /**
    * Share a document with ONE user (direct share, recipient type `user`). Used to
    * give the original owner access to a notebook we published on their behalf.
-   * 409 (already shared) is OK. `notify` defaults to false, as above.
+   * `notify` defaults to false, as above.
    */
   async shareWithUser(
     id: string,
@@ -419,14 +412,7 @@ export class DocumentClient {
     access: 'read' | 'read-write' = 'read-write',
     notify = false
   ): Promise<void> {
-    const url = `${this.baseUrl}/platform/document/v1/direct-shares?send-notification=${notify}&admin-access=true`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ documentId: id, access, recipients: [{ id: userId, type: 'user' }] }),
-    });
-    if (res.ok || res.status === 409) return;
-    throw new DocumentApiError(res.status, url, await res.text());
+    await this.grantDirect(id, access, [{ id: userId, type: 'user' }], notify);
   }
 
   // ─── ownership + full sharing state (endpoints per @dynatrace-sdk/client-document 1.30) ───
@@ -507,12 +493,50 @@ export class DocumentClient {
     }, fd);
   }
 
-  /** Create a direct share with several recipients at once. No email by default. */
+  /**
+   * Create a direct share with several recipients at once. No email by default.
+   *
+   * A document has at most one direct share per access level: if one already
+   * exists this throws HTTP 409 — it does NOT mean "these recipients already have
+   * access". Use `grantDirect` to add to whatever share is there.
+   */
   async createDirectShare(id: string, access: 'read' | 'read-write', recipients: SsoEntity[], notify = false): Promise<void> {
     // admin-access: once ownership has moved to the real owner the tool no longer
     // owns the document, and without it the create is refused (HTTP 403) — found
     // when a republish deleted a share and could not re-create it.
-    await this.json('POST', '/direct-shares', { 'send-notification': String(notify), 'admin-access': 'true' }, { documentId: id, access, recipients }, [200, 201, 409]);
+    await this.json('POST', '/direct-shares', { 'send-notification': String(notify), 'admin-access': 'true' }, { documentId: id, access, recipients }, [200, 201]);
+  }
+
+  /** Add recipients to an existing direct share. Adding the document's owner is refused (HTTP 400). */
+  async addDirectShareRecipients(shareId: string, recipients: SsoEntity[], notify = false): Promise<void> {
+    await this.json(
+      'POST',
+      `/direct-shares/${encodeURIComponent(shareId)}/recipients/add`,
+      { 'send-notification': String(notify), 'admin-access': 'true' },
+      { recipients },
+      [204]
+    );
+  }
+
+  /** Remove recipients (by id) from a direct share; the share itself stays. */
+  async removeDirectShareRecipients(shareId: string, ids: string[]): Promise<void> {
+    await this.json('POST', `/direct-shares/${encodeURIComponent(shareId)}/recipients/remove`, { 'admin-access': 'true' }, { ids }, [204]);
+  }
+
+  /**
+   * Give recipients `access`, whether or not the document already has a direct
+   * share at that level: create one, or add them to the one that is there.
+   */
+  async grantDirect(id: string, access: 'read' | 'read-write', recipients: SsoEntity[], notify = false): Promise<void> {
+    const existing = (await this.json('GET', '/direct-shares', { filter: `documentId=='${id}'`, 'admin-access': 'true' }))?.['direct-shares'] as
+      | Array<{ id: string; access: string[] }>
+      | undefined;
+    const share = (existing ?? []).find((s) => shareAccess(s.access) === access);
+    if (!share) return this.createDirectShare(id, access, recipients, notify);
+    // Only the ones not already on it, so a re-run (e.g. a restage) is a no-op.
+    const on = ((await this.json('GET', `/direct-shares/${encodeURIComponent(share.id)}/recipients`, { 'admin-access': 'true' }))?.recipients ?? []) as SsoEntity[];
+    const missing = recipients.filter((r) => !on.some((o) => o.id === r.id && o.type === r.type));
+    if (missing.length) await this.addDirectShareRecipients(share.id, missing, notify);
   }
 
   /** Delete a direct share (revokes all its recipients). 404 is OK. */

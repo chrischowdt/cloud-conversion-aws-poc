@@ -24,8 +24,10 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+
+import { findOriginal } from '../lib/migrate-support.ts';
 
 import { DocumentClient, DocumentApiError, type SharingState } from '../dynatrace/document.ts';
 import { describeSharing, planSharingMirror, sameSharing, type SharingPlan } from '../lib/doc-sharing.ts';
@@ -35,6 +37,7 @@ import {
   POINTER_SECTION_ID,
   SUPERSEDED_LABEL,
   UPGRADED_LABEL,
+  authoredChangesSince,
   mergeLabels,
   buildMigrationNotice,
   buildOriginalPointer,
@@ -70,6 +73,10 @@ export interface NotebookPublishContext {
   publishDir: string;
   /** Where pre-publish snapshots of the review copy go. */
   prePublishDir: string;
+  /** Tenant out dir; the downloaded original there is the base the review copy was staged from. */
+  outDir: string;
+  /** Publish even though the owner edited the original after it was staged (their edits will be missing). */
+  force?: boolean;
 }
 
 export type NotebookPublishOutcome =
@@ -96,6 +103,7 @@ export async function applySharingPlan(client: DocumentClient, docId: string, pl
   // re-create was refused). In this order a failure can only leave EXTRA access
   // behind for a moment, never take away access someone should have.
   for (const s of plan.createDirect) await attempt('add a direct share', () => client.createDirectShare(docId, s.access, s.recipients));
+  for (const s of plan.addRecipients) await attempt('add recipients to a direct share', () => client.addDirectShareRecipients(s.shareId, s.recipients));
   for (const a of plan.createEnvironment) await attempt('add an environment share', () => client.shareEnvironment(docId, a));
   if (plan.flags) {
     await attempt('set private/reshareable flags', async () => {
@@ -108,6 +116,7 @@ export async function applySharingPlan(client: DocumentClient, docId: string, pl
     failures.push('removals skipped because a grant failed — fix and re-run');
     return failures;
   }
+  for (const s of plan.removeRecipients) await attempt('remove recipients from a direct share', () => client.removeDirectShareRecipients(s.shareId, s.ids));
   for (const id of plan.deleteDirect) await attempt('remove a direct share', () => client.deleteDirectShare(id));
   for (const id of plan.deleteEnvironment) await attempt('remove an environment share', () => client.deleteEnvironmentShare(id));
   return failures;
@@ -119,6 +128,10 @@ function describePlan(p: SharingPlan, target: SharingState, current: SharingStat
   if (p.flags) steps.push(`set ${p.flags.isPrivate ? 'private' : 'public'}, ${p.flags.isReshareable ? 'reshareable' : 'not reshareable'}`);
   if (p.deleteDirect.length) steps.push(`remove ${p.deleteDirect.length} direct share(s)`);
   if (p.createDirect.length) steps.push(`add ${p.createDirect.length} direct share(s)`);
+  const added = p.addRecipients.reduce((n, s) => n + s.recipients.length, 0);
+  const removed = p.removeRecipients.reduce((n, s) => n + s.ids.length, 0);
+  if (added) steps.push(`add ${added} recipient(s) to an existing direct share`);
+  if (removed) steps.push(`remove ${removed} recipient(s) from an existing direct share`);
   if (p.deleteEnvironment.length) steps.push(`remove ${p.deleteEnvironment.length} environment share(s)`);
   if (p.createEnvironment.length) steps.push(`add ${p.createEnvironment.length} environment share(s)`);
   if (target.owner && target.owner !== current.owner) steps.push(`transfer ownership ${current.owner.slice(0, 8)} → ${target.owner.slice(0, 8)}`);
@@ -159,9 +172,15 @@ async function mirrorOwnerAndSharing(c: NotebookPublishCandidate, copyId: string
     }
   }
 
-  // Prove it.
+  // Prove it — after one more pass. The first plan had to leave out anyone who
+  // was the copy's owner at the time (the API won't share a document with its
+  // own owner); now that ownership has moved, they can be added.
   try {
-    const after = await ctx.client.getSharingState(copyId);
+    let after = await ctx.client.getSharingState(copyId);
+    if (!sameSharing(target, after)) {
+      failures.push(...(await applySharingPlan(ctx.client, copyId, planSharingMirror(target, after))));
+      after = await ctx.client.getSharingState(copyId);
+    }
     const ownerOk = after.owner === target.owner;
     const shareOk = sameSharing(target, after);
     const head = ownerOk && shareOk
@@ -244,13 +263,16 @@ export async function publishNotebookAsNew(
 ): Promise<NotebookPublishOutcome> {
   if (!c.reviewCopyId) return { kind: 'skipped', reason: 'no review copy recorded — stage it first' };
 
-  // The original's version now, so the pointer write can be locked to it.
+  // The original as it is now: its version, so the pointer write can be locked
+  // to it, and its content, for the drift guard below.
   let origVersion: number | undefined;
   let origLabels: string[] = [];
+  let origContent: unknown;
   try {
-    const meta = await ctx.client.getMetadata(c.id, true);
-    origVersion = meta.version;
-    origLabels = meta.labels ?? [];
+    const orig = await ctx.client.getDocumentFull(c.id, true);
+    origVersion = orig.metadata.version;
+    origLabels = orig.metadata.labels ?? [];
+    origContent = typeof orig.content === 'string' ? JSON.parse(orig.content) : orig.content;
   } catch (e) {
     return { kind: 'skipped', reason: `original not readable (${errText(e)})` };
   }
@@ -274,6 +296,23 @@ export async function publishNotebookAsNew(
     console.log(`  = ${c.name} — already published (both notebooks labelled); nothing written${ctx.apply ? ', tracker re-recorded' : ''}`);
     return ctx.apply ? { kind: 'published', row: publishedRow(c), recordedOnly: true } : { kind: 'prepared' };
   }
+  // Drift guard. The review copy was built from the downloaded original; if the
+  // owner has since added or changed sections, the new notebook would be
+  // missing that work. Stored results don't count — running a query isn't an edit.
+  if (!ctx.force) {
+    const basePath = await findOriginal(ctx.outDir, 'notebook', c.id);
+    if (!basePath) return { kind: 'skipped', reason: 'the staged original is not on disk, so owner edits since staging cannot be ruled out (--force to override)' };
+    const bw = JSON.parse(await readFile(basePath, 'utf8')) as { content?: unknown };
+    const staged = typeof bw.content === 'string' ? JSON.parse(bw.content) : bw.content;
+    const drift = authoredChangesSince(staged as never, origContent as never);
+    if (drift.length) {
+      return {
+        kind: 'skipped',
+        reason: `DRIFT: the owner edited the original after it was staged (${drift.join(', ')}); the new notebook would be missing that work — restage it, or --force`,
+      };
+    }
+  }
+
   const content = structuredClone(typeof live.content === 'string' ? JSON.parse(live.content) : live.content);
 
   stripOriginalCommentsInPlace(content);
