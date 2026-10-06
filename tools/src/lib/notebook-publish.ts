@@ -5,8 +5,12 @@
  * Dashboards are cut over in place (same id, same URL). Notebooks are not: a
  * notebook stores the results of its past query runs alongside the queries, so
  * overwriting it with migrated content throws those results away. Instead the
- * reviewed copy BECOMES the new notebook — renamed, with the migration's
- * reference comments stripped and a notice at the top explaining what happened.
+ * reviewed copy BECOMES the new notebook — under the original's own title, with
+ * the migration's reference comments stripped and a notice at the top explaining
+ * what happened. The title is deliberately NOT changed: later upgrades (other
+ * query types, other clouds) would otherwise stack suffixes. The two notebooks
+ * are told apart by their tiles and by LABELS, which are also how tooling finds
+ * them again.
  * The original gets exactly one change: a pointer tile at the top linking to the
  * new notebook, because otherwise its owner has no way to find it. Every other
  * section of the original, stored results included, is carried over unchanged.
@@ -28,8 +32,33 @@ export const POINTER_SECTION_ID = 'cct-migration-pointer';
 /** Prefix migrate-stage puts on review copies. */
 const REVIEW_PREFIX = /^\s*\[MIGRATION REVIEW\]\s*/i;
 
-/** Suffix that tells the new notebook apart from the original, which keeps its name. */
-export const PUBLISHED_SUFFIX = ' (new AWS integration)';
+/**
+ * Labels. Document labels exist on the live API (not yet in SDK 1.30), can be
+ * filtered server-side with `labels contains '<label>'`, survive content
+ * updates, and a write REPLACES the whole set — so always merge.
+ *   UPGRADED_LABEL   — on the new notebook
+ *   SUPERSEDED_LABEL — on the original, so scans skip it rather than queue it
+ *                      for conversion a second time
+ */
+export const UPGRADED_LABEL = 'aws-new-integration';
+export const SUPERSEDED_LABEL = 'aws-classic-superseded';
+
+/** Existing labels plus ours, deduplicated, order kept. */
+export function mergeLabels(existing: readonly string[] | undefined, add: readonly string[]): string[] {
+  return [...new Set([...(existing ?? []), ...add])];
+}
+
+/** Existing labels minus ours — how rollback takes them back off without touching the owner's own. */
+export function removeLabels(existing: readonly string[] | undefined, remove: readonly string[]): string[] {
+  const drop = new Set(remove);
+  return (existing ?? []).filter((l) => !drop.has(l));
+}
+
+/** True when a notebook's content carries the pointer tile, i.e. it is a superseded original. */
+export function isSupersededOriginal(content: unknown): boolean {
+  const sections = (content as { sections?: Array<{ id?: unknown }> } | null)?.sections ?? [];
+  return sections.some((s) => s?.id === POINTER_SECTION_ID);
+}
 
 export interface NoticeOptions {
   /** The original notebook's name. */
@@ -42,19 +71,19 @@ export interface NoticeOptions {
   date: string;
 }
 
-/** The name the published notebook carries. Idempotent. */
+/** The name the published notebook carries: the original's own title, without the review prefix. */
 export function publishedNotebookName(originalName: string): string {
-  const base = originalName.replace(REVIEW_PREFIX, '').trim() || 'Untitled notebook';
-  return base.endsWith(PUBLISHED_SUFFIX.trim()) ? base : `${base}${PUBLISHED_SUFFIX}`;
+  return originalName.replace(REVIEW_PREFIX, '').trim() || 'Untitled notebook';
 }
 
 /** Markdown for the notice tile at the top of the new notebook. */
 export function buildMigrationNotice(o: NoticeOptions): string {
-  const original = o.originalUrl ? `[${o.originalName}](${o.originalUrl})` : `**${o.originalName}**`;
+  // Both notebooks share a title, so link by role, never by name.
+  const original = o.originalUrl ? `[the original notebook](${o.originalUrl})` : 'the original notebook';
   const lines = [
     '### ✅ Upgraded for the new AWS integration',
     '',
-    `This notebook is an upgraded copy of ${original}. Its queries were converted to work with ` +
+    `This is the upgraded version of ${original}. Its queries were converted to work with ` +
       "Dynatrace's new AWS cloud integration (Smartscape on Grail), which replaces the classic AWS integration.",
     '',
     "**The original notebook's queries and the results of its past runs were left exactly as they were**; " +
@@ -77,11 +106,12 @@ export interface PointerOptions {
 
 /** Markdown for the pointer tile at the top of the ORIGINAL notebook. */
 export function buildOriginalPointer(o: PointerOptions): string {
-  const target = o.newUrl ? `[${o.newName}](${o.newUrl})` : `**${o.newName}**`;
+  // Both notebooks share a title, so link by role, never by name.
+  const target = o.newUrl ? `[Open the upgraded version](${o.newUrl})` : 'Open the upgraded version (same title, in your notebooks)';
   return [
     '### ➡️ An upgraded version of this notebook is available',
     '',
-    `Open ${target}. Its queries were converted for Dynatrace's new AWS cloud integration ` +
+    `${target}. Its queries were converted for Dynatrace's new AWS cloud integration ` +
       '(Smartscape on Grail). The queries below still use the classic AWS integration and may stop returning ' +
       'data once it is turned off.',
     '',

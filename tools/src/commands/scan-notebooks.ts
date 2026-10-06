@@ -27,6 +27,7 @@ import { mzTagsPathIfPresent } from '../lib/mz-tags.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { runAssetScan, type ScanInputAsset } from '../lib/asset-scan-run.ts';
 import { extractNotebookQueries } from '../lib/asset-extractors.ts';
+import { SUPERSEDED_LABEL, isSupersededOriginal } from '../lib/notebook-publish.ts';
 
 export interface ScanNotebooksArgs {
   inputDir?: string;
@@ -60,8 +61,9 @@ export async function runScanNotebooks(args: ScanNotebooksArgs): Promise<void> {
   console.log(`Scanning ${files.length} notebooks in ${inputDir}`);
 
   const assets: ScanInputAsset[] = [];
+  let superseded = 0;
   for (const file of files) {
-    let parsed: { metadata?: { id?: string; name?: string }; content?: unknown };
+    let parsed: { metadata?: { id?: string; name?: string; labels?: string[] }; content?: unknown };
     try {
       parsed = JSON.parse(await readFile(join(inputDir, file), 'utf8'));
     } catch {
@@ -78,12 +80,23 @@ export async function runScanNotebooks(args: ScanNotebooksArgs): Promise<void> {
           })()
         : parsed.content;
     if (!content) continue;
+    // A superseded ORIGINAL: its upgraded version was published as a new notebook
+    // and this one was left in place to keep its past results. It still holds
+    // classic queries, so without this it would be queued for conversion again.
+    if (isSupersededOriginal(content) || (parsed.metadata?.labels ?? []).includes(SUPERSEDED_LABEL)) {
+      superseded++;
+      continue;
+    }
     assets.push({
       id: parsed.metadata?.id ?? file,
       name: parsed.metadata?.name ?? '(unnamed)',
       file,
       queries: extractNotebookQueries(content),
     });
+  }
+
+  if (superseded) {
+    console.log(`  skipped ${superseded} superseded original(s) — already upgraded into a new notebook (label ${SUPERSEDED_LABEL})`);
   }
 
   await runAssetScan({

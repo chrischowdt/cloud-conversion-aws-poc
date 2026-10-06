@@ -4,6 +4,11 @@ import assert from 'node:assert/strict';
 import {
   NOTICE_SECTION_ID,
   POINTER_SECTION_ID,
+  SUPERSEDED_LABEL,
+  UPGRADED_LABEL,
+  isSupersededOriginal,
+  mergeLabels,
+  removeLabels,
   buildMigrationNotice,
   buildOriginalPointer,
   sameSectionsExcept,
@@ -14,17 +19,33 @@ import {
 } from './notebook-publish.ts';
 
 describe('publishedNotebookName', () => {
-  it('drops the review prefix and marks the new notebook apart from the original', () => {
-    assert.equal(publishedNotebookName('[MIGRATION REVIEW] EIF Notebook'), 'EIF Notebook (new AWS integration)');
-  });
-
-  it('is idempotent', () => {
-    const once = publishedNotebookName('[MIGRATION REVIEW] Bala PCI');
-    assert.equal(publishedNotebookName(once), once);
+  it('keeps the original title — only the review prefix goes', () => {
+    // Later upgrades would otherwise stack suffixes onto the title.
+    assert.equal(publishedNotebookName('[MIGRATION REVIEW] EIF Notebook'), 'EIF Notebook');
+    assert.equal(publishedNotebookName('EIF Notebook'), 'EIF Notebook');
   });
 
   it('never yields an empty name', () => {
-    assert.equal(publishedNotebookName('[MIGRATION REVIEW] '), 'Untitled notebook (new AWS integration)');
+    assert.equal(publishedNotebookName('[MIGRATION REVIEW] '), 'Untitled notebook');
+  });
+});
+
+describe('labels', () => {
+  it("merges ours into the owner's existing labels, without duplicates", () => {
+    assert.deepEqual(mergeLabels(['team-x'], [UPGRADED_LABEL]), ['team-x', UPGRADED_LABEL]);
+    assert.deepEqual(mergeLabels([UPGRADED_LABEL], [UPGRADED_LABEL]), [UPGRADED_LABEL]);
+    assert.deepEqual(mergeLabels(undefined, [SUPERSEDED_LABEL]), [SUPERSEDED_LABEL]);
+  });
+
+  it('removes only ours on rollback', () => {
+    assert.deepEqual(removeLabels(['team-x', SUPERSEDED_LABEL], [SUPERSEDED_LABEL]), ['team-x']);
+    assert.deepEqual(removeLabels(undefined, [SUPERSEDED_LABEL]), []);
+  });
+
+  it('recognises a superseded original by its pointer tile', () => {
+    assert.equal(isSupersededOriginal({ sections: [{ id: POINTER_SECTION_ID }, { id: 'q' }] }), true);
+    assert.equal(isSupersededOriginal({ sections: [{ id: 'q' }] }), false);
+    assert.equal(isSupersededOriginal(null), false);
   });
 });
 
@@ -37,7 +58,7 @@ describe('buildMigrationNotice', () => {
   });
 
   it('links the original and says its queries and results were left as they were', () => {
-    assert.match(md, /\[Kiran's Notebook\]\(https:\/\/x\.apps\.dynatrace\.com\/.+\/abc\)/);
+    assert.match(md, /\[the original notebook\]\(https:\/\/x\.apps\.dynatrace\.com\/.+\/abc\)/);
     assert.match(md, /results of its past runs were left exactly as they were/i);
     assert.match(md, /link to this notebook at the top/);
   });
@@ -49,7 +70,7 @@ describe('buildMigrationNotice', () => {
 
   it('degrades cleanly without a URL or reviewer', () => {
     const bare = buildMigrationNotice({ originalName: 'X', date: '2026-10-05' });
-    assert.match(bare, /\*\*X\*\*/);
+    assert.match(bare, /upgraded version of the original notebook\./);
     assert.doesNotMatch(bare, /reviewed by/);
   });
 });
@@ -107,7 +128,7 @@ describe('the pointer tile on the ORIGINAL notebook', () => {
   });
 
   it('links to the new notebook and says nothing else changed', () => {
-    assert.match(md, /\[EIF Notebook \(new AWS integration\)\]\(https:\/\/x\.apps\.dynatrace\.com\/.+\/new-id\)/);
+    assert.match(md, /\[Open the upgraded version\]\(https:\/\/x\.apps\.dynatrace\.com\/.+\/new-id\)/);
     assert.match(md, /Nothing else in this notebook was changed/);
     assert.ok(md.includes('\n'), 'multi-line markdown');
   });

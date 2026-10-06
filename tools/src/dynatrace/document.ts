@@ -35,6 +35,11 @@ export interface Document {
   version?: number;
   isPrivate?: boolean;
   externalId?: string | null;
+  /**
+   * Document labels. Present on the live API (nic55601, 2026-10-06) although
+   * @dynatrace-sdk/client-document 1.30 does not model them yet.
+   */
+  labels?: string[];
   /** Free-form additional fields surfaced by the API. */
   [k: string]: unknown;
 }
@@ -298,7 +303,19 @@ export class DocumentClient {
    */
   async updateContent(
     id: string,
-    opts: { name: string; type: string; content: unknown; version?: number; adminAccess?: boolean }
+    opts: {
+      name: string;
+      type: string;
+      content: unknown;
+      version?: number;
+      adminAccess?: boolean;
+      /**
+       * Replace the document's labels in the SAME write. Omit to leave them as
+       * they are. The API replaces the whole set (verified), so pass the merged
+       * list, not just the additions; `[]` clears them.
+       */
+      labels?: string[];
+    }
   ): Promise<{ id: string; version?: number }> {
     const contentStr = typeof opts.content === 'string' ? opts.content : JSON.stringify(opts.content);
     const fd = new FormData();
@@ -308,6 +325,12 @@ export class DocumentClient {
     // called "[MIGRATION REVIEW] …". Verified on nic55601: the field renames, and
     // a PATCH carrying only the field leaves content untouched.
     fd.append('name', opts.name);
+    // One `labels` field per label — the only form the API accepts (the JSON
+    // metadata endpoint rejects them); a single empty field clears the set.
+    if (opts.labels) {
+      if (opts.labels.length) for (const l of opts.labels) fd.append('labels', l);
+      else fd.append('labels', '');
+    }
     fd.append('content', new Blob([contentStr], { type: 'application/json' }), 'content.json');
     const query: Record<string, string> = {};
     if (opts.adminAccess !== false) query['admin-access'] = 'true';
@@ -351,7 +374,7 @@ export class DocumentClient {
    * default it to FALSE — bulk-staging migration copies shouldn't email the team.
    */
   async shareEnvironment(id: string, access: 'read' | 'read-write' = 'read-write', notify = false): Promise<void> {
-    const url = `${this.baseUrl}/platform/document/v1/environment-shares?send-notification=${notify}`;
+    const url = `${this.baseUrl}/platform/document/v1/environment-shares?send-notification=${notify}&admin-access=true`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
@@ -375,7 +398,7 @@ export class DocumentClient {
     access: 'read' | 'read-write' = 'read-write',
     notify = false
   ): Promise<void> {
-    const url = `${this.baseUrl}/platform/document/v1/direct-shares?send-notification=${notify}`;
+    const url = `${this.baseUrl}/platform/document/v1/direct-shares?send-notification=${notify}&admin-access=true`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
@@ -396,7 +419,7 @@ export class DocumentClient {
     access: 'read' | 'read-write' = 'read-write',
     notify = false
   ): Promise<void> {
-    const url = `${this.baseUrl}/platform/document/v1/direct-shares?send-notification=${notify}`;
+    const url = `${this.baseUrl}/platform/document/v1/direct-shares?send-notification=${notify}&admin-access=true`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
@@ -486,7 +509,10 @@ export class DocumentClient {
 
   /** Create a direct share with several recipients at once. No email by default. */
   async createDirectShare(id: string, access: 'read' | 'read-write', recipients: SsoEntity[], notify = false): Promise<void> {
-    await this.json('POST', '/direct-shares', { 'send-notification': String(notify) }, { documentId: id, access, recipients }, [200, 201, 409]);
+    // admin-access: once ownership has moved to the real owner the tool no longer
+    // owns the document, and without it the create is refused (HTTP 403) — found
+    // when a republish deleted a share and could not re-create it.
+    await this.json('POST', '/direct-shares', { 'send-notification': String(notify), 'admin-access': 'true' }, { documentId: id, access, recipients }, [200, 201, 409]);
   }
 
   /** Delete a direct share (revokes all its recipients). 404 is OK. */

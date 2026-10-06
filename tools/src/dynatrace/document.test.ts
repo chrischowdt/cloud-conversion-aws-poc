@@ -22,18 +22,18 @@ describe('DocumentClient share notification suppression', () => {
   it('shareWithGroup defaults to send-notification=false (no team email)', async () => {
     const cap = captureUrl();
     await client.shareWithGroup('doc-1', 'grp-1');
-    assert.match(cap.urls[0]!, /\/direct-shares\?send-notification=false$/);
+    assert.match(cap.urls[0]!, /\/direct-shares\?send-notification=false&admin-access=true$/);
   });
 
   it('shareWithGroup honors notify=true', async () => {
     const cap = captureUrl();
     await client.shareWithGroup('doc-1', 'grp-1', 'read-write', true);
-    assert.match(cap.urls[0]!, /send-notification=true$/);
+    assert.match(cap.urls[0]!, /send-notification=true&admin-access=true$/);
   });
 
   it('shareEnvironment defaults to send-notification=false', async () => {
     const cap = captureUrl();
     await client.shareEnvironment('doc-1');
-    assert.match(cap.urls[0]!, /\/environment-shares\?send-notification=false$/);
+    assert.match(cap.urls[0]!, /\/environment-shares\?send-notification=false&admin-access=true$/);
   });
 });

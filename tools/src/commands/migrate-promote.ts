@@ -48,6 +48,8 @@ export interface MigratePromoteArgs {
   force?: boolean;
   /** Publish despite blocking lint findings. */
   ignoreLint?: boolean;
+  /** Notebooks: publish again even if both notebooks already carry their labels. */
+  republish?: boolean;
   mappingPath?: string;
   liveMetricsPath?: string;
   minOverrideSeries?: number;
@@ -134,6 +136,7 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
   let promoted = 0;
   let prepared = 0;
   let skipped = 0;
+  let recorded = 0;
 
   for (const c of candidates) {
     // Notebooks are never cut over in place: a notebook keeps the results of its
@@ -144,10 +147,11 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
         client,
         apply: !!args.apply,
         ignoreLint: !!args.ignoreLint,
+        republish: !!args.republish,
         publishDir: join(base, 'migration', 'publish-new'),
         prePublishDir: join(base, 'migration', 'pre-publish'),
       });
-      if (out.kind === 'published') { updates.push(out.row); promoted++; }
+      if (out.kind === 'published') { updates.push(out.row); if (out.recordedOnly) recorded++; else promoted++; }
       else if (out.kind === 'prepared') prepared++;
       else { console.log(`  ! ${c.id} (${c.name}) — ${out.reason}. Skipping.`); skipped++; }
       continue;
@@ -299,7 +303,7 @@ export async function runMigratePromote(args: MigratePromoteArgs): Promise<void>
 
   console.log('');
   if (args.apply) {
-    console.log(`Published ${promoted} asset(s); ${skipped} skipped.`);
+    console.log(`Published ${promoted} asset(s); ${recorded ? `${recorded} already published (recorded only); ` : ''}${skipped} skipped.`);
     console.log(
       'Dashboards: `cct migrate-verify` confirms the cutover. Any asset: `cct migrate-rollback --ids <id> --apply` reverts ' +
         '(for a notebook that restores the review copy and removes the pointer tile from the original).'

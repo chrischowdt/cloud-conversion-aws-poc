@@ -6,7 +6,8 @@
  * past query runs with the queries, so overwriting it destroys them. Instead the
  * review copy (already reviewed and marked Ready To Publish) becomes the new
  * notebook:
- *   - renamed  "[MIGRATION REVIEW] X"  →  "X (new AWS integration)"
+ *   - renamed  "[MIGRATION REVIEW] X"  →  "X" (the original's own title, unchanged)
+ *   - labelled `aws-new-integration`; the original is labelled `aws-classic-superseded`
  *   - the `//` original-query reference blocks stripped, as in a dashboard cutover
  *   - a notice tile added at the top explaining what happened, linking the original
  *   - given the original's OWNER and exactly the original's sharing settings (public
@@ -32,6 +33,9 @@ import { stripOriginalCommentsInPlace } from './rewrite-dashboard.ts';
 import { lintAsset, summarize } from '../lib/output-lint.ts';
 import {
   POINTER_SECTION_ID,
+  SUPERSEDED_LABEL,
+  UPGRADED_LABEL,
+  mergeLabels,
   buildMigrationNotice,
   buildOriginalPointer,
   countReferenceBlocks,
@@ -60,6 +64,8 @@ export interface NotebookPublishContext {
   client: DocumentClient;
   apply: boolean;
   ignoreLint: boolean;
+  /** Re-publish even when both notebooks already carry their labels (e.g. after changing the tile text). */
+  republish?: boolean;
   /** Where prepare-mode payloads go. */
   publishDir: string;
   /** Where pre-publish snapshots of the review copy go. */
@@ -68,7 +74,7 @@ export interface NotebookPublishContext {
 
 export type NotebookPublishOutcome =
   | { kind: 'prepared' }
-  | { kind: 'published'; row: TrackerRow }
+  | { kind: 'published'; row: TrackerRow; recordedOnly?: boolean }
   | { kind: 'skipped'; reason: string };
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -85,16 +91,25 @@ export async function applySharingPlan(client: DocumentClient, docId: string, pl
   const attempt = async (what: string, fn: () => Promise<unknown>) => {
     try { await fn(); } catch (e) { failures.push(`${what}: ${errText(e)}`); }
   };
+  // Grant before revoking. Deleting first meant a failed create left someone
+  // without access (it happened: a republish removed a user's share and the
+  // re-create was refused). In this order a failure can only leave EXTRA access
+  // behind for a moment, never take away access someone should have.
+  for (const s of plan.createDirect) await attempt('add a direct share', () => client.createDirectShare(docId, s.access, s.recipients));
+  for (const a of plan.createEnvironment) await attempt('add an environment share', () => client.shareEnvironment(docId, a));
   if (plan.flags) {
     await attempt('set private/reshareable flags', async () => {
       const meta = await client.getMetadata(docId, true);
       await client.setSharingFlags(docId, plan.flags!, Number(meta.version));
     });
   }
+  // Only revoke once every grant above succeeded.
+  if (failures.length) {
+    failures.push('removals skipped because a grant failed — fix and re-run');
+    return failures;
+  }
   for (const id of plan.deleteDirect) await attempt('remove a direct share', () => client.deleteDirectShare(id));
-  for (const s of plan.createDirect) await attempt('add a direct share', () => client.createDirectShare(docId, s.access, s.recipients));
   for (const id of plan.deleteEnvironment) await attempt('remove an environment share', () => client.deleteEnvironmentShare(id));
-  for (const a of plan.createEnvironment) await attempt('add an environment share', () => client.shareEnvironment(docId, a));
   return failures;
 }
 
@@ -195,6 +210,8 @@ async function addPointerToOriginal(
       content: withPointer,
       version: orig.metadata.version,
       adminAccess: true,
+      // Marks it superseded, so future scans skip it instead of queueing it again.
+      labels: mergeLabels(orig.metadata.labels, [SUPERSEDED_LABEL]),
     });
   } catch (e) {
     return `! pointer NOT added (${errText(e)})`;
@@ -211,7 +228,11 @@ async function addPointerToOriginal(
     if (String(after.metadata.name) !== String(orig.metadata.name)) {
       return `! original was RENAMED to "${after.metadata.name}" — investigate`;
     }
-    return `pointer added to the original (v${orig.metadata.version} → v${after.metadata.version}); its ${n} other section(s) are byte-identical`;
+    const labelled = (after.metadata.labels ?? []).includes(SUPERSEDED_LABEL);
+    return (
+      `pointer added to the original (v${orig.metadata.version} → v${after.metadata.version}); its ${n} other section(s) are byte-identical; ` +
+      (labelled ? `labelled ${SUPERSEDED_LABEL}` : `! label ${SUPERSEDED_LABEL} NOT present`)
+    );
   } catch (e) {
     return `pointer added, but could not re-read the original to confirm (${errText(e)})`;
   }
@@ -225,9 +246,11 @@ export async function publishNotebookAsNew(
 
   // The original's version now, so the pointer write can be locked to it.
   let origVersion: number | undefined;
+  let origLabels: string[] = [];
   try {
     const meta = await ctx.client.getMetadata(c.id, true);
     origVersion = meta.version;
+    origLabels = meta.labels ?? [];
   } catch (e) {
     return { kind: 'skipped', reason: `original not readable (${errText(e)})` };
   }
@@ -240,6 +263,16 @@ export async function publishNotebookAsNew(
     live = await ctx.client.getDocumentFull(c.reviewCopyId, true);
   } catch (e) {
     return { kind: 'skipped', reason: `review copy not readable (${errText(e)})` };
+  }
+
+  // Already published? The LABELS say so, on the documents themselves. The
+  // tracker cannot be trusted for this: on 2026-10-06 a stale save of the shared
+  // workbook silently reverted the tool's 'published-new' rows, and trusting it
+  // would republish — rewriting the pointer and bumping the version of every
+  // owner's original on every run. So: record, write nothing, unless --republish.
+  if (!ctx.republish && origLabels.includes(SUPERSEDED_LABEL) && (live.metadata.labels ?? []).includes(UPGRADED_LABEL)) {
+    console.log(`  = ${c.name} — already published (both notebooks labelled); nothing written${ctx.apply ? ', tracker re-recorded' : ''}`);
+    return ctx.apply ? { kind: 'published', row: publishedRow(c), recordedOnly: true } : { kind: 'prepared' };
   }
   const content = structuredClone(typeof live.content === 'string' ? JSON.parse(live.content) : live.content);
 
@@ -284,9 +317,9 @@ export async function publishNotebookAsNew(
       accessPlan = `! could not read sharing to plan it (${errText(e)})`;
     }
     console.log(
-      `  · ${c.name} → would publish copy ${c.reviewCopyId} as "${name}"` +
+      `  · ${c.name} → would publish copy ${c.reviewCopyId} as "${name}" (title kept), labelled ${UPGRADED_LABEL}` +
         `${leftover ? ` (! ${leftover} reference block(s) not stripped)` : ''}\n` +
-        `      would add a pointer tile to the top of the original (v${origVersion}), changing nothing else\n` +
+        `      would add a pointer tile to the top of the original (v${origVersion}) and label it ${SUPERSEDED_LABEL}, changing nothing else\n` +
         `      ${accessPlan}`
     );
     return { kind: 'prepared' };
@@ -310,6 +343,8 @@ export async function publishNotebookAsNew(
       content: published,
       version: live.metadata.version,
       adminAccess: true,
+      // Same write, so labelling costs no extra version. Merged: the API replaces the set.
+      labels: mergeLabels(live.metadata.labels, [UPGRADED_LABEL]),
     });
   } catch (e) {
     return { kind: 'skipped', reason: `publish failed: ${errText(e)}` };
@@ -323,16 +358,26 @@ export async function publishNotebookAsNew(
   // flags are owner-only and the transfer removes our own access.
   const accessNote = await mirrorOwnerAndSharing(c, c.reviewCopyId, ctx);
 
-  console.log(`  ✓ ${c.name} → published "${name}" (${c.reviewCopyId})\n      ${pointerNote}\n      ${accessNote}`);
+  let labelNote = '';
+  try {
+    const m = await ctx.client.getMetadata(c.reviewCopyId, true);
+    labelNote = (m.labels ?? []).includes(UPGRADED_LABEL) ? `, labelled ${UPGRADED_LABEL}` : `, ! label ${UPGRADED_LABEL} NOT present`;
+  } catch { /* the owner/sharing check below reports an unreadable copy */ }
+  console.log(`  ✓ ${c.name} → published "${name}" (${c.reviewCopyId})${labelNote}\n      ${pointerNote}\n      ${accessNote}`);
   return {
     kind: 'published',
-    row: {
-      asset_id: c.id,
-      asset_type: 'notebook',
-      name: c.name,
-      status: PUBLISHED_NEW_STATUS,
-      decision: PUBLISHED,
-      promoted_at: new Date().toISOString(),
-    },
+    row: publishedRow(c),
+  };
+}
+
+/** The tracker row for a published notebook. */
+function publishedRow(c: NotebookPublishCandidate): TrackerRow {
+  return {
+    asset_id: c.id,
+    asset_type: 'notebook',
+    name: c.name,
+    status: PUBLISHED_NEW_STATUS,
+    decision: PUBLISHED,
+    promoted_at: new Date().toISOString(),
   };
 }

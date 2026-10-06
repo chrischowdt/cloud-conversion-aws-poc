@@ -773,6 +773,7 @@ async function main(): Promise<void> {
         apply: args.flags.get('apply') === true,
         force: args.flags.get('force') === true,
         ignoreLint: args.flags.get('ignore-lint') === true,
+        republish: args.flags.get('republish') === true,
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),

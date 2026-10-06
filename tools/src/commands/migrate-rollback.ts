@@ -17,7 +17,7 @@ import { readRows, upsertRows, type AssetType, type TrackerRow } from '../lib/tr
 import { PUBLISHED_NEW_STATUS, applySharingPlan } from './publish-notebook.ts';
 import { planSharingMirror, sameSharing } from '../lib/doc-sharing.ts';
 import type { SharingState } from '../dynatrace/document.ts';
-import { POINTER_SECTION_ID, withoutSection } from '../lib/notebook-publish.ts';
+import { POINTER_SECTION_ID, SUPERSEDED_LABEL, UPGRADED_LABEL, removeLabels, withoutSection } from '../lib/notebook-publish.ts';
 
 export interface MigrateRollbackArgs {
   outDir: string;
@@ -85,6 +85,7 @@ export async function runMigrateRollback(args: MigrateRollbackArgs): Promise<voi
           content: snap.content,
           version: live.metadata.version,
           adminAccess: true,
+          labels: removeLabels(live.metadata.labels, [UPGRADED_LABEL]),
         });
         // Take the pointer back out of the original. Remove only that section,
         // rather than restoring a snapshot, so any edit the owner made since
@@ -93,15 +94,18 @@ export async function runMigrateRollback(args: MigrateRollbackArgs): Promise<voi
         try {
           const orig = await client.getDocumentFull(t.id, true);
           const oc = (typeof orig.content === 'string' ? JSON.parse(orig.content) : orig.content) as { sections?: Array<{ id?: string }> };
-          if ((oc.sections ?? []).some((s) => s?.id === POINTER_SECTION_ID)) {
+          const hasPointer = (oc.sections ?? []).some((s) => s?.id === POINTER_SECTION_ID);
+          const hasLabel = (orig.metadata.labels ?? []).includes(SUPERSEDED_LABEL);
+          if (hasPointer || hasLabel) {
             await client.updateContent(t.id, {
               name: String(orig.metadata.name ?? t.name),
               type: 'notebook',
               content: withoutSection(oc, POINTER_SECTION_ID),
               version: orig.metadata.version,
               adminAccess: true,
+              labels: removeLabels(orig.metadata.labels, [SUPERSEDED_LABEL]),
             });
-            ptr = 'pointer removed from the original';
+            ptr = 'pointer and label removed from the original';
           }
         } catch (e) {
           ptr = `! could not remove the pointer from the original (${e instanceof DocumentApiError ? `HTTP ${e.status}` : (e as Error).message})`;
