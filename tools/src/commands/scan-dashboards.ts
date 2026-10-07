@@ -57,15 +57,14 @@ export interface ScanDashboardsArgs {
   minOverrideSeries?: number;
 }
 
-// AWS markers — any one of these in the file content makes the dashboard
-// "AWS-using" for our purposes. Run as substring contains over the serialized
-// content (cheap and avoids re-walking the JSON twice).
-const AWS_MARKERS = [
-  'dt.cloud.aws.',
-  'builtin:cloud.aws.',
-  'dt.entity.aws_',
-  'cloud:aws:',
-];
+// AWS markers — any one of these in a query makes the dashboard "AWS-using" for
+// our purposes. Shared with the notebook/detector scans. This list used to be
+// its own copy WITHOUT the bare `cloud.aws.<svc>.<metric>` form, so every
+// dashboard written against bare keys + dt.entity.custom_device was silently
+// filed as non-AWS and never reached the tracker (found 2026-10-07 when the
+// team asked for 18 "missing" dashboards — all 18 were that shape). The bare
+// marker is a substring of the `builtin:` and `dt.` forms, so it covers them.
+import { AWS_MARKERS } from '../lib/asset-scan.ts';
 
 const QUERY_FIELD_NAMES = new Set(['query', 'input', 'dqlQuery']);
 
