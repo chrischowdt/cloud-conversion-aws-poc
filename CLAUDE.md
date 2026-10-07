@@ -69,6 +69,7 @@ Multi-pass regex pipeline that translates a classic DQL string into its Smartsca
 | 2.6 | `entity.name` → `name` (only when fetch was restructured) | inline |
 | 2.65 | Classic source-entity signal fields → Smartscape: `dt.source_entity.type` → `dt.smartscape_source.type`, bare `dt.source_entity` → `dt.smartscape_source.id` | inline |
 | 2.7 | Classic field rename within Smartscape context (`awsAccountId` → `aws.account.id`) | `entity-field-mappings.ts` |
+| 2.73–2.73c | **Classic tag ARRAY idioms → `tags:aws` RECORD key reads.** Classic tags are `"[AWS]Key:value"` strings; the new field is a record whose toString() is JSON, so every classic idiom runs and returns nothing. 2.73 `contains(tags,"K:v")` → `contains(tags[K],"v")`; 2.73b `expand tags` + `splitString`/`matchesPhrase(tags,"[AWS]K:")` pairs → key reads, expand dropped (guard reads live code only, not comments); 2.73c `parse [lower(]toString(arraySort(tags))[)], "LD 'K:'ALPHA:x …"` → `fieldsAdd x = [lower(]tags[K][)]` (+ `DATA`, char-class types, backtick keys with colons) and inline `contains(toString(tags),"K:v")`. `location` → `aws.region` field. Each verified side by side on sfz80352. What remains (e.g. two entity types' tags merged in one `if()` then expanded) is lint-blocked for a human. | inline |
 | 2.8 | Warn when `by:{dt.smartscape.X}` references a non-carrier dim | `metric-dim-carriers.ts` |
 | 3 | Flag `classicEntitySelector`, classic entity ID literals | inline |
 

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { buildPullIndex } from './metric-streams.ts';
 import { rewriteDql, isBlockingWarning } from './dql-rewriter.ts';
+import { lintQuery } from './output-lint.ts';
 import type {
   CompositeFormula,
   DetectedRecipe,
@@ -2063,6 +2064,143 @@ describe('classic `expand tags` + splitString extraction', () => {
   it('keeps the expand when something still treats tags as a string', () => {
     const r = rewriteDql(q + '\n| filter contains(tags, "raw")', buildIndex([]));
     assert.match(r.rewritten, /expand tags/);
+  });
+});
+
+describe('classic `expand tags` + matchesPhrase (Pass 2.73b)', () => {
+  it('pairs a key filter with the bare-colon split and drops the expand', () => {
+    // AAP _ JET _ UCD Flifo Solace Consumer v2. Measured on sfz80352: classic
+    // prd 2,257 series, this translation prd 2,331.
+    const q =
+      'timeseries w = sum(cloud.aws.dynamodb.consumed_write_capacity_units_sum), by:{dt.entity.custom_device}\n' +
+      '| fieldsAdd table = entityName(dt.entity.custom_device),\n' +
+      'tags = entityAttr(dt.entity.custom_device, "tags")\n' +
+      '| expand tags\n' +
+      '| filter matchesPhrase(tags, "[AWS]env:") | fieldsAdd env = splitString(tags, ":")[1]\n' +
+      '| filter in(env, $Environment)';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /filter isNotNull\(tags\[env\]\) \| fieldsAdd env = tags\[env\]/);
+    assert.doesNotMatch(r.rewritten, /expand tags/);
+    assert.doesNotMatch(r.rewritten, /splitString\(tags/);
+    assert.match(r.rewritten, /filter in\(env, \$Environment\)/, 'the rest is left as written');
+  });
+
+  it('pairs each filter with its own split when the idiom repeats (append)', () => {
+    const block = (m: string) =>
+      `timeseries ${m} = sum(cloud.aws.dynamodb.consumed_write_capacity_units_sum), by:{dt.entity.custom_device}\n` +
+      '| fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")\n| expand tags\n' +
+      '| filter matchesPhrase(tags, "[AWS]env:") | fieldsAdd env = splitString(tags, ":")[1]';
+    const r = rewriteDql(`${block('a')}\n| append [\n${block('b')}\n]`, buildIndex([]));
+    assert.equal(r.rewritten.match(/fieldsAdd env = tags\[env\]/g)?.length, 2);
+    assert.doesNotMatch(r.rewritten, /expand tags|splitString\(tags/);
+  });
+
+  it('turns a phrase match on a whole Key:value tag into the same match on the key', () => {
+    // EVD-ECR-Monitoring. Measured on sfz80352: classic 2 series, this form 2.
+    const q =
+      'timeseries i = avg(cloud.aws.lambda.invocations_sum), by:{dt.entity.custom_device}\n' +
+      '| fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")\n' +
+      '| expand tags\n' +
+      '| filter matchesPhrase(tags, "[AWS]ApplicationCI:evd")';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /filter matchesPhrase\(tags\[ApplicationCI\], "evd"\)/);
+    assert.doesNotMatch(r.rewritten, /expand tags/);
+  });
+
+  it("ignores the author's commented-out lines when deciding the expand can go", () => {
+    const q =
+      'timeseries d = avg(cloud.aws.lambda.duration), by:{dt.entity.custom_device}\n' +
+      '| fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")\n' +
+      '| expand tags\n' +
+      '| filter matchesPhrase(tags, "[AWS]ApplicationCI:evd")\n' +
+      '//| filter matchesPhrase(tags, "evd")';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.doesNotMatch(r.rewritten, /\| expand tags/);
+    assert.match(r.rewritten, /\/\/\| filter matchesPhrase\(tags, "evd"\)/, 'the comment itself is left alone');
+  });
+});
+
+describe('classic tag `parse` idiom (Pass 2.73c)', () => {
+  // 444 queries across the used-but-untracked dashboards, all this one pattern.
+  const q =
+    'timeseries cpu = avg(cloud.aws.ecs.cpu_utilization_by_service_name), by: {dt.entity.custom_device, ServiceName}\n' +
+    '| fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")\n' +
+    '| fieldsAdd customProperties = entityAttr(dt.entity.custom_device, "customProperties")\n' +
+    `| parse toString(arraySort(tags)), "LD 'ApplicationCI:'ALPHA:appci LD 'env:'ALPHA:env"\n` +
+    '| fieldsRemove tags, customProperties\n' +
+    '| filter in(appci, $ApplicationCI)';
+
+  it('reads each parsed key from the record instead', () => {
+    // Measured on sfz80352: top appci/env groups identical series-for-series.
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /\| fieldsAdd appci = tags\[ApplicationCI\], env = tags\[env\]/);
+    assert.doesNotMatch(r.rewritten, /parse toString\(arraySort\(tags\)\)/);
+  });
+
+  it('leaves everything around it as the author wrote it', () => {
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /fieldsRemove tags, customProperties/);
+    assert.match(r.rewritten, /filter in\(appci, \$ApplicationCI\)/);
+  });
+
+  it('passes the tag-record lint once converted', () => {
+    const r = rewriteDql(q, buildIndex([]));
+    assert.deepEqual(lintQuery(r.rewritten).filter((f) => /tag/.test(f.ruleId)), []);
+  });
+
+  it('reads the classic location tag from the region field', () => {
+    const r = rewriteDql(q.replace("'env:'ALPHA:env", "'location:'ALNUM:loc"), buildIndex([]));
+    assert.match(r.rewritten, /loc = getNodeField\(dt\.smartscape\.aws_ecs_cluster, "aws\.region"\)/);
+  });
+
+  it('keeps a lower() source lowercase and restores the key casing', () => {
+    // 251 queries in the tracked backlog. Measured on sfz80352 (EC2 CPU): 32 of
+    // 33 classic groups present with at least the classic series count.
+    const r = rewriteDql(
+      q.replace(
+        `parse toString(arraySort(tags)), "LD 'ApplicationCI:'ALPHA:appci LD 'env:'ALPHA:env"`,
+        `parse lower(toString(arraySort(tags))), "LD 'applicationci:'ALPHA:applicationci LD 'env:'ALPHA:env"`
+      ),
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /\| fieldsAdd applicationci = lower\(tags\[ApplicationCI\]\), env = lower\(tags\[env\]\)/);
+    assert.doesNotMatch(r.rewritten, /parse lower/);
+  });
+
+  it('accepts DATA, character-class value types, and backtick-quotes keys with colons', () => {
+    const r = rewriteDql(
+      q.replace(
+        `"LD 'ApplicationCI:'ALPHA:appci LD 'env:'ALPHA:env"`,
+        `"DATA 'env:' WORD:env LD '[AWS]Region:' [a-zA-Z0-9-]*:Region LD '[AWS]aws:cloudformation:stack-name:' ALPHA:stack"`
+      ),
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /env = tags\[env\], Region = tags\[Region\], stack = tags\[`aws:cloudformation:stack-name`\]/);
+  });
+
+  it('reads the key for contains(toString(tags), "Key:value") written inline', () => {
+    // ARL : Volare : Monitoring Services per Env (8 tiles in each tenant).
+    const inline =
+      'timeseries s = avg(cloud.aws.es.cluster_statusgreen_minimum_by_client_id), by: { dt.entity.custom_device}\n' +
+      '| fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")\n' +
+      '| filter contains(toString(tags), "ApplicationCI:arl")';
+    const r = rewriteDql(inline, buildIndex([]));
+    assert.match(r.rewritten, /filter contains\(tags\[ApplicationCI\], "arl"\)/);
+    assert.deepEqual(lintQuery(r.rewritten).filter((f) => /tag/.test(f.ruleId)), []);
+  });
+
+  it('leaves a pattern it does not fully understand alone', () => {
+    const odd = q.replace("LD 'env:'ALPHA:env", "LD 'env:' LD:rest");
+    const r = rewriteDql(odd, buildIndex([]));
+    assert.match(r.rewritten, /parse toString\(arraySort\(tags\)\)/);
+  });
+
+  it('leaves non-AWS entity tags alone (they really are an array)', () => {
+    const svc =
+      'fetch dt.entity.service\n| fieldsAdd tags\n' +
+      `| parse toString(arraySort(tags)), "LD 'ApplicationCI:'ALPHA:appci"`;
+    const r = rewriteDql(svc, buildIndex([]));
+    assert.match(r.rewritten, /parse toString\(arraySort\(tags\)\)/);
   });
 });
 

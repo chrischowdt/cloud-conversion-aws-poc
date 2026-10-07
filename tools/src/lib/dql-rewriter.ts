@@ -33,6 +33,7 @@ import { classicEntityToSmartscape, lookupByDimRef, entityScope } from './entity
 import { lookupEolForClassicKey } from './eol-lookup.ts';
 import { isMetricCarrier, isKnownNonCarrier } from './metric-dim-carriers.ts';
 import { canonicalTagKey } from './tag-key-casing.ts';
+import { codeMask } from './dql-command.ts';
 import { rewriteEntityIdPins } from './entity-id-pins.ts';
 import { findEdgesBetween } from './smartscape-edges.ts';
 import {
@@ -997,6 +998,8 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // produces a filter that parses, runs, and matches nothing.
   rewritten = rewriteClassicTagSubstringFilters(rewritten, transforms);
   rewritten = rewriteClassicTagExpandIdiom(rewritten, transforms);
+  // Pass 2.73c: `parse toString(arraySort(tags)), "LD 'Key:'ALPHA:x …"` → key reads.
+  rewritten = rewriteClassicTagParseIdiom(rewritten, transforms);
 
   // Pass 2.75: `tags` is a RECORD on the new side — string functions need toString().
   //
@@ -2590,6 +2593,49 @@ function rewriteClassicTagExpandIdiom(input: string, transforms: Transform[]): s
         return repl;
       }
     );
+    // The key picked by a FILTER, the value split off on the bare colon:
+    //   | filter matchesPhrase(tags, "[AWS]env:") | fieldsAdd env = splitString(tags, ":")[1]
+    // After the expand, the filter keeps the one row holding that key, so it is
+    // "the key is present"; the split is its value. Paired with the NEAREST
+    // following split, never across another matchesPhrase on the var.
+    // Measured (sfz80352, DynamoDB): classic prd 2,257 / dev 1 series; this
+    // translation prd 2,331 (the new integration's series set differs slightly).
+    out = out.replace(
+      new RegExp(
+        `filter\\s+matchesPhrase\\(\\s*${V}\\s*,\\s*"(?:\\[AWS\\])?([^":]+):"\\s*\\)` +
+          `((?:(?!matchesPhrase\\(\\s*${V}\\b)[\\s\\S])*?)` +
+          `splitString\\(\\s*${V}\\s*,\\s*":"\\s*\\)\\s*\\[\\s*1\\s*\\]`,
+        'g'
+      ),
+      (full, key: string, between: string) => {
+        const read = replaceKey(key.trim());
+        const repl = `filter isNotNull(${read})${between}${read}`;
+        note(full, repl, key.trim());
+        return repl;
+      }
+    );
+    // A phrase match on one whole "Key:value" tag → the same match on that key's
+    // value: `matchesPhrase(tags, "[AWS]ApplicationCI:evd")` →
+    // `matchesPhrase(tags[ApplicationCI], "evd")`. Keeps matchesPhrase's own
+    // semantics (token match, case-insensitive) rather than swapping in ==.
+    // Measured (sfz80352, Lambda appci evd): classic 2 series, this form 2.
+    out = out.replace(
+      new RegExp(`matchesPhrase\\(\\s*${V}\\s*,\\s*"(?:\\[AWS\\])?([A-Za-z][\\w-]*):([^":]+)"\\s*\\)`, 'g'),
+      (full, key: string, value: string) => {
+        const repl = `matchesPhrase(${replaceKey(key.trim())}, ${JSON.stringify(value)})`;
+        note(full, repl, key.trim());
+        return repl;
+      }
+    );
+    // A phrase match on a key alone ("[AWS]env:") with no paired split: the key is present.
+    out = out.replace(
+      new RegExp(`matchesPhrase\\(\\s*${V}\\s*,\\s*"(?:\\[AWS\\])?([A-Za-z][\\w-]*):"\\s*\\)`, 'g'),
+      (full, key: string) => {
+        const repl = `isNotNull(${replaceKey(key.trim())})`;
+        note(full, repl, key.trim());
+        return repl;
+      }
+    );
 
     // Drop the expand only once nothing treats the var as a tag STRING any
     // more. A survivor means we did not understand the query, and removing the
@@ -2598,10 +2644,14 @@ function rewriteClassicTagExpandIdiom(input: string, transforms: Transform[]): s
     // still treating the var as a string, and dropping the expand there leaves
     // a filter that matches nothing. Found on BBT - SNS
     // NumberOfNotificationsFailed, where this guard let the expand go.
+    // Live code only: an author's commented-out `//| filter matchesPhrase(tags, …)`
+    // is not a use (found on an EVD Lambda tile — it kept the expand).
+    const mask = codeMask(out);
+    const code = Array.from(out, (ch, i) => (mask[i] ? ch : ' ')).join('');
     const stillStringy = new RegExp(
       `(?:contains|splitString|matchesPhrase|matchesValue|startsWith|endsWith)\\(\\s*` +
         `(?:(?:lower|upper|toString|arraySort)\\(\\s*)?${V}\\s*[,)]`
-    ).test(out) || new RegExp(`(?:lower|upper|arraySort)\\(\\s*${V}\\s*\\)`).test(out);
+    ).test(code) || new RegExp(`(?:lower|upper|arraySort)\\(\\s*${V}\\s*\\)`).test(code);
     if (stillStringy) continue;
     const expandRe = new RegExp(`\\s*\\|\\s*expand\\s+${V}\\b[^\\n|]*`, 'g');
     if (expandRe.test(out)) {
@@ -2614,6 +2664,108 @@ function rewriteClassicTagExpandIdiom(input: string, transforms: Transform[]): s
         detail: 'tags:aws is a record, not the classic array — expand yields one null row, and the key reads above no longer need it',
       });
     }
+  }
+  return out;
+}
+
+// ─── Pass 2.73c: classic tag `parse` idiom → record key reads ──────────────────
+//
+// The most common classic way to pull tag values out of the ARRAY: sort it,
+// stringify it, and pattern-match "Key:" prefixes —
+//
+//   | fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")
+//   | parse toString(arraySort(tags)), "LD 'ApplicationCI:'ALPHA:appci LD 'env:'ALPHA:env"
+//
+// On the record this parses JSON and matches nothing. Each `LD 'Key:'TYPE:name`
+// item is simply "the value of Key, as name", so it becomes
+//
+//   | fieldsAdd appci = tags[ApplicationCI], env = tags[env]
+//
+// 444 queries in the 364 used-but-untracked dashboards use exactly this pattern
+// (2026-10-07). Measured on sfz80352 (ECS CPU by service): the top appci/env
+// groups match series-for-series (cuw/prd 278, dqn/prd 277, cwo/prd 191, …);
+// totals 3,910 classic vs 4,012 here, the new integration's series set.
+//
+// Two deliberate differences, both in the direction of returning data: classic
+// ALPHA stops at the first non-letter, the key read gives the whole value; and a
+// classic parse is all-or-nothing, the key reads are independent. Anything but a
+// plain sequence of those items is left alone — the lint keeps it blocked.
+//
+// Variants handled (all seen in the tracked backlog, 2026-10-07):
+//   - `parse lower(toString(arraySort(tags))), "LD 'applicationci:'ALPHA:x …"` —
+//     251 queries. Lowercased keys go back through the canonical casing table and
+//     the read is wrapped in lower() so values stay lowercase. Measured on
+//     sfz80352 (EC2 CPU): 32 of 33 classic applicationci/env groups present with
+//     at least the classic series count; the one missing is null/null, the
+//     all-or-nothing artefact above.
+//   - `DATA` instead of `LD`; a character class as the value type
+//     (`[a-zA-Z0-9-]*:location`).
+//   - keys containing colons (`aws:cloudformation:stack-name:`), read with a
+//     backtick-quoted key — verified to work against the record.
+const TAG_PARSE_ITEM =
+  /^\s*(?:LD|DATA)\s*'(?:\[AWS\])?([^']+):'\s*(?:ALPHA|ALNUM|WORD|NSPACE|\[[^\]]*\][*+]?)\s*:\s*([A-Za-z_]\w*)/i;
+function tagParseItems(pattern: string): Array<{ key: string; name: string }> | null {
+  const items: Array<{ key: string; name: string }> = [];
+  let rest = pattern;
+  while (rest.trim()) {
+    const m = TAG_PARSE_ITEM.exec(rest);
+    if (!m) return null;
+    items.push({ key: m[1]!.trim(), name: m[2]! });
+    rest = rest.slice(m[0].length);
+  }
+  return items.length ? items : null;
+}
+/** A record key as DQL accepts it: bare when it is an identifier, backtick-quoted otherwise. */
+const tagKeyRef = (key: string): string => {
+  const k = canonicalTagKey(key);
+  return /^[A-Za-z_]\w*$/.test(k) ? k : `\`${k}\``;
+};
+
+function rewriteClassicTagParseIdiom(input: string, transforms: Transform[]): string {
+  // Like the expand idiom, this binds the tag field WITHOUT toString().
+  const assignRe = /\b([A-Za-z_]\w*)\s*=\s*getNodeField\(\s*([^,()]+?)\s*,\s*"tags:aws"\s*\)/g;
+  const bound = new Map<string, string>();
+  for (let m = assignRe.exec(input); m; m = assignRe.exec(input)) bound.set(m[1]!, m[2]!.trim());
+  if (bound.size === 0) return input;
+
+  let out = input;
+  for (const [v, dim] of bound) {
+    const V = escapeRegExp(v);
+    const inner = `toString\\(\\s*(?:arraySort\\(\\s*${V}\\s*\\)|${V})\\s*\\)`;
+    const parseRe = new RegExp(`\\|\\s*parse\\s+(?:(lower)\\(\\s*${inner}\\s*\\)|${inner})\\s*,\\s*"([^"]*)"`, 'g');
+    // Pass 2.73's substring idiom with the toString() written inline rather than
+    // on the variable: `contains(toString(tags), "ApplicationCI:arl")`.
+    out = out.replace(
+      new RegExp(`contains\\(\\s*toString\\(\\s*${V}\\s*\\)\\s*,\\s*"(?:\\[AWS\\])?([A-Za-z][\\w-]*):([^":]*)"\\s*\\)`, 'g'),
+      (full, key: string, value: string) => {
+        const repl = CLASSIC_REGION_TAG.test(key)
+          ? `matchesValue(getNodeField(${dim}, "aws.region"), ${JSON.stringify(value)})`
+          : `contains(${v}[${tagKeyRef(key)}], ${JSON.stringify(value)})`;
+        transforms.push({
+          kind: 'entity-dim',
+          before: full,
+          after: repl,
+          detail: `classic tag substring → tag-record key read (${key}); the serialized record is JSON, so "Key:value" never matches`,
+        });
+        return repl;
+      }
+    );
+    out = out.replace(parseRe, (full, lowered: string | undefined, pattern: string) => {
+      const items = tagParseItems(pattern);
+      if (!items) return full;
+      const reads = items.map(({ key, name }) => {
+        const read = CLASSIC_REGION_TAG.test(key) ? `getNodeField(${dim}, "aws.region")` : `${v}[${tagKeyRef(key)}]`;
+        return `${name} = ${lowered ? `lower(${read})` : read}`;
+      });
+      const repl = `| fieldsAdd ${reads.join(', ')}`;
+      transforms.push({
+        kind: 'entity-dim',
+        before: full.trim(),
+        after: repl,
+        detail: `classic tag parse (${items.map((i) => i.key).join(', ')}) → tag-record key reads; tags:aws is a record, so the "Key:" pattern never matches it`,
+      });
+      return repl;
+    });
   }
   return out;
 }
