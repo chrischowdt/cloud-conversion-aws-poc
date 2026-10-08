@@ -34,7 +34,7 @@ A Node 22 + TypeScript CLI, `cct`, in [`tools/`](tools/):
   - Dashboards are updated in place, behind a drift guard and with a snapshot for rollback.
   - Notebooks are published as a **new** notebook with the original owner and sharing, and the original gets only a pointer tile. A notebook stores the results of its past runs, so overwriting it would destroy them.
 
-See [`CLAUDE.md`](CLAUDE.md) for the architecture (rewriter passes, lookup tiers, lookup tables) and [`tools/README.md`](tools/README.md) for the commands.
+**Taking this over or running it yourself?** Start with the [runbook](docs/RUNBOOK.md): how the migration is actually run, from setup to batches to publishing. Then read [the decisions behind it](docs/DECISIONS.md). See [`CLAUDE.md`](CLAUDE.md) for the architecture (rewriter passes, lookup tiers, lookup tables) and [`tools/README.md`](tools/README.md) for the commands.
 
 ## Status
 
