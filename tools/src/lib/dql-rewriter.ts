@@ -33,7 +33,7 @@ import { classicEntityToSmartscape, lookupByDimRef, entityScope } from './entity
 import { lookupEolForClassicKey } from './eol-lookup.ts';
 import { isMetricCarrier, isKnownNonCarrier } from './metric-dim-carriers.ts';
 import { canonicalTagKey } from './tag-key-casing.ts';
-import { codeMask } from './dql-command.ts';
+import { codeMask, timeseriesCommands, topLevelBy } from './dql-command.ts';
 import { rewriteEntityIdPins } from './entity-id-pins.ts';
 import { findEdgesBetween } from './smartscape-edges.ts';
 import {
@@ -167,8 +167,15 @@ const SKILL_REFS = {
 // column refs like `\`avg(dt.cloud.aws.rds.cpu.usage)\``. Rewriting metric
 // keys inside those produces nested backticks and a parse error. The orphan
 // pattern below catches and warns about those separately.
+//
+// The bare metric segment may also start with a DIGIT — `cloud.aws.apigateway.
+// 5xxerror_sum`. Requiring a letter there made those keys invisible: no swap
+// and no warning, so an API Gateway 5XX alert went to review still classic
+// (found by a reviewer, 2026-10-08). Digit-led names are lowercase snake only,
+// and may not run into a word character, so the new-form `5XXError.By.ApiName`
+// is never mistaken for one.
 const CLASSIC_KEY_PATTERN =
-  /(?<!`)\b(avg|sum|max|min|count|percentile|median)\(\s*`?((?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+\.[a-z][\w]*)`?\s*([,)])/g;
+  /(?<!`)\b(avg|sum|max|min|count|percentile|median)\(\s*`?((?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+\.(?:[a-z][\w]*|[0-9][a-z0-9_]*(?!\w)))`?\s*([,)])/g;
 
 /**
  * True when a metric key matches the new-connection shape
@@ -198,7 +205,7 @@ const METRIC_STREAMS_KEY_RE =
 // as its name. After we swap the metric key in the timeseries call, the
 // column name changes and these references go stale; warn the user.
 const BACKTICK_COLUMN_REF_PATTERN =
-  /`(avg|sum|max|min|count|percentile|median)\(\s*((?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+\.[a-z][\w]*)\s*\)`/g;
+  /`(avg|sum|max|min|count|percentile|median)\(\s*((?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+\.(?:[a-z][\w]*|[0-9][a-z0-9_]*(?!\w)))\s*\)`/g;
 
 const ENTITY_DIM_PATTERN =
   /`?\bdt\.entity\.([\w:]+)`?/g;
@@ -687,6 +694,9 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   if (!metricUnmapped && (transforms.some((t) => t.kind === 'metric-key') || NEW_KEY_RE.test(rewritten))) {
     rewritten = rewriteEntityIdPins(rewritten, index.entityArns, transforms, warnings);
   }
+
+  // Pass 1.53: metric dimensions whose real name has a SPACE (MSK: `Broker ID`).
+  rewritten = rewriteSpacedMetricDims(rewritten, transforms);
 
   // Pass 1.55: disambiguate classic `dt.entity.custom_device` to a real
   // Smartscape node type. Custom_device is "not planned" in Smartscape, but in
@@ -2125,11 +2135,14 @@ function argRefsNonAwsEntity(arg: string): boolean {
 function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
   // entityAttr(x, "field") → getNodeField(x, "field"). Must run before
   // entityName replacement so we don't accidentally match Attr's "Name" prefix.
+  // Case-insensitive, and with the optional `type:"…"` argument: DQL function
+  // names are, and a reviewer found `entityattr(x, "arn", type:"dt.entity.cloud:aws:lambda")`
+  // left classic in alert batch-03 (2026-10-08).
   let rewritten = input.replace(
-    /\bentityAttr\(\s*([^,)]+?)\s*,\s*("[^"]+")\s*\)/g,
-    (full, arg: string, field: string) => {
+    /\bentityAttr\(\s*([^,)]+?)\s*,\s*("[^"]+")(?:\s*,\s*type:\s*"([^"]+)")?\s*\)/gi,
+    (full, arg: string, field: string, typeRef: string | undefined) => {
       // Leave entityAttr on a non-AWS entity classic (matches the untouched entity).
-      if (argRefsNonAwsEntity(arg)) return full;
+      if (argRefsNonAwsEntity(arg) || (typeRef && entityScope(typeRef.replace(/^dt\.entity\./, '')) === 'non-aws')) return full;
       // The node NAME is not a readable field on Smartscape — it's a function.
       // entityAttr(x, "entity.name" | "name") → getNodeName(x). (Reviewers hit
       // `getNodeField(x,"entity.name")` failing; the name comes from getNodeName.)
@@ -2154,7 +2167,7 @@ function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
 
   // entityName(x) — drop optional `type:"..."` argument per skill rule.
   rewritten = rewritten.replace(
-    /\bentityName\(\s*([^,)]+?)(?:\s*,\s*type:\s*"([^"]+)")?\s*\)/g,
+    /\bentityName\(\s*([^,)]+?)(?:\s*,\s*type:\s*"([^"]+)")?\s*\)/gi,
     (full, arg: string, typeRef: string | undefined) => {
       // Leave classic when the entity is non-AWS (named via `type:` or the arg).
       if ((typeRef && entityScope(typeRef) === 'non-aws') || argRefsNonAwsEntity(arg)) return full;
@@ -2627,6 +2640,22 @@ function rewriteClassicTagExpandIdiom(input: string, transforms: Transform[]): s
         return repl;
       }
     );
+    // A lowercased substring test on one "key:value" tag →
+    // `contains(lower(tags[Key]), "value")`. The key comes back to its canonical
+    // casing (ApplicationCI — the standard the team set on 2026-10-01); lower()
+    // stays on the VALUE, so the match is as case-free as the author wrote it.
+    // BBT - SNS NumberOfNotificationsFailed: classic 4 series, this form 4, the
+    // left-alone form 0 of 343. A reviewer wrote tags[ApplicationCI] == "bbt".
+    out = out.replace(
+      new RegExp(`contains\\(\\s*lower\\(\\s*${V}\\s*\\)\\s*,\\s*"(?:\\[aws\\])?([a-z][\\w-]*):([^":]+)"\\s*\\)`, 'gi'),
+      (full, key: string, value: string) => {
+        const repl = CLASSIC_REGION_TAG.test(key)
+          ? `contains(lower(getNodeField(${dim}, "aws.region")), ${JSON.stringify(value.toLowerCase())})`
+          : `contains(lower(${v}[${canonicalTagKey(key)}]), ${JSON.stringify(value.toLowerCase())})`;
+        note(full, repl, key.trim());
+        return repl;
+      }
+    );
     // A phrase match on a key alone ("[AWS]env:") with no paired split: the key is present.
     out = out.replace(
       new RegExp(`matchesPhrase\\(\\s*${V}\\s*,\\s*"(?:\\[AWS\\])?([A-Za-z][\\w-]*):"\\s*\\)`, 'g'),
@@ -2664,6 +2693,96 @@ function rewriteClassicTagExpandIdiom(input: string, transforms: Transform[]): s
         detail: 'tags:aws is a record, not the classic array — expand yields one null row, and the key reads above no longer need it',
       });
     }
+  }
+  return out;
+}
+
+// ─── Pass 1.53: metric dimensions whose real name contains a space ─────────────
+//
+// The new MSK metric KEYS spell their dimensions with underscores —
+// `cloud.aws.kafka.MessagesInPerSec.By.Broker_ID.Cluster_Name.Topic` — but the
+// dimensions on the series are named with SPACES. Measured on nic55601:
+//   by:{Broker_ID}               1 series, all null      by:{`Broker ID`}               6, none null
+//   by:{Consumer_Group}          0 of 9,468 non-null     by:{`Consumer Group`}          9,468
+//   by:{Cluster_Name}            0 of 9,468 non-null     by:{`Cluster Name`}            9,468
+//   by:{Client_Authentication}   0 of 8 non-null         by:{`Client Authentication`}   8
+// So the classic dimension name carried over 1:1 — which every classic query
+// does — splits into one null group and filters on it match nothing. A
+// reviewer fixed exactly this in alert batch-03 (2026-10-08).
+//
+// Direct translation, not a rename: in `by:{}` the dimension is ALIASED back to
+// the classic name (`Broker_ID = \`Broker ID\``, the form a dashboard reviewer
+// used and which runs), so every later reference in the pipeline still works.
+// Inside the same timeseries command (its filters) the real name is used.
+// Scoped to the services where it is measured.
+const SPACED_DIMS: Record<string, Record<string, string>> = {
+  kafka: {
+    Broker_ID: 'Broker ID',
+    Client_Authentication: 'Client Authentication',
+    Cluster_Name: 'Cluster Name',
+    Consumer_Group: 'Consumer Group',
+  },
+};
+
+function rewriteSpacedMetricDims(input: string, transforms: Transform[]): string {
+  let out = input;
+  // Right to left, so earlier command offsets stay valid as we splice.
+  for (const cmd of timeseriesCommands(out).reverse()) {
+    const text = out.slice(cmd.start, cmd.end);
+    const svc = /`?cloud\.aws\.([a-z0-9_]+)\.[A-Za-z0-9]+\.By\./.exec(text)?.[1];
+    const dims = svc ? SPACED_DIMS[svc] : undefined;
+    if (!dims) continue;
+    const names = Object.keys(dims);
+    const by = topLevelBy(out, cmd);
+    const mask = codeMask(out);
+    const changed: string[] = [];
+
+    // Bare uses inside the command but outside the by-clause (filters, args).
+    // A name is a dim reference only as a whole identifier: not part of the
+    // metric key (preceded by `.`), not already backticked, not in a string.
+    const idRe = new RegExp(`(?<![\\w.\`])(${names.map(escapeRegExp).join('|')})(?![\\w\`])`, 'g');
+    const replaceIn = (from: number, to: number): string => {
+      const seg = out.slice(from, to);
+      return seg.replace(idRe, (m, name: string, off: number) => {
+        if (!mask[from + off]) return m;
+        changed.push(name);
+        return `\`${dims[name]}\``;
+      });
+    };
+
+    let rebuilt: string;
+    if (by) {
+      const body = out.slice(by.open + 1, by.close);
+      // Split the by-body on top-level commas.
+      const items: string[] = [];
+      let depth = 0, last = 0;
+      for (let i = 0; i < body.length; i++) {
+        const ch = body[i]!;
+        if (!mask[by.open + 1 + i]) continue;
+        if (ch === '(' || ch === '{' || ch === '[') depth++;
+        else if (ch === ')' || ch === '}' || ch === ']') depth--;
+        else if (ch === ',' && depth === 0) { items.push(body.slice(last, i)); last = i + 1; }
+      }
+      items.push(body.slice(last));
+      const newItems = items.map((item) => {
+        const m = /^(\s*)(?:([A-Za-z_][\w.]*|`[^`]+`)\s*=\s*)?`?([A-Za-z_]\w*)`?(\s*)$/.exec(item);
+        if (!m || !dims[m[3]!]) return item;
+        changed.push(m[3]!);
+        const alias = m[2] ?? m[3]!;
+        return `${m[1]}${alias} = \`${dims[m[3]!]}\`${m[4]}`;
+      });
+      rebuilt = replaceIn(cmd.start, by.open + 1) + newItems.join(',') + replaceIn(by.close, cmd.end);
+    } else {
+      rebuilt = replaceIn(cmd.start, cmd.end);
+    }
+    if (!changed.length) continue;
+    out = out.slice(0, cmd.start) + rebuilt + out.slice(cmd.end);
+    transforms.push({
+      kind: 'entity-dim',
+      before: [...new Set(changed)].join(', '),
+      after: [...new Set(changed)].map((n) => `\`${dims[n]}\``).join(', '),
+      detail: `the new ${svc} metrics name these dimensions with spaces; the underscore names are null on every series (aliased back in by:{} so later references still work)`,
+    });
   }
   return out;
 }
@@ -2803,6 +2922,20 @@ function rewriteAwsTagFilters(input: string, transforms: Transform[]): string {
     (full, te, key, expr) => eq(full, te, key, expr));
   out = out.replace(new RegExp(`\\bin\\(\\s*concat\\(\\s*"\\[AWS\\]${K}:"\\s*,\\s*([^()]+?)\\)\\s*,\\s*(${tags})\\s*\\)`, 'g'),
     (full, key, expr, te) => eq(full, te, key, expr));
+  // matchesValue(<tags>, "[AWS]Key:value") — the same match on that key's value,
+  // keeping matchesValue's own semantics (case-insensitive, wildcards). Found in
+  // alert batch-03 (EDK : Lambda High Errors), where a reviewer replaced it.
+  out = out.replace(new RegExp(`\\bmatchesValue\\(\\s*(${tags})\\s*,\\s*"(?:\\[AWS\\])?([A-Za-z][\\w-]*):([^":]+)"\\s*\\)`, 'g'),
+    (full, te: string, key: string, val: string) => {
+      const dim = /getNodeField\(\s*([^,()]+?)\s*,/.exec(te)?.[1];
+      // `location` is the region auto-tag; read the field — but only when we know the node.
+      if (CLASSIC_REGION_TAG.test(key) && !dim) return full;
+      const repl = CLASSIC_REGION_TAG.test(key)
+        ? `matchesValue(getNodeField(${dim}, "aws.region"), ${JSON.stringify(val)})`
+        : `matchesValue(${te.trim()}[${canonicalTagKey(key)}], ${JSON.stringify(val)})`;
+      transforms.push({ kind: 'entity-dim', before: full, after: repl, detail: `classic tag matchesValue → the same match on the tag-record key (${key})` });
+      return repl;
+    });
   return out;
 }
 

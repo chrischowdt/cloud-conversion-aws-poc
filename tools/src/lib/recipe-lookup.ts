@@ -269,6 +269,28 @@ export type LookupResult =
  */
 function applyDimOverride(index: RecipeIndex, synthetic: MappingEntry): DimOverride | undefined {
   if (!index.liveMetrics || !synthetic.newDtMetricKey) return undefined;
+  // Lambda `…By.FunctionName.Resource`: CloudWatch adds the Resource dimension
+  // only for invocations through an alias or version, so that variant is thin
+  // even when it is not empty — nic55601: Errors.By.FunctionName 239 series,
+  // .By.FunctionName.Resource 12. Classic `*_by_resource` covered every function,
+  // and the mapped variant returned 0 rows for CBS - Lambda Errors (classic 29;
+  // the reviewer's By.FunctionName 30) — alert batch-03, 2026-10-08. Swap on
+  // evidence only: when the plain variant carries more series on this tenant.
+  const lambdaRes = /^(cloud\.aws\.lambda\.[A-Za-z0-9]+\.By\.FunctionName)\.Resource$/.exec(synthetic.newDtMetricKey);
+  if (lambdaRes) {
+    const plain = lambdaRes[1]!;
+    const nRes = index.liveMetrics.byKey.get(synthetic.newDtMetricKey) ?? 0;
+    const nPlain = index.liveMetrics.byKey.get(plain) ?? 0;
+    if (nPlain > nRes) {
+      const override: DimOverride = { from: synthetic.newDtMetricKey, to: plain, count: nPlain };
+      synthetic.newDtMetricKey = plain;
+      synthetic.notes =
+        (synthetic.notes ? synthetic.notes + ' ' : '') +
+        `DIM-VARIANT OVERRIDE: ${override.from} only carries aliased/versioned invocations here (${nRes} series); ` +
+        `using ${plain} (${nPlain} series), which covers every function as the classic metric did.`;
+      return override;
+    }
+  }
   const pref = preferPopulatedVariant(
     index.liveMetrics,
     synthetic.newDtMetricKey,

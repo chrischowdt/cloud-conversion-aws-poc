@@ -102,7 +102,14 @@ class Parser {
       this.pos++;
       dottedSuffix = this.readIdent();
     }
-    const op: StringOp = isStringOp(dottedSuffix) ? dottedSuffix : 'equals';
+    // The bare legacy `entityName("x")` (no `.equals`/`.contains` suffix) is a
+    // case-insensitive CONTAINS in classic, not an equality — tenant-measured,
+    // see entityNameClause in classic-selector-translator.ts.
+    const op: StringOp = isStringOp(dottedSuffix)
+      ? dottedSuffix
+      : !dottedSuffix && ENTITY_NAME_NAMES.has(canonicalPredicate(name))
+        ? 'contains'
+        : 'equals';
 
     if (this.peek() !== '(') {
       return this.buildPredicate(name, op, []);

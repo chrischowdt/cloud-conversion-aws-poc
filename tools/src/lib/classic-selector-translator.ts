@@ -160,7 +160,7 @@ function translatePredicate(
     case 'entityName': {
       const values = p.values.map(jsonString);
       const fieldRef = `getNodeField(${dim}, "name")`;
-      return { clause: stringOpToClause(fieldRef, p.op, values) };
+      return { clause: entityNameClause(fieldRef, p.op, values) };
     }
 
     case 'tag':
@@ -363,6 +363,33 @@ function translateTag(
       `tag("${p.raw}") matches by substring on the serialized tag string — verify whether you ` +
       `want exact key/value match instead. See examples.md Example 013.`,
   };
+}
+
+/**
+ * Classic entity-NAME matching is case-insensitive, and the bare legacy form
+ * `entityName("x")` is a CONTAINS, not an equality (the parser gives that bare
+ * form op `contains`). Measured on nic55601: `entityName("dvk-kelk-msk")` selects
+ * dvk-kelk-MSK-qa-us-east-2-kafka and three siblings; `entityName("dwx")` selects
+ * 104 entities named dwx-…; `entityName("DWX")` the same 104. Translating either
+ * to `name == "…"` matched nothing — both reviewer fixes in alert batch-03 were
+ * this (2026-10-08). Mirrors the classic-entity branch below, which was verified
+ * the same way. (The parser turns the bare form into op `contains`.)
+ */
+function entityNameClause(fieldRef: string, op: StringOp, values: string[]): string {
+  const any = (f: (v: string) => string) => (values.length === 1 ? f(values[0]!) : '(' + values.map(f).join(' or ') + ')');
+  switch (op) {
+    case 'contains':
+      return any((v) => `contains(${fieldRef}, ${v}, caseSensitive: false)`);
+    case 'startsWith':
+      return any((v) => `startsWith(lower(${fieldRef}), lower(${v}))`);
+    case 'equals':
+    case 'in':
+      return values.length <= 1
+        ? `lower(${fieldRef}) == lower(${values[0] ?? '""'})`
+        : `in(lower(${fieldRef}), array(${values.map((v) => `lower(${v})`).join(', ')}))`;
+    default:
+      return stringOpToClause(fieldRef, op, values);
+  }
 }
 
 function stringOpToClause(fieldRef: string, op: StringOp, values: string[]): string {
@@ -582,7 +609,7 @@ function translatePredicateForNode(
       return {};
     case 'entityName': {
       const values = p.values.map(jsonString);
-      return { clause: stringOpToClause('name', p.op, values) };
+      return { clause: entityNameClause('name', p.op, values) };
     }
     case 'entityId':
       return {

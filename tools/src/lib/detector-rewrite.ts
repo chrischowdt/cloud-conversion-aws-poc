@@ -67,7 +67,7 @@ export interface DetectorRewriteResult {
 
 /** Shapes a classic AWS metric key can take in a detector query. */
 const CLASSIC_KEY_RE =
-  /(?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+\.[a-z][\w]*/;
+  /(?:builtin:cloud\.aws|dt\.cloud\.aws|ext:cloud\.aws)\.[\w.:]+|cloud\.aws\.[a-z0-9_]+\.(?:[a-z][\w]*|[0-9][a-z0-9_]*(?!\w))/;
 
 /** First `dt.smartscape.<type>` dim the rewritten query produced. */
 const SMARTSCAPE_DIM_RE = /dt\.smartscape\.([a-z0-9_]+)/;

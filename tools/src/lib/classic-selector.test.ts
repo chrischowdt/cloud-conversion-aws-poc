@@ -106,16 +106,24 @@ describe('translateSelector — DQL emission', () => {
     assert.equal(r.filter, '');
   });
 
-  it('translates entityName equality', () => {
+  it('translates the bare entityName("x") as the case-insensitive CONTAINS it is', () => {
+    // Measured on nic55601: entityName("dvk-kelk-msk") selects
+    // dvk-kelk-MSK-qa-us-east-2-kafka; entityName("dwx") 104 entities; the old
+    // `name == "…"` translation matched none (alert batch-03 reviewer fixes).
     const ast = parseSelector('entityName("my-instance")');
     const r = translateSelector(ast, dim);
-    assert.equal(r.filter, `getNodeField(${dim}, "name") == "my-instance"`);
+    assert.equal(r.filter, `contains(getNodeField(${dim}, "name"), "my-instance", caseSensitive: false)`);
   });
 
-  it('translates entityName.startsWith', () => {
+  it('keeps entityName.equals an equality, case-insensitive like classic', () => {
+    const r = translateSelector(parseSelector('entityName.equals("my-instance")'), dim);
+    assert.equal(r.filter, `lower(getNodeField(${dim}, "name")) == lower("my-instance")`);
+  });
+
+  it('translates entityName.startsWith case-insensitively', () => {
     const ast = parseSelector('entityName.startsWith("prod-")');
     const r = translateSelector(ast, dim);
-    assert.equal(r.filter, `startsWith(getNodeField(${dim}, "name"), "prod-")`);
+    assert.equal(r.filter, `startsWith(lower(getNodeField(${dim}, "name")), lower("prod-"))`);
   });
 
   it('translates tag with explicit context', () => {
@@ -238,7 +246,7 @@ describe('translateSelector — DQL emission', () => {
     );
     assert.match(r.filter, /dt\.smartscape\.aws_ec2_instance in \[/);
     assert.match(r.filter, /smartscapeNodes AWS_AVAILABILITY_ZONE/);
-    assert.match(r.filter, /name == "us-east-1a"/);
+    assert.match(r.filter, /contains\(name, "us-east-1a", caseSensitive: false\)/);
     assert.match(r.filter, / and /);
   });
 
@@ -275,7 +283,7 @@ describe('translateSelector — DQL emission', () => {
     const r = translateSelector(ast, dim);
     assert.equal(
       r.filter,
-      `in(getNodeField(${dim}, "name"), array("a", "b", "c"))`
+      `in(lower(getNodeField(${dim}, "name")), array(lower("a"), lower("b"), lower("c")))`
     );
   });
 });

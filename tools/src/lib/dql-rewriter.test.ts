@@ -2205,16 +2205,62 @@ describe('classic tag `parse` idiom (Pass 2.73c)', () => {
 });
 
 describe('expand is kept when the tag var is used as a string through a wrapper', () => {
-  it('keeps expand for contains(lower(tags), "key:value")', () => {
-    // BBT - SNS NumberOfNotificationsFailed. Removing the expand here left a
-    // filter matching 0 of 343 series; the lint rule blocks it for a human.
-    const q =
-      'timeseries failed = sum(cloud.aws.sns.number_of_notifications_failed_sum), by:{dt.entity.custom_device}\n' +
-      '| fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")\n' +
-      '| expand tags\n' +
-      '| filter contains(lower(tags), "applicationci:bbt")';
-    const r = rewriteDql(q, buildIndex([]));
+  const q = (filter: string) =>
+    'timeseries failed = sum(cloud.aws.sns.number_of_notifications_failed_sum), by:{dt.entity.custom_device}\n' +
+    '| fieldsAdd tags = entityAttr(dt.entity.custom_device, "tags")\n' +
+    '| expand tags\n' +
+    `| filter ${filter}`;
+
+  it('translates contains(lower(tags), "key:value") to the key read, then drops the expand', () => {
+    // BBT - SNS NumberOfNotificationsFailed (alert batch-02). Measured on
+    // nic55601: classic 5 rows, this form 5, the reviewer's tags[ApplicationCI] == "bbt" 5.
+    const r = rewriteDql(q('contains(lower(tags), "applicationci:bbt")'), buildIndex([]));
+    assert.match(r.rewritten, /filter contains\(lower\(tags\[ApplicationCI\]\), "bbt"\)/);
+    assert.doesNotMatch(r.rewritten, /expand tags/);
+  });
+
+  it('keeps the expand for a wrapped string use it cannot translate', () => {
+    const r = rewriteDql(q('contains(lower(tags), "raw")'), buildIndex([]));
     assert.match(r.rewritten, /expand tags/);
+  });
+});
+
+describe('alert batch-03 reviewer findings (2026-10-08)', () => {
+  it('reads an MSK dimension by its real, spaced name and aliases it back', () => {
+    // nic55601: by:{Broker_ID} 1 all-null series vs by:{`Broker ID`} 6.
+    const r = rewriteDql(
+      'timeseries m = avg(cloud.aws.kafka.messages_in_per_sec_by_broker_idtopic, filter:{Broker_ID == "1"}), by:{Topic, dt.entity.custom_device, Broker_ID}\n| filter Broker_ID != "2"',
+      buildIndex([{ classicMetricId: 'cloud.aws.kafka.messages_in_per_sec_by_broker_idtopic', newDtMetricKey: 'cloud.aws.kafka.MessagesInPerSec.By.Broker_ID.Cluster_Name.Topic', service: 'kafka' } as any])
+    );
+    assert.match(r.rewritten, /by:\{Topic, dt\.smartscape\.aws_msk_cluster, Broker_ID = `Broker ID`\}/);
+    assert.match(r.rewritten, /filter:\{`Broker ID` == "1"\}/);
+    assert.match(r.rewritten, /\| filter Broker_ID != "2"/, 'later references keep the aliased name');
+    assert.match(r.rewritten, /By\.Broker_ID\.Cluster_Name\.Topic/, 'the metric key itself is untouched');
+  });
+
+  it('converts a digit-led classic key instead of passing it through silently', () => {
+    const r = rewriteDql(
+      'timeseries `5xxerror_sum`=sum(cloud.aws.apigateway.5xxerror_sum),by:{dt.entity.custom_device}',
+      buildIndex([{ classicMetricId: 'cloud.aws.apigateway.5xxerror_sum', newDtMetricKey: 'cloud.aws.apigateway.5XXError.By.ApiName', service: 'apigateway' } as any])
+    );
+    assert.match(r.rewritten, /sum\(`cloud\.aws\.apigateway\.5XXError\.By\.ApiName`\)/);
+  });
+
+  it('converts lowercase entityattr with a type: argument', () => {
+    const r = rewriteDql(
+      'timeseries e = sum(cloud.aws.lambda.errors_sum), by:{dt.entity.custom_device}\n| fieldsAdd arn_name = entityattr(dt.entity.custom_device, "arn", type:"dt.entity.cloud:aws:lambda")',
+      buildIndex([])
+    );
+    assert.doesNotMatch(r.rewritten, /entityattr/i);
+    assert.match(r.rewritten, /arn_name = getNodeField\(dt\.smartscape\.aws_lambda_function, "aws\.arn"\)/);
+  });
+
+  it('translates matchesValue on a classic Key:value tag to the same match on the key', () => {
+    const r = rewriteDql(
+      'timeseries e = sum(cloud.aws.lambda.errors_sum), by:{dt.entity.custom_device}, filter:{matchesValue(entityAttr(dt.entity.custom_device, "tags"), "[AWS]Team:edk")}',
+      buildIndex([])
+    );
+    assert.match(r.rewritten, /matchesValue\(getNodeField\(dt\.smartscape\.aws_lambda_function, "tags:aws"\)\[Team\], "edk"\)/);
   });
 });
 
