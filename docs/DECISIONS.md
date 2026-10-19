@@ -12,7 +12,7 @@ The rules this migration runs by. Most came from something going wrong once. If 
 - **Region comes from the resource's `aws.region` field,** not from the classic `location` tag, which isn't present everywhere.
 - **Management zones are decoded from their name.** Zones don't exist on the new AWS resources. Zone names follow the convention `<APP> : <name> : <ENV>`, which matched the zones' own rules for every zone checked (one exception in over 3,000), so the name translates directly to tag filters:
   - the app becomes `ApplicationCI` and the last part becomes `env`;
-  - a phrase with only the app (`"CPN"`) means every environment;
+  - a phrase with only the app (e.g. `"ABC"`) means every environment;
   - in a metric query the target is the enriched `aws.tags.*` dimensions; elsewhere, the resource's own tags.
 
   Names outside the convention fall back to the downloaded zone rules. If neither works, the filter stays blocked.
