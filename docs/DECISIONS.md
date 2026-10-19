@@ -10,6 +10,12 @@ The rules this migration runs by. Most came from something going wrong once. If 
 - **Output proven to return nothing is blocked** (`lib/output-lint.ts`). The typical failure isn't an error. It's a query that runs and returns nothing, which on a dashboard looks like a quiet tile and on an alert looks like no incidents.
 - **Tag keys use the casing resources actually carry** (`ApplicationCI`, `env`, `Environment`, `Name`). Teams whose tags don't follow the standard fix their tags; the tool doesn't case-fold.
 - **Region comes from the resource's `aws.region` field,** not from the classic `location` tag, which isn't present everywhere.
+- **Management zones are decoded from their name.** Zones don't exist on the new AWS resources. Zone names follow the convention `<APP> : <name> : <ENV>`, which matched the zones' own rules for every zone checked (one exception in over 3,000), so the name translates directly to tag filters:
+  - the app becomes `ApplicationCI` and the last part becomes `env`;
+  - a phrase with only the app (`"CPN"`) means every environment;
+  - in a metric query the target is the enriched `aws.tags.*` dimensions; elsewhere, the resource's own tags.
+
+  Names outside the convention fall back to the downloaded zone rules. If neither works, the filter stays blocked.
 - **Classic entity ids don't exist on the new side.** A query pinned to one resource by id is re-pinned by its **ARN**, which every classic entity, new metric series and new entity carries.
 
 ## How assets are published

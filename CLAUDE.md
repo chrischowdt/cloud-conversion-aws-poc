@@ -67,6 +67,7 @@ Multi-pass regex pipeline that translates a classic DQL string into its Smartsca
 | 1.7 | `<edge>[dt.entity.X]` → `references[<edge>.<x>]`, with edge validation | `smartscape-edges.ts` |
 | 2 | `dt.entity.X` → `dt.smartscape.X` (in any context) | `entity-mappings.ts` |
 | 2.5 | `entityName(x)` → `getNodeName(x)`, `entityAttr(x, "f")` → `getNodeField(x, "f")` | inline |
+| 2.51 | **Management-zone filters → tag filters, decoded from the zone NAME** (`<APP> : <name> : <ENV>`: app → ApplicationCI, a full name's last part → env; a phrase like `"CPN"` = app only, every env). Zones don't exist on new AWS nodes. In a timeseries on a converted metric → enriched `aws.tags.*` dims; elsewhere → the node's `tags:aws` record. Also used by `mzName()` in selectors (`translateManagementZone`). Names outside the convention fall back to `management-zones.json` rules; otherwise blocked (lint `management-zone-on-node`). Never emitted on an unconverted metric (no tag dims there). Measured on nic55601: name = rules on 3,119 of 3,120 zones; 21 of 22 zone-filtered alerts convert and match the reviewers' hand fixes. | `mz-name.ts` |
 | 2.6 | `entity.name` → `name` (only when fetch was restructured) | inline |
 | 2.65 | Classic source-entity signal fields → Smartscape: `dt.source_entity.type` → `dt.smartscape_source.type`, bare `dt.source_entity` → `dt.smartscape_source.id` | inline |
 | 2.7 | Classic field rename within Smartscape context (`awsAccountId` → `aws.account.id`) | `entity-field-mappings.ts` |

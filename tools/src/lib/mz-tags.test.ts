@@ -108,10 +108,17 @@ describe('mzName translation through the selector translator', () => {
     assert.equal(t.filter, '');
   });
 
-  it('without an index at all, behaviour is unchanged (still untranslated)', () => {
+  it('without zone translation allowed (no mzTags hint), stays untranslated', () => {
+    // The rewriter withholds the hint when the metric did not convert.
     const ast = parseSelector('type(CUSTOM_DEVICE),mzName("CPN : PSS SEATS INVENTORY : QA")');
     const t = translateSelector(ast, 'dt.smartscape.aws_rds_dbinstance', { defaultTagContext: 'aws' });
     assert.equal(t.complete, false);
+  });
+
+  it('decodes a convention name even with an EMPTY index — no discovery run needed', () => {
+    const ast = parseSelector('type(CUSTOM_DEVICE),mzName("BBT : NEXUS : STG")');
+    const t = translateSelector(ast, 'dt.smartscape.aws_rds_dbinstance', { defaultTagContext: 'aws', mzTags: new Map() });
+    assert.equal(t.filter, '`aws.tags.applicationci` == "bbt" and `aws.tags.env` == "stg"');
   });
 });
 

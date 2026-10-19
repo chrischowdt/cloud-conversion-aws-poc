@@ -25,6 +25,7 @@ import {
 } from './aws-service-node-types.ts';
 import { parseSelector } from './classic-selector-parser.ts';
 import { mzFilterExpression, type MzTagIndex } from './mz-tags.ts';
+import { decodeZoneName, unionFilter, zoneMetricFilter, zoneNodeFilter } from './mz-name.ts';
 import { enrichedTagDimension } from './enriched-tags.ts';
 import { translateSelector, translateSelectorClassic } from './classic-selector-translator.ts';
 import { lookupInDac, cloudwatchStatisticForNewKey, isAdditiveSumMetric } from './dac-lookup.ts';
@@ -683,7 +684,10 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
     rewritten,
     transforms,
     warnings,
-    metricUnmapped ? undefined : index.mzTags
+    // Present (even empty) = zone translation allowed: zone NAMES decode without
+    // a discovery run (mz-name.ts); the downloaded rules only back up names
+    // outside the convention.
+    metricUnmapped ? undefined : (index.mzTags ?? new Map())
   );
 
   // Pass 1.52: classic entity-id PINS → a filter on the metric's `aws.arn`.
@@ -2237,13 +2241,16 @@ function alignRdsMetricGrain(input: string, transforms: Transform[], warnings: W
 // matches nothing. 15 of 999 AWS alerts in lower; reviewers replaced it by hand
 // in alert batches 06–07 (CPN EC2, CPN Kafka, CPN ELB ×2).
 //
-// A zone is a saved set of membership rules, and `discover-management-zones`
-// already reduces each zone's AWS rules to tag predicates (see mz-tags.ts). The
-// classic filter selected every entity in ANY zone whose name matches the
-// phrase, so the faithful translation is the union of those zones' filters:
-//   "CPN" → (applicationci == cpn and env == dev) or (… qa) or (… stg)
-// If any matched zone can't be reduced to tags, or none match, the filter is
-// left alone — the lint rule `management-zone-on-node` keeps it blocked.
+// The zone NAME says what it selects (`<APP> : <name> : <ENV>`, see mz-name.ts),
+// so decode it: the app becomes the ApplicationCI tag, a full name's last part
+// the env tag. A partial phrase covers every zone it is a phrase of, so "CPN"
+// is the app alone — the filter the reviewers wrote by hand (CPN EC2: classic 9
+// rows, reviewer 100, ours 100). Inside a timeseries command the target is the
+// enriched metric dimensions (`aws.tags.applicationci`); elsewhere, the node's
+// own tag record. Names outside the convention fall back to the zone rules
+// `discover-management-zones` downloaded (the union of the zones whose name
+// matches the phrase); if neither works the filter is left alone, and the lint
+// rule `management-zone-on-node` keeps it blocked.
 function phraseTokens(s: string): string[] {
   return (s.match(/[A-Za-z0-9]+/g) ?? []).map((t) => t.toLowerCase());
 }
@@ -2255,26 +2262,32 @@ function zoneMatchesPhrase(zone: string, phrase: string): boolean {
 }
 
 function rewriteManagementZoneAttrFilters(input: string, transforms: Transform[], warnings: Warning[], mzTags: MzTagIndex | undefined): string {
-  if (!mzTags || !/managementZones/.test(input)) return input;
+  if (!/managementZones/.test(input)) return input;
+  const cmds = timeseriesCommands(input);
+  const inTimeseries = (at: number) => cmds.some((c) => at >= c.start && at < c.end);
   return input.replace(
     /\bmatchesPhrase\(\s*getNodeField\(\s*([^,()]+?)\s*,\s*"managementZones"\s*\)\s*,\s*"([^"]+)"\s*\)/g,
-    (full, _dim: string, phrase: string) => {
-      const zones = [...mzTags.keys()].filter((z) => zoneMatchesPhrase(z, phrase));
-      if (!zones.length) return full;
-      const exprs = [...new Set(zones.map((z) => mzFilterExpression(mzTags.get(z)!)))];
-      const repl = exprs.length === 1 ? `(${exprs[0]})` : `(${exprs.map((e) => `(${e})`).join(' or ')})`;
-      transforms.push({
-        kind: 'entity-dim',
-        before: full,
-        after: repl,
-        detail: `management zones are not on the new AWS nodes; "${phrase}" matched ${zones.length} zone(s) (${zones.join('; ')}), rewritten as their AWS tag filters`,
-      });
+    (full, dim: string, phrase: string, offset: number) => {
+      let repl: string | undefined;
+      let how: string;
+      // Metric dimensions only exist on a converted (new-key) metric.
+      const metricDims = inTimeseries(offset) && NEW_KEY_RE.test(input);
+      const decoded = decodeZoneName(phrase);
+      if (decoded) {
+        repl = `(${metricDims ? zoneMetricFilter(decoded) : zoneNodeFilter(dim, decoded)})`;
+        how = `decoded from the zone name: app ${decoded.app}${decoded.env ? `, env ${decoded.env}` : ' (every environment — the phrase names no env)'}`;
+      } else {
+        const zones = mzTags ? [...mzTags.keys()].filter((z) => zoneMatchesPhrase(z, phrase)) : [];
+        if (!zones.length || !metricDims) return full;
+        repl = `(${unionFilter(zones.map((z) => mzFilterExpression(mzTags!.get(z)!)))})`;
+        how = `"${phrase}" is not an <APP> : <name> : <ENV> name; used the tag rules of the ${zones.length} zone(s) it matches (${zones.join('; ')})`;
+      }
+      transforms.push({ kind: 'entity-dim', before: full, after: repl, detail: `management zones are not on the new AWS nodes — ${how}` });
       warnings.push({
         kind: 'classic-selector-note',
         text:
-          `Management-zone filter "${phrase}" rewritten as the matched zones' AWS tag rules (${zones.length} zone(s)). ` +
-          `This reproduces the zones' AWS membership only — verify the scope, especially if the zones also selected ` +
-          `resources by something other than tags, or if some resources are missing the tags.`,
+          `Management-zone filter "${phrase}" rewritten as a tag filter (${how}). Zones don't exist on the new AWS ` +
+          `nodes; verify the scope, especially for resources missing the ApplicationCI/env tags.`,
         match: full,
       });
       return repl;

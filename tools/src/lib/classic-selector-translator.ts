@@ -24,6 +24,7 @@
 import type { Predicate, StringOp } from './classic-selector-parser.ts';
 import { classicEntityToSmartscape, lookupBySmartscapeDim } from './entity-mappings.ts';
 import { mzFilterExpression, type MzTagIndex } from './mz-tags.ts';
+import { decodeZoneName, unionFilter, zoneMetricFilter } from './mz-name.ts';
 import { findEdgesBetween } from './smartscape-edges.ts';
 
 /**
@@ -293,6 +294,22 @@ function translateManagementZone(
   hints: TranslationHints
 ): PredicateTranslation {
   const names = p.values ?? [];
+  // Decode the zone NAME first (`<APP> : <name> : <ENV>`, mz-name.ts) — it agrees
+  // with the zones' own rules on 3,119 of 3,120 zones and needs no discovery run.
+  // Only when the caller allows zone translation (hints.mzTags present): it
+  // withholds it when the metric did not convert, because a classic metric
+  // carries no aws.tags.* dimension and the filter would return nothing.
+  const decoded = names.map((n) => decodeZoneName(n));
+  if (hints.mzTags && names.length > 0 && decoded.every(Boolean)) {
+    const clause = unionFilter(decoded.map((d) => zoneMetricFilter(d!)));
+    return {
+      clause,
+      note:
+        `Management zone ${names.map((n) => `"${n}"`).join(', ')} decoded from its name to an enriched-tag ` +
+        `dimension filter (${clause}). Zones have no Smartscape equivalent — verify the scope, especially for ` +
+        `resources missing the ApplicationCI/env tags.`,
+    };
+  }
   const idx = hints.mzTags;
   if (idx && names.length > 0) {
     const parts: string[] = [];

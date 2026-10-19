@@ -2235,17 +2235,31 @@ describe('alert batch 04–07 reviewer findings (2026-10-19)', () => {
     assert.match(r.rewritten, /by:\{dt\.smartscape\.aws_opensearchservice_domain\}/);
   });
 
-  it("rewrites a management-zone attribute filter as the matched zones' tag rules", () => {
-    const mzTags = new Map([
-      ['CPN : SEATS : DEV', [{ key: 'ApplicationCI', value: 'cpn' }, { key: 'env', value: 'dev' }]],
-      ['CPN : SEATS : QA', [{ key: 'ApplicationCI', value: 'cpn' }, { key: 'env', value: 'qa' }]],
-      ['XCPNX : OTHER', [{ key: 'ApplicationCI', value: 'xyz' }]],
-    ]) as any;
-    const q = 'timeseries c = avg(cloud.aws.ec2.cpu_utilization, filter: { matchesPhrase(entityAttr(dt.entity.custom_device, "managementZones"), "CPN") }), by: { dt.entity.custom_device }';
-    const r = rewriteDql(q, { ...buildIndex([]), mzTags });
+  const ec2Zone = (phrase: string) =>
+    `timeseries c = avg(cloud.aws.ec2.cpu_utilization, filter: { matchesPhrase(entityAttr(dt.entity.custom_device, "managementZones"), "${phrase}") }), by: { dt.entity.custom_device }`;
+  const ec2 = buildIndex([{ classicMetricId: 'cloud.aws.ec2.cpu_utilization', newDtMetricKey: 'cloud.aws.ec2.CPUUtilization.By.InstanceId', service: 'ec2' } as any]);
+
+  it('decodes a zone phrase naming only the app to the app tag — every environment', () => {
+    // CPN EC2 (batch-07): classic 9 rows, the reviewer's appci filter 100, ours 100.
+    const r = rewriteDql(ec2Zone('CPN'), ec2);
     assert.doesNotMatch(r.rewritten, /managementZones/);
-    assert.match(r.rewritten, /\(\(`aws\.tags\.applicationci` == "cpn" and `aws\.tags\.env` == "dev"\) or \(`aws\.tags\.applicationci` == "cpn" and `aws\.tags\.env` == "qa"\)\)/);
-    assert.doesNotMatch(r.rewritten, /xyz/, 'phrase match is on whole tokens: XCPNX is not CPN');
+    assert.match(r.rewritten, /filter: \{ \(`aws\.tags\.applicationci` == "cpn"\) \}/);
+  });
+
+  it('decodes a full zone name to app AND env, with no zone download needed', () => {
+    const r = rewriteDql(ec2Zone('CPN : PSS SEATS INVENTORY : QA'), ec2);
+    assert.match(r.rewritten, /\(`aws\.tags\.applicationci` == "cpn" and `aws\.tags\.env` == "qa"\)/);
+  });
+
+  it('falls back to the downloaded zone rules for a name outside the convention', () => {
+    const mzTags = new Map([['Technology : F5', [{ key: 'ApplicationCI', value: 'net' }]]]) as any;
+    const r = rewriteDql(ec2Zone('Technology'), { ...ec2, mzTags });
+    assert.match(r.rewritten, /\(`aws\.tags\.applicationci` == "net"\)/);
+  });
+
+  it('reads the node tags instead when the metric did not convert (no aws.tags dims there)', () => {
+    const r = rewriteDql(ec2Zone('CPN'), buildIndex([]));
+    assert.doesNotMatch(r.rewritten, /`aws\.tags\.applicationci`/);
   });
 
   it('leaves the zone filter (lint-blocked) when no zone matches', () => {
