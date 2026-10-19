@@ -24,7 +24,7 @@ import {
   smartscapeDimForNodeType,
 } from './aws-service-node-types.ts';
 import { parseSelector } from './classic-selector-parser.ts';
-import type { MzTagIndex } from './mz-tags.ts';
+import { mzFilterExpression, type MzTagIndex } from './mz-tags.ts';
 import { enrichedTagDimension } from './enriched-tags.ts';
 import { translateSelector, translateSelectorClassic } from './classic-selector-translator.ts';
 import { lookupInDac, cloudwatchStatisticForNewKey, isAdditiveSumMetric } from './dac-lookup.ts';
@@ -721,6 +721,9 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // classic name doesn't match the actual edge for the source-target pair.
   rewritten = rewriteRelationshipBrackets(rewritten, transforms, warnings, fetchContext);
 
+  // Pass 1.56: an RDS-INSTANCE binding needs the instance-grain metric variant.
+  rewritten = alignRdsMetricGrain(rewritten, transforms, warnings, index);
+
   // Pass 2: replace dt.entity.<type> with dt.smartscape.<...>.
   // Skip dim swaps inside `lookup [fetch dt.entity.<not-planned-type>]`
   // subqueries — the entire subquery is classic-only and a partial rewrite
@@ -792,6 +795,9 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // Pass 2.5: entityName(x) → getNodeName(x); entityAttr(x, "f") → getNodeField(x, "f").
   // Runs AFTER the dt.entity.* dim swap so x is already in smartscape form.
   rewritten = rewriteEntityNameAttr(rewritten, transforms);
+
+  // Pass 2.51: `matchesPhrase(<node>.managementZones, "X")` → the matched zones' tag filters.
+  rewritten = rewriteManagementZoneAttrFilters(rewritten, transforms, warnings, index.mzTags);
 
   // Pass 2.55: collapse the classic `splitString(toString(<tags>), "[AWS]Key:")…`
   // value-extraction idiom to a direct record read `<tags>[Key]` (tags:aws).
@@ -2184,6 +2190,98 @@ function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
   return rewritten;
 }
 
+// ─── Pass 1.56: RDS instance binding ↔ instance-grain metric ──────────────────
+//
+// Classic `cloud.aws.aurora.*` metrics are per DB INSTANCE, so Pass 1.55 binds
+// them to `dt.smartscape.aws_rds_dbinstance` — but the mapping often picks the
+// CLUSTER variant (`….By.DBClusterIdentifier`). Those series carry no instance
+// id at all (nic55601: CommitLatency cluster variant 82 series, 0 with an
+// instance id; instance variant 319, all with one; DMLLatency 70/0 vs 130/130),
+// so the binding is null on every series: the alert can't attach to an entity
+// and any filter on the node matches nothing. 33 of 999 AWS alerts in lower;
+// a reviewer fixed one by hand (CWE Aurora CommitLatencyHigh, batch-05).
+//
+// Keep the instance binding and switch to the instance variant — but only on
+// evidence: when this tenant's inventory shows the instance variant has series.
+function alignRdsMetricGrain(input: string, transforms: Transform[], warnings: Warning[], index: RecipeIndex): string {
+  const live = index.liveMetrics;
+  if (!live || !/dt\.smartscape\.aws_rds_dbinstance\b/.test(input)) return input;
+  const keys = [...new Set(input.match(/cloud\.aws\.rds\.[A-Za-z0-9]+\.By\.DBClusterIdentifier\b/g) ?? [])];
+  let out = input;
+  for (const key of keys) {
+    const inst = key.replace(/\.By\.DBClusterIdentifier$/, '.By.DBInstanceIdentifier');
+    const n = live.byKey.get(inst) ?? 0;
+    if (n <= 0) continue;
+    out = out.split(key).join(inst);
+    transforms.push({
+      kind: 'metric-key',
+      before: key,
+      after: inst,
+      detail: `the query binds the RDS INSTANCE node, and cluster-grain series carry no instance id; using the instance variant (${n} series here)`,
+    });
+    warnings.push({
+      kind: 'dim-variant-override',
+      text: `${key} → ${inst}: the classic metric was per DB instance and the query binds dt.smartscape.aws_rds_dbinstance, which the cluster-grain series never carry (${n} instance series on this tenant). Verify the instance grain matches the alert's intent.`,
+      match: key,
+    });
+  }
+  return out;
+}
+
+// ─── Pass 2.51: management-zone attribute filter → the zones' tag filters ────
+//
+// Classic alerts scope to a zone by reading the entity's zone list:
+//   filter: { matchesPhrase(entityAttr(dt.entity.custom_device, "managementZones"), "CPN") }
+// After Pass 2.5 that is `getNodeField(<node>, "managementZones")` — a field the
+// new AWS nodes do not have (nic55601: 0 of 14,990 EC2 nodes), so the filter
+// matches nothing. 15 of 999 AWS alerts in lower; reviewers replaced it by hand
+// in alert batches 06–07 (CPN EC2, CPN Kafka, CPN ELB ×2).
+//
+// A zone is a saved set of membership rules, and `discover-management-zones`
+// already reduces each zone's AWS rules to tag predicates (see mz-tags.ts). The
+// classic filter selected every entity in ANY zone whose name matches the
+// phrase, so the faithful translation is the union of those zones' filters:
+//   "CPN" → (applicationci == cpn and env == dev) or (… qa) or (… stg)
+// If any matched zone can't be reduced to tags, or none match, the filter is
+// left alone — the lint rule `management-zone-on-node` keeps it blocked.
+function phraseTokens(s: string): string[] {
+  return (s.match(/[A-Za-z0-9]+/g) ?? []).map((t) => t.toLowerCase());
+}
+function zoneMatchesPhrase(zone: string, phrase: string): boolean {
+  const z = phraseTokens(zone), p = phraseTokens(phrase);
+  if (!p.length) return false;
+  for (let i = 0; i + p.length <= z.length; i++) if (p.every((t, j) => z[i + j] === t)) return true;
+  return false;
+}
+
+function rewriteManagementZoneAttrFilters(input: string, transforms: Transform[], warnings: Warning[], mzTags: MzTagIndex | undefined): string {
+  if (!mzTags || !/managementZones/.test(input)) return input;
+  return input.replace(
+    /\bmatchesPhrase\(\s*getNodeField\(\s*([^,()]+?)\s*,\s*"managementZones"\s*\)\s*,\s*"([^"]+)"\s*\)/g,
+    (full, _dim: string, phrase: string) => {
+      const zones = [...mzTags.keys()].filter((z) => zoneMatchesPhrase(z, phrase));
+      if (!zones.length) return full;
+      const exprs = [...new Set(zones.map((z) => mzFilterExpression(mzTags.get(z)!)))];
+      const repl = exprs.length === 1 ? `(${exprs[0]})` : `(${exprs.map((e) => `(${e})`).join(' or ')})`;
+      transforms.push({
+        kind: 'entity-dim',
+        before: full,
+        after: repl,
+        detail: `management zones are not on the new AWS nodes; "${phrase}" matched ${zones.length} zone(s) (${zones.join('; ')}), rewritten as their AWS tag filters`,
+      });
+      warnings.push({
+        kind: 'classic-selector-note',
+        text:
+          `Management-zone filter "${phrase}" rewritten as the matched zones' AWS tag rules (${zones.length} zone(s)). ` +
+          `This reproduces the zones' AWS membership only — verify the scope, especially if the zones also selected ` +
+          `resources by something other than tags, or if some resources are missing the tags.`,
+        match: full,
+      });
+      return repl;
+    }
+  );
+}
+
 // ─── Pass 2.55: classic tag value-extraction idiom → direct record read ───
 //
 // The dominant classic AWS tag-read idiom string-parses the serialized tags to
@@ -2894,6 +2992,11 @@ function rewriteAwsTagFilters(input: string, transforms: Transform[]): string {
   const tagVars = new Set<string>();
   const assignRe = /\b([A-Za-z_]\w*)\s*=\s*getNodeField\([^()]*,\s*"tags:aws"\)/g;
   for (let m = assignRe.exec(input); m; m = assignRe.exec(input)) tagVars.add(m[1]!);
+  // `| lookup [smartscapeNodes AWS_X | fields name, id, tags], …, fields: {name, tags}`
+  // also brings the AWS node's tag RECORD in as `tags` (nic55601: tags[ApplicationCI]
+  // readable on 136 of 136 MSK clusters). 35 of 999 lower alerts filter it with the
+  // classic "[AWS]Key:value" match afterwards (EPI QA, alert batches 05 and 07).
+  if (/\blookup\s*\[\s*smartscapeNodes\s+"?AWS_[A-Z0-9_]+"?[^\]]*\|\s*fields\b[^\]|]*\btags\b[^\]]*\][^|]*\bfields\s*:\s*\{[^}]*\btags\b/.test(input)) tagVars.add('tags');
 
   const gnf = 'getNodeField\\([^()]*,\\s*"tags:aws"\\)';
   const varAlt = [...tagVars].map(escapeRegExp).join('|');
@@ -3192,7 +3295,11 @@ function pruneByDimsNotOnKey(input: string, transforms: Transform[], warnings: W
       const bare = p.replace(/`/g, '');
       // keep anything that isn't a plain dimension token
       if (/[=()]/.test(p)) return true;
-      if (/^dt\./.test(bare) || /^aws\./.test(bare)) return true;
+      // `primary_tags.*` are real dims on the new series too (nic55601:
+      // primary_tags.applicationci on 107 of 130 DMLLatency series). Dropping it
+      // left BJR - RDS Aurora DML Latency failing FIELD_DOES_NOT_EXIST on its
+      // own `| filter primary_tags.applicationci == …` (alert batch-07).
+      if (/^dt\./.test(bare) || /^aws\./.test(bare) || /^primary_tags\./.test(bare)) return true;
       // The KEY spells a dimension with underscores (`.By.Cluster_Name`) while
       // the SERIES carries it with spaces (`Cluster Name`). Compare on one
       // normalised form, or a correctly-renamed dimension looks absent from its
@@ -3201,7 +3308,20 @@ function pruneByDimsNotOnKey(input: string, transforms: Transform[], warnings: W
       dropped.push(bare);
       return false;
     });
-    if (kept.length === parts.length || kept.length === 0) return full;
+    // Classic `Region` is the AWS region, which every new series carries as
+    // `aws.region` (nic55601 DocDB ReplicaLag: 64 of 64 series). Alias it rather
+    // than drop it — 12 of 999 lower alerts group by Region, and 3 filter on it
+    // afterwards, which failed FIELD_DOES_NOT_EXIST once it was pruned
+    // (CWE - DocDB ReplicaLag, alert batch-07).
+    let aliased = false;
+    const regionAt = parts.findIndex((p) => p.replace(/`/g, '') === 'Region');
+    if (regionAt >= 0 && dropped.includes('Region')) {
+      dropped.splice(dropped.lastIndexOf('Region'), 1);
+      kept.splice(Math.min(regionAt, kept.length), 0, 'Region = aws.region');
+      aliased = true;
+      transforms.push({ kind: 'entity-dim', before: 'Region', after: 'Region = aws.region', detail: 'classic Region dimension → the aws.region every new series carries (aliased, so later references keep working)' });
+    }
+    if ((kept.length === parts.length && !aliased) || kept.length === 0) return full;
     // `full` spans `timeseries … by:{…}`, so rewrite only its trailing clause.
     return full.replace(/\bby\s*:\s*\{[^}]*\}$/, `by:{${kept.join(', ')}}`);
   });

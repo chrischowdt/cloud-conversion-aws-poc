@@ -36,6 +36,22 @@ describe('rewriteEntityIdPins — inside the timeseries filter', () => {
     assert.equal(r.warnings.length, 0);
   });
 
+  it('converts matchesValue(dim, { ids }) — "any of" — like in()', () => {
+    // 20 of 999 lower alerts pin this way (ARL OpenSearch, alert batch-05).
+    const q = `timeseries v = avg(x), by:{dt.entity.custom_device}, filter:{ matchesValue(dt.entity.custom_device, { "${A}", "${B}" }) }`;
+    const r = run(q, arns({ [A]: ARN_A, [B]: ARN_B }));
+    assert.equal(r.out, `timeseries v = avg(x), by:{dt.entity.custom_device}, filter:{ in(aws.arn, array("${ARN_A}", "${ARN_B}")) }`);
+    assert.equal(run(`timeseries v = avg(x), filter:{ matchesValue(dt.entity.custom_device, "${A}") }`, arns({ [A]: ARN_A })).out,
+      `timeseries v = avg(x), filter:{ in(aws.arn, array("${ARN_A}")) }`);
+  });
+
+  it('leaves matchesValue alone when an id is unresolved, or the list holds a pattern', () => {
+    const q = `timeseries v = avg(x), filter:{ matchesValue(dt.entity.custom_device, { "${A}", "${B}" }) }`;
+    assert.equal(run(q, arns({ [A]: ARN_A })).out, q);
+    const wild = `timeseries v = avg(x), filter:{ matchesValue(dt.entity.custom_device, "CUSTOM_DEVICE-*") }`;
+    assert.equal(run(wild, arns({ [A]: ARN_A })).out, wild);
+  });
+
   it('keeps != as !=', () => {
     const q = `timeseries v = avg(x), filter:{ dt.entity.custom_device != "${A}" }`;
     assert.match(run(q, arns({ [A]: ARN_A })).out, /aws\.arn != "arn:aws:es:us-east-2:/);
@@ -161,7 +177,7 @@ describe('Pass 1.52 through rewriteDql', () => {
     const r = rewriteDql(q, mapped);
     assert.match(r.rewritten, new RegExp(`aws\\.arn == "${ARN_A}"`));
     assert.doesNotMatch(r.rewritten, /CUSTOM_DEVICE-/);
-    assert.match(r.rewritten, /by:\{\s*dt\.smartscape\.aws_opensearch_domain\s*\}/);
+    assert.match(r.rewritten, /by:\{\s*dt\.smartscape\.aws_opensearchservice_domain\s*\}/);
     assert.equal(lintAsset({ query: r.rewritten }).some((f) => f.ruleId === 'classic-entity-id-vs-smartscape-dim'), false);
   });
 
@@ -170,7 +186,7 @@ describe('Pass 1.52 through rewriteDql', () => {
       `timeseries v = min(${key}), by:{dt.entity.custom_device}, interval:1m\n` +
       `| filter dt.entity.custom_device == "${A}" or dt.entity.custom_device == "${B}"`;
     const r = rewriteDql(q, mapped);
-    assert.match(r.rewritten, /by:\{\s*dt\.smartscape\.aws_opensearch_domain, aws\.arn\s*\}/);
+    assert.match(r.rewritten, /by:\{\s*dt\.smartscape\.aws_opensearchservice_domain, aws\.arn\s*\}/);
     assert.match(r.rewritten, /\| filter aws\.arn == .* or aws\.arn == /);
     assert.doesNotMatch(r.rewritten, /CUSTOM_DEVICE-/);
   });

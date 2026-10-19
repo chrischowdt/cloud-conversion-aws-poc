@@ -62,9 +62,24 @@ export const LINT_RULES: LintRule[] = [
         // dim == "ID" / != "ID", optionally inside toString(...)
         new RegExp(`(?:toString\\(\\s*)?${DIM}\\s*\\)?\\s*[!=]=\\s*${ID}`).test(q) ||
         // in(dim, "ID", …) / in(dim, array("ID", …))
-        new RegExp(`\\bin\\(\\s*(?:toString\\(\\s*)?${DIM}\\s*\\)?\\s*,\\s*(?:array\\(\\s*)?${ID}`).test(q)
+        new RegExp(`\\bin\\(\\s*(?:toString\\(\\s*)?${DIM}\\s*\\)?\\s*,\\s*(?:array\\(\\s*)?${ID}`).test(q) ||
+        // matchesValue(dim, "ID") / matchesValue(dim, { "ID", … }) — 20 of 999 lower
+        // alerts pin this way; four ARL OpenSearch reviews (batch-05) found them empty.
+        new RegExp(`\\bmatchesValue\\(\\s*${DIM}\\s*,\\s*\\{?\\s*${ID}`).test(q)
       );
     },
+  },
+  {
+    id: 'management-zone-on-node',
+    severity: 'blocking',
+    message:
+      'Reads `managementZones` from a Smartscape node. The new AWS nodes have no management zones ' +
+      '(nic55601: 0 of 14,990 EC2 nodes), so the filter matches nothing. Four CPN alerts in review ' +
+      'batches 06–07 returned 0 rows this way.',
+    fix:
+      'Use the zone\'s AWS tag rules instead — run `cct discover-management-zones` so the rewriter can ' +
+      'translate it, or write the tag filter by hand (e.g. `aws.tags.applicationci` == "cpn").',
+    test: (q) => /getNodeField\(\s*`?dt\.smartscape\.[a-z0-9_]+`?\s*,\s*"managementZones"\s*\)/.test(q),
   },
   {
     id: 'tag-record-in-string-comparison',

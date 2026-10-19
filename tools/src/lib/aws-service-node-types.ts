@@ -14,11 +14,18 @@
  *
  * Empirical, not derived from the dt-migration entities JSON: its
  * `dacResourceType` carries the wrong granularity for several services
- * (ecs→SERVICE not CLUSTER, es→OPENSEARCHSERVICE not OPENSEARCH,
- * elasticache→SERVERLESSCACHE not CACHECLUSTER). The metric source type is what
- * `dt.smartscape.<type>` dimensions actually match.
+ * (ecs→SERVICE not CLUSTER, elasticache→SERVERLESSCACHE not CACHECLUSTER). The
+ * metric source type is what `dt.smartscape.<type>` dimensions actually match.
  *
  * Source: nic55601 (2026-06-12), 40 services, 67,424 series.
+ *
+ * es CHANGED SINCE (re-probed 2026-10-19, nic55601): there are 0
+ * AWS_OPENSEARCH_DOMAIN nodes and 94 AWS_OPENSEARCHSERVICE_DOMAIN nodes; the es
+ * series carry both ids, but only the service one joins a node (by
+ * dt.smartscape.aws_opensearchservice_domain: 59 of 60 series non-null; by
+ * aws_opensearch_domain: 35 of 36, joining nothing). An alert bound to the old
+ * type points at an entity that does not exist. Six reviewer fixes across alert
+ * batches 04–07 were exactly this rename; 101 of 999 AWS alerts use es.
  */
 
 /** metric-key service segment (`cloud.aws.<service>.…`) → Smartscape node type. */
@@ -43,7 +50,7 @@ export const SERVICE_NODE_TYPE_MAP: Record<string, string> = {
   efs: 'AWS_EFS_FILESYSTEM',
   eks: 'AWS_EKS_CLUSTER',
   elasticache: 'AWS_ELASTICACHE_CACHECLUSTER',
-  es: 'AWS_OPENSEARCH_DOMAIN',
+  es: 'AWS_OPENSEARCHSERVICE_DOMAIN',
   firehose: 'AWS_KINESISFIREHOSE_DELIVERYSTREAM',
   glue: 'AWS_GLUE_JOB',
   kafka: 'AWS_MSK_CLUSTER',

@@ -1636,7 +1636,10 @@ describe('rewriteDql — by-clause dims the new key does not carry', () => {
     );
     assert.ok(r.rewritten.includes('DBClusterIdentifier'), r.rewritten);
     assert.ok(!/\bRole\b/.test(r.rewritten), 'Role is not a dim of this key');
-    assert.ok(!/\bRegion\b/.test(r.rewritten), 'Region is not a dim of this key');
+    // The reviewer dropped Region here; since 2026-10-19 it is aliased to the
+    // aws.region every series carries, which keeps the classic per-region grain
+    // and stops later `filter … Region` from failing (CWE - DocDB ReplicaLag).
+    assert.match(r.rewritten, /Region = aws\.region/);
     assert.ok(r.warnings.some((w) => w.kind === 'dim-not-carried'));
   });
 
@@ -2222,6 +2225,66 @@ describe('expand is kept when the tag var is used as a string through a wrapper'
   it('keeps the expand for a wrapped string use it cannot translate', () => {
     const r = rewriteDql(q('contains(lower(tags), "raw")'), buildIndex([]));
     assert.match(r.rewritten, /expand tags/);
+  });
+});
+
+describe('alert batch 04–07 reviewer findings (2026-10-19)', () => {
+  it('binds OpenSearch metrics to the node type that has nodes', () => {
+    // nic55601: 0 AWS_OPENSEARCH_DOMAIN nodes vs 94 AWS_OPENSEARCHSERVICE_DOMAIN.
+    const r = rewriteDql('timeseries v = avg(cloud.aws.es.cpu_utilization_maximum_by_client_id), by:{dt.entity.custom_device}', buildIndex([]));
+    assert.match(r.rewritten, /by:\{dt\.smartscape\.aws_opensearchservice_domain\}/);
+  });
+
+  it("rewrites a management-zone attribute filter as the matched zones' tag rules", () => {
+    const mzTags = new Map([
+      ['CPN : SEATS : DEV', [{ key: 'ApplicationCI', value: 'cpn' }, { key: 'env', value: 'dev' }]],
+      ['CPN : SEATS : QA', [{ key: 'ApplicationCI', value: 'cpn' }, { key: 'env', value: 'qa' }]],
+      ['XCPNX : OTHER', [{ key: 'ApplicationCI', value: 'xyz' }]],
+    ]) as any;
+    const q = 'timeseries c = avg(cloud.aws.ec2.cpu_utilization, filter: { matchesPhrase(entityAttr(dt.entity.custom_device, "managementZones"), "CPN") }), by: { dt.entity.custom_device }';
+    const r = rewriteDql(q, { ...buildIndex([]), mzTags });
+    assert.doesNotMatch(r.rewritten, /managementZones/);
+    assert.match(r.rewritten, /\(\(`aws\.tags\.applicationci` == "cpn" and `aws\.tags\.env` == "dev"\) or \(`aws\.tags\.applicationci` == "cpn" and `aws\.tags\.env` == "qa"\)\)/);
+    assert.doesNotMatch(r.rewritten, /xyz/, 'phrase match is on whole tokens: XCPNX is not CPN');
+  });
+
+  it('leaves the zone filter (lint-blocked) when no zone matches', () => {
+    const q = 'timeseries c = avg(cloud.aws.ec2.cpu_utilization, filter: { matchesPhrase(entityAttr(dt.entity.custom_device, "managementZones"), "NOPE") }), by: { dt.entity.custom_device }';
+    const r = rewriteDql(q, { ...buildIndex([]), mzTags: new Map() as any });
+    assert.ok(lintQuery(r.rewritten).some((f) => f.ruleId === 'management-zone-on-node'));
+  });
+
+  it('reads the tag record a smartscapeNodes lookup brings in', () => {
+    // EPI QA (batches 05, 07): classic 1 row, reviewer 1, ours before this fix 0.
+    const q =
+      'timeseries m = sum(cloud.aws.kafka.messages_in_per_sec_sum_by_broker_idtopic), by: { Topic, dt.entity.custom_device }\n' +
+      '| lookup [fetch `dt.entity.cloud:aws:kafka` | fields entity.name, id, tags], sourceField:dt.entity.custom_device, lookupField:id, fields: {entity.name,tags}\n' +
+      '| filter matchesValue(tags,"[AWS]ApplicationCI:epi")';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /filter matchesValue\(tags\[ApplicationCI\], "epi"\)/);
+  });
+
+  it('keeps primary_tags.* in the by-clause', () => {
+    // BJR - RDS Aurora DML Latency: pruning it made the later filter fail.
+    const q = 'timeseries avg = avg(`cloud.aws.rds.DMLLatency.By.DBInstanceIdentifier`), by:{DBInstanceIdentifier, dt.smartscape.aws_rds_dbinstance, primary_tags.applicationci}\n| filter primary_tags.applicationci == "bjr"';
+    assert.match(rewriteDql(q, buildIndex([])).rewritten, /by:\{DBInstanceIdentifier, dt\.smartscape\.aws_rds_dbinstance, primary_tags\.applicationci\}/);
+  });
+
+  it('aliases a classic Region dimension to aws.region instead of pruning it', () => {
+    // CWE - DocDB ReplicaLag: pruning Region made the later filter fail.
+    const q = 'timeseries v = avg(`cloud.aws.docdb.DBInstanceReplicaLag.By.DBInstanceIdentifier`), by: { DBInstanceIdentifier, Region }, interval: 1m\n| filter matchesValue(Region, "us-east-1")';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /by:\{DBInstanceIdentifier, Region = aws\.region\}/);
+    assert.match(r.rewritten, /filter matchesValue\(Region, "us-east-1"\)/);
+  });
+
+  it('uses the instance-grain RDS variant when the query binds the instance node', () => {
+    // nic55601: CommitLatency cluster variant 82 series, 0 with an instance id.
+    const liveMetrics = { byKey: new Map([['cloud.aws.rds.CommitLatency.By.DBInstanceIdentifier', 319], ['cloud.aws.rds.CommitLatency.By.DBClusterIdentifier', 82]]), byBase: new Map() };
+    const idx = { ...buildIndex([{ classicMetricId: 'cloud.aws.aurora.commit_latency', newDtMetricKey: 'cloud.aws.rds.CommitLatency.By.DBClusterIdentifier', service: 'rds' } as any]), liveMetrics };
+    const r = rewriteDql('timeseries val = avg(cloud.aws.aurora.commit_latency), by:{dt.entity.custom_device}', idx);
+    assert.match(r.rewritten, /`cloud\.aws\.rds\.CommitLatency\.By\.DBInstanceIdentifier`/);
+    assert.match(r.rewritten, /dt\.smartscape\.aws_rds_dbinstance/);
   });
 });
 

@@ -18,8 +18,8 @@ describe('nodeTypeForMetricService', () => {
   });
 
   it('uses the empirical (not doc-derived) node type where they differ', () => {
-    // doc dacResourceType would give OPENSEARCHSERVICE / SERVERLESSCACHE — wrong.
-    assert.equal(nodeTypeForMetricService('es'), 'AWS_OPENSEARCH_DOMAIN');
+    // doc dacResourceType would give SERVERLESSCACHE — wrong. (es: see below.)
+    assert.equal(nodeTypeForMetricService('es'), 'AWS_OPENSEARCHSERVICE_DOMAIN');
     assert.equal(nodeTypeForMetricService('elasticache'), 'AWS_ELASTICACHE_CACHECLUSTER');
     assert.equal(nodeTypeForMetricService('kafka'), 'AWS_MSK_CLUSTER');
   });
@@ -103,8 +103,11 @@ describe('expansion from DAC entities JSON (2026-06-16)', () => {
     assert.equal(isMultiNodeService('elasticache'), true);
   });
 
-  it('preserves empirical overrides (es→OPENSEARCH, not the doc OPENSEARCHSERVICE)', () => {
-    assert.equal(nodeTypeForMetricService('es'), 'AWS_OPENSEARCH_DOMAIN');
+  it('binds es to the node type that has nodes (re-probed 2026-10-19: 94 vs 0)', () => {
+    // June's probe said AWS_OPENSEARCH_DOMAIN; the integration has since moved
+    // its nodes to OPENSEARCHSERVICE, and an alert bound to the old type points
+    // at an entity that does not exist.
+    assert.equal(nodeTypeForMetricService('es'), 'AWS_OPENSEARCHSERVICE_DOMAIN');
     assert.equal(nodeTypeForMetricService('ecs'), 'AWS_ECS_CLUSTER');
   });
 });

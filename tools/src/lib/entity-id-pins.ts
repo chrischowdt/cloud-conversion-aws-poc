@@ -36,6 +36,7 @@ const ARN_DIM = 'aws.arn';
 
 const CMP = /(`?dt\.entity\.([a-z0-9_:]+)`?)\s*(==|!=)\s*"([A-Z][A-Z0-9_:]*-[0-9A-F]{16})"/g;
 const IN_OPEN = /\bin\(\s*(`?dt\.entity\.([a-z0-9_:]+)`?)\s*,/g;
+const MV_OPEN = /\bmatchesValue\(\s*(`?dt\.entity\.([a-z0-9_:]+)`?)\s*,/g;
 const ID_LITERAL = /"([A-Z][A-Z0-9_:]*-[0-9A-F]{16})"/g;
 
 interface Hit {
@@ -95,6 +96,21 @@ function findHits(q: string, mask: boolean[]): Hit[] {
       ids,
       op: 'in',
     });
+  }
+  // matchesValue(dim, "ID") / matchesValue(dim, { "ID", … }) — "any of", like
+  // in(). 20 of 999 AWS alerts in lower pin this way (e.g. the ARL OpenSearch
+  // detectors reviewed in batch-05, which returned nothing once converted).
+  MV_OPEN.lastIndex = 0;
+  for (let m = MV_OPEN.exec(q); m; m = MV_OPEN.exec(q)) {
+    if (!mask[m.index]) continue;
+    const open = m.index + m[0].indexOf('(');
+    const close = closingParen(q, mask, open);
+    if (close < 0) continue;
+    const args = q.slice(m.index + m[0].length, close);
+    const leftover = args.replace(ID_LITERAL, '').replace(/[\s,{}]/g, '');
+    const ids = [...args.matchAll(ID_LITERAL)].map((x) => x[1]!);
+    if (leftover !== '' || ids.length === 0) continue;
+    hits.push({ start: m.index, end: close + 1, text: q.slice(m.index, close + 1), dimType: m[2]!, ids, op: 'in' });
   }
   return hits.sort((a, b) => a.start - b.start);
 }
