@@ -2196,17 +2196,26 @@ function rewriteEntityNameAttr(input: string, transforms: Transform[]): string {
 
 // ─── Pass 1.56: RDS instance binding ↔ instance-grain metric ──────────────────
 //
-// Classic `cloud.aws.aurora.*` metrics are per DB INSTANCE, so Pass 1.55 binds
-// them to `dt.smartscape.aws_rds_dbinstance` — but the mapping often picks the
-// CLUSTER variant (`….By.DBClusterIdentifier`). Those series carry no instance
-// id at all (nic55601: CommitLatency cluster variant 82 series, 0 with an
-// instance id; instance variant 319, all with one; DMLLatency 70/0 vs 130/130),
-// so the binding is null on every series: the alert can't attach to an entity
-// and any filter on the node matches nothing. 33 of 999 AWS alerts in lower;
-// a reviewer fixed one by hand (CWE Aurora CommitLatencyHigh, batch-05).
+// Pass 1.55 binds rds custom devices to `dt.smartscape.aws_rds_dbinstance`, but
+// for classic `cloud.aws.aurora.*` keys the mapping picks the CLUSTER variant
+// (`….By.DBClusterIdentifier`). Those series carry no instance id at all
+// (nic55601: CommitLatency cluster variant 82 series, 0 with an instance id;
+// instance variant 319, all with one; DMLLatency 70/0 vs 130/130), so the
+// binding is null on every series: the alert can't attach to an entity and any
+// filter on the node matches nothing. 33 of 999 AWS alerts in lower; reviewers
+// fixed two by hand with the instance variant (CWE CommitLatency, CWE DBLoad).
 //
-// Keep the instance binding and switch to the instance variant — but only on
-// evidence: when this tenant's inventory shows the instance variant has series.
+// CORRECTION (2026-10-20): the classic aurora custom devices are CLUSTERS
+// (names like `…-auroracluster-us-east-1-qa`, across 700+ devices), so the
+// faithful grain is the cluster variant bound to `dt.smartscape.aws_rds_dbcluster`
+// — not the instance variant used here, which turns a per-cluster alert into a
+// per-instance one (CWE CommitLatency: classic 1 row, this 2). It was kept
+// because the cluster-level metrics are collected for far fewer clusters (82 in
+// lower, vs 700+ classic devices) — cluster binding returned 0 on many alerts
+// where classic had data. Which grain to use is an open decision; see the
+// needs-review analysis of 2026-10-20.
+//
+// Only on evidence: when this tenant's inventory shows the instance variant has series.
 function alignRdsMetricGrain(input: string, transforms: Transform[], warnings: Warning[], index: RecipeIndex): string {
   const live = index.liveMetrics;
   if (!live || !/dt\.smartscape\.aws_rds_dbinstance\b/.test(input)) return input;
