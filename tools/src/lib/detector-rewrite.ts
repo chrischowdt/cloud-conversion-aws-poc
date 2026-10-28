@@ -31,6 +31,7 @@ import {
   type Warning,
 } from './dql-rewriter.ts';
 import { lookupClassicKey, type RecipeIndex } from './recipe-lookup.ts';
+import { emittedEntityColumn } from './detector-binding.ts';
 
 /** What we did (or refused to do) to the detector's static threshold. */
 export interface ThresholdAction {
@@ -314,11 +315,15 @@ export function rewriteDetector(
   const needsSync = props.some(
     (p) => typeof p?.value === 'string' && (p.value as string).includes('{dims:dt.entity.custom_device')
   );
+  // Bind to the entity column the split emits; failing that, the first node dim
+  // (a query that only FILTERS on one; the stager then tries to bind it).
+  const currentBinding = props.find((p) => String(p?.key ?? '') === SMARTSCAPE_BINDING_KEY)?.value;
+  const bindDim = emittedEntityColumn(query.rewritten, typeof currentBinding === 'string' ? currentBinding : undefined) ?? targetDim;
+  // The binding is rewritten whenever the query emits an entity, not only when a
+  // classic `{dims:...}` placeholder is present: a detector can carry
+  // `{dt.source_entity}`, or no binding at all, and still need one.
+  if (bindDim) rewriteEntityBinding(props, bindDim, eventTemplateChanges);
   if (targetDim) {
-    // The binding is rewritten whenever the query resolved to a Smartscape dim,
-    // not only when a classic `{dims:...}` placeholder is present: a detector
-    // can carry `{dt.source_entity}`, or no binding at all, and still need one.
-    rewriteEntityBinding(props, targetDim, eventTemplateChanges);
     for (const p of props) {
       if (typeof p?.value !== 'string') continue;
       const { text, subs } = rewriteEventTemplateString(p.value, targetDim);
@@ -327,7 +332,7 @@ export function rewriteDetector(
         p.value = text;
       }
     }
-  } else if (needsSync || (query.rewritten !== query.original && props.some((p) => String(p?.key ?? '') === CLASSIC_BINDING_KEY))) {
+  } else if (needsSync || (!bindDim && query.rewritten !== query.original && props.some((p) => String(p?.key ?? '') === CLASSIC_BINDING_KEY))) {
     // We converted the query but it didn't resolve to a Smartscape dim, so the
     // binding can't be rewritten safely. Flag it rather than guess — the
     // failure mode is an alert that still fires but attaches to nothing.

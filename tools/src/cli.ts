@@ -235,6 +235,10 @@ COMMANDS
                     shares them. Flags: --apply, --share-group <id> (or env
                     DT_SHARE_GROUP_ID), --batch-size <n> (default 10), --buckets
                     <clean,soft> (default), --ids <a,b>, --limit, --input-file.
+                    Unbound alerts get dt.smartscape_source.id added to their
+                    split. A read-only 7-day series count decides the card text:
+                    unchanged, or per resource (threshold to check). Left
+                    unbound only past 10,000 series. --no-bind-entities skips it.
   migrate-pull      Fetch the human-fixed review copies (Document API) into
                     migration/reviewed/ and mark rows in-review. Needs the admin
                     token. Flags: --ids, --limit, --tracker.
@@ -729,6 +733,7 @@ async function main(): Promise<void> {
         mappingPath: getString(args.flags, 'mapping'),
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),
+        bindEntities: args.flags.get('no-bind-entities') !== true,
       });
       return;
     }

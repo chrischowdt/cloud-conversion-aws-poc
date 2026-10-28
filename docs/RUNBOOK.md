@@ -126,12 +126,21 @@ Alerts are never published as a second copy: two armed copies would alert twice.
 
 ```bash
 cct download-anomaly-detectors                                   # refresh first; owners edit alerts too
+cct discover-metrics                                             # metric inventory (~7 min); picks metric variants
+cct discover-entity-arns                                         # new alerts may pin new classic ids
 cct stage-detectors --tracker "<path>" --batch-size 25 --limit 100 --share-group <id>            # prepare
 cct stage-detectors --tracker "<path>" --batch-size 25 --limit 100 --share-group <id> --apply    # create
 ```
 
 That creates `[MIGRATION REVIEW] AWS alerts — batch-NN` notebooks (25 alerts each, 4 batches here), numbered after the last existing batch. Alerts already in a batch are skipped, and the `alerts` sheet records each alert as `staged` with its notebook. Each alert is a markdown card (what changed, threshold, warnings) plus a DQL tile. Reviewers fix the tile in place and record their decision and notes in the `alerts` sheet.
 
+- **Entity binding:** an alert whose query has no entity in its split would reach the incident tool with no entity. The prepare step adds `dt.smartscape_source.id` to the split, after a read-only 7-day check of the series count:
+  - **unchanged:** the grain is the same; nothing to check;
+  - **larger, or no data to check:** the alert now fires per resource, and the card asks the reviewer to check the threshold;
+  - **past 10,000 series,** Davis's per-detector limit, or a query shape it can't edit safely: left unbound, with a note on the card.
+
+  `--no-bind-entities` skips it.
+- **Before applying,** run a few prepared queries yourself. An empty result where the classic query has data is usually a metric that isn't collected in that account (add it to the AWS connection), not a translation mistake.
 - `--group-by-team` batches by the team prefix in the alert title instead.
 - `--restage` re-renders existing batches in place. It overwrites the tiles, so only use it on batches nobody has started.
 

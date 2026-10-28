@@ -35,6 +35,7 @@ import { lookupEolForClassicKey } from './eol-lookup.ts';
 import { isMetricCarrier, isKnownNonCarrier } from './metric-dim-carriers.ts';
 import { canonicalTagKey } from './tag-key-casing.ts';
 import { codeMask, timeseriesCommands, topLevelBy } from './dql-command.ts';
+import { metricBase } from './live-metrics.ts';
 import { rewriteEntityIdPins } from './entity-id-pins.ts';
 import { findEdgesBetween } from './smartscape-edges.ts';
 import {
@@ -74,7 +75,12 @@ export interface Warning {
     | 'dim-not-carried'
     | 'aggregation-mismatch'
     | 'non-aws-entity'
-    | 'end-of-life-service';
+    | 'end-of-life-service'
+    // A migrated alert whose split carries no entity: it fires attached to nothing.
+    | 'alert-unbound'
+    // The entity was added to an alert's split and that split it per resource
+    // (or there was no data to prove it didn't): the threshold needs a look.
+    | 'alert-per-entity';
   text: string;
   /** Pointer to the relevant dt-migration reference (if any). */
   reference?: string;
@@ -728,6 +734,12 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // Pass 1.56: an RDS-INSTANCE binding needs the instance-grain metric variant.
   rewritten = alignRdsMetricGrain(rewritten, transforms, warnings, index);
 
+  // Pass 1.565: pinned ARNs name the grain (cluster vs instance) — follow them.
+  rewritten = alignGrainToPinnedArns(rewritten, transforms, warnings, index);
+
+  // Pass 1.57: prefer the variant of the same metric that covers the resources.
+  rewritten = alignMetricCoverage(rewritten, transforms, warnings, index);
+
   // Pass 2: replace dt.entity.<type> with dt.smartscape.<...>.
   // Skip dim swaps inside `lookup [fetch dt.entity.<not-planned-type>]`
   // subqueries — the entire subquery is classic-only and a partial rewrite
@@ -800,6 +812,9 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // Runs AFTER the dt.entity.* dim swap so x is already in smartscape form.
   rewritten = rewriteEntityNameAttr(rewritten, transforms);
 
+  // Pass 2.52: a node's name read inside a timeseries → the metric's own name dimension.
+  rewritten = rewriteNodeNameInTimeseries(rewritten, input, transforms);
+
   // Pass 2.51: `matchesPhrase(<node>.managementZones, "X")` → the matched zones' tag filters.
   rewritten = rewriteManagementZoneAttrFilters(rewritten, transforms, warnings, index.mzTags);
 
@@ -869,6 +884,20 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
         detail: 'classic source-entity type field → Smartscape source type',
       });
     }
+    // An author who already set `dt.smartscape_source.id` next to the classic
+    // field (`| fieldsAdd dt.source_entity = acct_id, dt.smartscape_source.id =
+    // acct_id`) would get it twice: "The field `dt.smartscape_source.id` would be
+    // created twice in the same command" (nic55601 2026-10-27, DynamoDB
+    // AccountProvisionedWriteCapacityUtilization). Keep theirs, drop the classic one.
+    rewritten = rewritten.replace(/(\|\s*fieldsAdd\b)([^|]*)/g, (seg, head: string, body: string) => {
+      if (!/\bdt\.smartscape_source\.id\s*=/.test(body) || !/\bdt\.source_entity\s*=/.test(body)) return seg;
+      const ASSIGN = String.raw`\bdt\.source_entity\s*=\s*[\w.\x60]+`;
+      const cleaned = body.replace(new RegExp(String.raw`\s*${ASSIGN}\s*,\s*`), ' ').replace(new RegExp(String.raw`\s*,\s*${ASSIGN}`), '');
+      if (cleaned === body) return seg;
+      transforms.push({ kind: 'entity-dim', before: 'dt.source_entity = …', after: '(dropped)', detail: 'dt.smartscape_source.id is already assigned in the same fieldsAdd' });
+      return head + cleaned;
+    });
+
     // Bare `dt.source_entity` (the source-entity ID), not followed by a field
     // accessor we already handled. `.type` is gone by now; guard against any
     // other `.<word>` to avoid touching unknown sub-fields.
@@ -2241,6 +2270,193 @@ function alignRdsMetricGrain(input: string, transforms: Transform[], warnings: W
   return out;
 }
 
+// ─── Pass 1.565: pinned ARNs decide cluster vs instance grain ────────────────
+//
+// Pass 1.52 re-pins a classic id to the resource's ARN. For RDS-family metrics
+// the ARN says which grain the classic device was (`…:cluster:…` vs `…:db:…`),
+// and a series only carries the ARN of its own grain: cluster ARNs never match
+// a `.By.DBInstanceIdentifier` series. EAI DocDB IndexBufferCacheHitRatio
+// (alert batch 21 prepare, 2026-10-27) pinned six cluster ARNs on the instance
+// variant, so it could never return a row. When every pinned ARN is one grain,
+// use that grain's variant (if this tenant has it) and its node dimension.
+const RDS_FAMILY_KEY_RE = /cloud\.aws\.(rds|docdb|neptune)\.([A-Za-z0-9_]+)\.By\.(DBInstanceIdentifier|DBClusterIdentifier(?:\.Role)?)(?![A-Za-z0-9_.])/g;
+function alignGrainToPinnedArns(input: string, transforms: Transform[], warnings: Warning[], index: RecipeIndex): string {
+  const live = index.liveMetrics;
+  if (!live || !/\baws\.arn\b/.test(input)) return input;
+  const arns = [...input.matchAll(/"arn:aws:rds:[a-z0-9-]+:\d+:(cluster|db):[^"]+"/g)].map((m) => m[1]);
+  if (!arns.length) return input;
+  const grain = arns.every((g) => g === 'cluster') ? 'cluster' : arns.every((g) => g === 'db') ? 'instance' : null;
+  if (!grain) return input;
+  let out = input;
+  let changed = false;
+  out = out.replace(RDS_FAMILY_KEY_RE, (full, svc: string, metric: string, dims: string) => {
+    const isCluster = dims.startsWith('DBCluster');
+    if ((grain === 'cluster') === isCluster) return full;
+    const base = `cloud.aws.${svc}.${metric}.By.`;
+    const options = grain === 'cluster' ? ['DBClusterIdentifier', 'DBClusterIdentifier.Role'] : ['DBInstanceIdentifier'];
+    const to = options.map((d) => base + d).find((k) => (live.byKey.get(k) ?? 0) > 0);
+    if (!to) return full;
+    changed = true;
+    transforms.push({ kind: 'metric-key', before: full, after: to, detail: `the pinned ARNs are all ${grain === 'cluster' ? 'clusters' : 'DB instances'}` });
+    warnings.push({
+      kind: 'dim-variant-override',
+      text: `${full} → ${to}: the classic resources pinned here are ${grain === 'cluster' ? 'clusters' : 'DB instances'} (their ARNs), and series only carry the ARN of their own grain.`,
+      match: full,
+    });
+    return to;
+  });
+  if (!changed) return out;
+  const [from, to] = grain === 'cluster' ? ['dbinstance', 'dbcluster'] : ['dbcluster', 'dbinstance'];
+  return out.replace(new RegExp(String.raw`\bdt\.smartscape\.aws_(rds|docdb|neptune)_${from}\b`, 'g'), (_m, svc: string) => `dt.smartscape.aws_${svc}_${to}`);
+}
+
+// ─── Pass 1.57: the variant that covers the resources ────────────────────────
+//
+// The mapping names ONE `.By.` variant of a metric. The lookup already swaps a
+// variant with no series for a populated sibling, but a variant can exist and
+// still cover a fraction of the resources. Measured on nic55601 (2026-10-27,
+// distinct dt.smartscape_source.id over 3 days):
+//   es.CPUUtilization        .By.ClientId.DomainName 8 domains, …DomainName.NodeId 92
+//   ecs.CPUUtilization       .By.ClusterName 15, …ClusterName.ServiceName many more
+//   apigateway.Latency       .By.ApiName.Method.Resource.Stage 20, …ApiName.Stage 118
+// Until 2026-10-27 the inventory was a truncated sample, so the thin variant
+// often looked absent and the override picked the broad one by accident;
+// reviewers approved those (es NodeId, alert batches 06 and 08).
+//
+// Swap only to a sibling that the query can use unchanged:
+//   - finer: it has every dimension of the mapped variant (the query's split
+//     aggregates it back), or
+//   - coarser: it lacks only dimensions the query never references;
+// and only on evidence, at least twice the entities. Instance vs cluster
+// variants are neither, so RDS grain stays with Pass 1.56. Keys this rewrite did
+// not choose, and verified recipe-tier keys, are never touched.
+const VARIANT_KEY_RE = /cloud\.aws\.[a-z0-9_]+\.[A-Za-z0-9_]+\.By\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*/g;
+const recipeKeyCache = new WeakMap<RecipeIndex, Set<string>>();
+function recipeNewKeys(index: RecipeIndex): Set<string> {
+  let s = recipeKeyCache.get(index);
+  if (!s) {
+    s = new Set([...index.byClassicId.values()].filter((e) => e.detectedRecipe && e.newDtMetricKey).map((e) => e.newDtMetricKey!));
+    recipeKeyCache.set(index, s);
+  }
+  return s;
+}
+const keyDims = (key: string): string[] => key.slice(key.indexOf('.By.') + 4).split('.');
+
+function alignMetricCoverage(input: string, transforms: Transform[], warnings: Warning[], index: RecipeIndex): string {
+  const entities = index.liveMetrics?.entities;
+  if (!entities) return input;
+  // Keys this rewrite put in (a transform's `after` can be a whole `avg(<key>)` call).
+  const chosen = new Set(transforms.filter((t) => t.kind === 'metric-key').flatMap((t) => t.after.match(VARIANT_KEY_RE) ?? []));
+  const recipe = recipeNewKeys(index);
+  // The query's code with string contents and metric keys blanked, so a
+  // dimension name inside a key (`….By.ClientId.DomainName`) or a filter value
+  // is not mistaken for a reference to that dimension.
+  const mask = codeMask(input);
+  const code = input.split('').map((c, i) => (mask[i] ? c : ' ')).join('').replace(VARIANT_KEY_RE, (k) => ' '.repeat(k.length));
+  const references = (dim: string) =>
+    [dim, dim.replace(/_/g, ' ')].some((d) => new RegExp(`(?<![A-Za-z0-9_.])${d.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_])`).test(code));
+  let out = input;
+  for (const key of new Set(input.match(VARIANT_KEY_RE) ?? [])) {
+    if (!chosen.has(key) || recipe.has(key)) continue;
+    const own = entities.get(key) ?? 0;
+    const dims = keyDims(key);
+    const used = dims.filter(references);
+    let best: { key: string; n: number; dims: number; finer: boolean } | undefined;
+    for (const s of index.liveMetrics!.byBase.get(metricBase(key)) ?? []) {
+      if (s === key) continue;
+      const sd = keyDims(s);
+      const finer = dims.every((d) => sd.includes(d));
+      const coarser = sd.every((d) => dims.includes(d)) && used.every((d) => sd.includes(d));
+      if (!finer && !coarser) continue;
+      const n = entities.get(s) ?? 0;
+      if (n < 2 || n < 2 * own) continue;
+      if (!best || n > best.n || (n === best.n && sd.length < best.dims)) best = { key: s, n, dims: sd.length, finer };
+    }
+    if (!best) continue;
+    const re = new RegExp(`${key.replace(/\./g, '\\.')}(?![A-Za-z0-9_]|\\.[A-Za-z0-9_])`, 'g');
+    out = out.replace(re, best.key);
+    const how = best.finer
+      ? 'the same metric at a finer grain, which the query aggregates back to its split'
+      : `the same metric without dimension(s) the query never uses (${dims.filter((d) => !keyDims(best!.key).includes(d)).join(', ')})`;
+    transforms.push({ kind: 'metric-key', before: key, after: best.key, detail: `covers ${best.n} resources here vs ${own}` });
+    warnings.push({
+      kind: 'dim-variant-override',
+      text: `${key} → ${best.key}: on this tenant the mapped variant covers ${own} resource(s) and this one ${best.n} — ${how}. Verify the threshold still means the same at this grain.`,
+      match: key,
+    });
+  }
+  return out;
+}
+
+// ─── Pass 2.52: a node's name inside a timeseries → the metric's name dim ────
+//
+// Classic `entityName(dt.entity.custom_device)` in a timeseries filter becomes
+// `getNodeName(dt.smartscape.<type>)` (Pass 2.5). Inside the timeseries command
+// that is a lookup over every node of the type, and Grail stops it on longer
+// windows: "The IN keyword's subquery read too much data" (nic55601 2026-10-27:
+// CBS / DYS RDS DatabaseConnections and EDK Lambda Errors run at 1h and 2h, fail
+// at 24h — the review notebooks' default — and at 7 days). 141 of 1,046 lower
+// AWS alerts read a node name there. Reviewers replaced it with the metric's
+// own dimension (CBS `DBInstanceIdentifier`, EPI `ClusterName`: "cheaper filter").
+//
+// The series carry the resource's name as a dimension, and it IS the node name.
+// Measured per type over 1h of series (node name == dimension, of series with a
+// node): every one for the types below; where the node had no name (OpenSearch
+// 33 of 90, Glue 6 of 76, DocDB cluster all 168) the dimension still has the
+// resource name, so the classic filter works again. Kinesis streams are left
+// out: their node name is the ARN, the dimension the bare stream name.
+const NAME_DIMENSION: Record<string, { keyDim: string; column: string }> = {
+  aws_lambda_function: { keyDim: 'FunctionName', column: 'FunctionName' },
+  aws_redshift_cluster: { keyDim: 'ClusterIdentifier', column: 'ClusterIdentifier' },
+  aws_sqs_queue: { keyDim: 'QueueName', column: 'QueueName' },
+  aws_msk_cluster: { keyDim: 'Cluster_Name', column: '`Cluster Name`' },
+  aws_rds_dbinstance: { keyDim: 'DBInstanceIdentifier', column: 'DBInstanceIdentifier' },
+  aws_rds_dbcluster: { keyDim: 'DBClusterIdentifier', column: 'DBClusterIdentifier' },
+  aws_docdb_dbcluster: { keyDim: 'DBClusterIdentifier', column: 'DBClusterIdentifier' },
+  aws_dynamodb_table: { keyDim: 'TableName', column: 'TableName' },
+  aws_kinesisanalyticsv2_application: { keyDim: 'Application', column: 'Application' },
+  aws_mwaa_environment: { keyDim: 'Environment', column: 'Environment' },
+  aws_glue_job: { keyDim: 'JobName', column: 'JobName' },
+  aws_kafkaconnect_connector: { keyDim: 'ConnectorName', column: 'ConnectorName' },
+  aws_amazonmq_broker: { keyDim: 'Broker', column: 'Broker' },
+  aws_elasticache_cachecluster: { keyDim: 'CacheClusterId', column: 'CacheClusterId' },
+  aws_ecs_cluster: { keyDim: 'ClusterName', column: 'ClusterName' },
+  aws_athena_workgroup: { keyDim: 'WorkGroup', column: 'WorkGroup' },
+  aws_apigateway_restapi: { keyDim: 'ApiName', column: 'ApiName' },
+  aws_sns_topic: { keyDim: 'TopicName', column: 'TopicName' },
+  aws_stepfunctions_statemachine: { keyDim: 'StateMachineArn', column: 'StateMachineArn' },
+  aws_opensearchservice_domain: { keyDim: 'DomainName', column: 'DomainName' },
+};
+const NODE_NAME_READ =
+  /getNodeName\(\s*`?dt\.smartscape\.([a-z0-9_]+)`?\s*\)|getNodeField\(\s*`?dt\.smartscape\.([a-z0-9_]+)`?\s*,\s*"name"\s*\)/g;
+
+function rewriteNodeNameInTimeseries(input: string, original: string, transforms: Transform[]): string {
+  // Only names this translation introduced; an author's own getNodeName stays.
+  if (/getNode(?:Name|Field)\s*\(/.test(original)) return input;
+  let out = input;
+  // Last command first, so earlier offsets stay valid.
+  for (const cmd of timeseriesCommands(out).reverse()) {
+    const body = out.slice(cmd.start, cmd.end);
+    const keys = body.match(VARIANT_KEY_RE) ?? [];
+    if (!keys.length) continue;
+    const mask = codeMask(body);
+    const next = body.replace(NODE_NAME_READ, (m: string, a: string | undefined, b: string | undefined, at: number) => {
+      const d = NAME_DIMENSION[(a ?? b)!];
+      if (!d || !mask[at]) return m;
+      if (!keys.every((k) => keyDims(k).includes(d.keyDim))) return m;
+      transforms.push({
+        kind: 'entity-dim',
+        before: m,
+        after: d.column,
+        detail: 'node name read inside the timeseries → the series’ own name dimension (same value; no node lookup)',
+      });
+      return d.column;
+    });
+    if (next !== body) out = out.slice(0, cmd.start) + next + out.slice(cmd.end);
+  }
+  return out;
+}
+
 // ─── Pass 2.51: management-zone attribute filter → the zones' tag filters ────
 //
 // Classic alerts scope to a zone by reading the entity's zone list:
@@ -3445,13 +3661,45 @@ function useEnrichedTagDims(
   // carry no AWS dimensions at all, which is exactly the case that bites.
   if (!/\bcloud\.aws\./.test(input)) return input;
 
+  // WHERE the read sits matters. Inside the timeseries command the enriched tag
+  // is a dimension of every series. After it, only the split's columns exist:
+  // `… by:{<node>} | filter `aws.tags.env` == "qa"` fails with "The field
+  // aws.tags.env doesn't exist" (nic55601 2026-10-27, ARL Kafka MaxOffsetLag,
+  // and a minimal RDS repro). There the node's tag record is the right read,
+  // with the key in the casing the resources carry (tag-key-casing.ts).
+  const cmds = timeseriesCommands(input);
+  const splitBody = (c: (typeof cmds)[number]) => {
+    const by = topLevelBy(input, c);
+    return by ? input.slice(by.open + 1, by.close) : '';
+  };
+  const placeOf = (at: number): { inside: boolean; split: string } | null => {
+    for (const c of cmds) if (at >= c.start && at < c.end) return { inside: true, split: splitBody(c) };
+    const before = cmds.filter((c) => c.end <= at).pop();
+    return before ? { inside: false, split: splitBody(before) } : null;
+  };
   const swapped = new Set<string>();
-  const out = input.replace(TAG_RECORD_READ, (full, key: string) => {
+  const recased = new Set<string>();
+  const out = input.replace(TAG_RECORD_READ, (full, key: string, at: number) => {
     if (!enriched.has(key.toLowerCase())) return full;
-    const dim = `\`${enrichedTagDimension(key)}\``;
-    swapped.add(`${key} → ${enrichedTagDimension(key)}`);
-    return dim;
+    const dimName = enrichedTagDimension(key);
+    const place = placeOf(at);
+    if (place && !place.inside && !place.split.includes(dimName)) {
+      const canonical = canonicalTagKey(key);
+      if (canonical === key) return full;
+      recased.add(`${key} → ${canonical}`);
+      return full.replace(/\[\s*[A-Za-z_][\w-]*\s*\]$/, `[${canonical}]`);
+    }
+    swapped.add(`${key} → ${dimName}`);
+    return `\`${dimName}\``;
   });
+  if (recased.size) {
+    transforms.push({
+      kind: 'entity-dim',
+      before: 'getNodeField(x, "tags:aws")[key]',
+      after: [...recased].map((s) => s.split(' → ')[1]).join(', '),
+      detail: 'tag read after the timeseries keeps the node lookup (the enriched dimension is not a column there); key in the casing resources carry',
+    });
+  }
 
   if (swapped.size) {
     transforms.push({

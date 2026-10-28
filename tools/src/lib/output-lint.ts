@@ -61,8 +61,10 @@ export const LINT_RULES: LintRule[] = [
       return (
         // dim == "ID" / != "ID", optionally inside toString(...)
         new RegExp(`(?:toString\\(\\s*)?${DIM}\\s*\\)?\\s*[!=]=\\s*${ID}`).test(q) ||
-        // in(dim, "ID", …) / in(dim, array("ID", …))
-        new RegExp(`\\bin\\(\\s*(?:toString\\(\\s*)?${DIM}\\s*\\)?\\s*,\\s*(?:array\\(\\s*)?${ID}`).test(q) ||
+        // in(dim, "ID", …) / in(dim, array("ID", …)) / in(dim, { "ID", … }) — the
+        // brace form slipped through: EAI DocDB IndexBufferCacheHitRatio staged
+        // as soft while returning nothing (alert batch 21 prepare, 2026-10-27).
+        new RegExp(`\\bin\\(\\s*(?:toString\\(\\s*)?${DIM}\\s*\\)?\\s*,\\s*(?:array\\(\\s*|\\{\\s*)?${ID}`).test(q) ||
         // matchesValue(dim, "ID") / matchesValue(dim, { "ID", … }) — 20 of 999 lower
         // alerts pin this way; four ARL OpenSearch reviews (batch-05) found them empty.
         new RegExp(`\\bmatchesValue\\(\\s*${DIM}\\s*,\\s*\\{?\\s*${ID}`).test(q)
@@ -126,6 +128,14 @@ export const LINT_RULES: LintRule[] = [
       'returns a single null row.',
     fix: 'Read the record by key instead: tags[ApplicationCI] — no expand/arraySort/parse needed.',
     test: (q) => {
+      // smartscapeNodes on an AWS type reads the record directly as `tags`. The
+      // EA Infra Dashboard's ApplicationCI variable (`expand appci = tags`, then
+      // splitString) was published this way and offered 0 values where the
+      // classic one offered 445 (nic55601, 2026-10-27).
+      if (/\bsmartscapeNodes\s+"?AWS_/.test(q)) {
+        if (/\|\s*expand\s+(?:\w+\s*=\s*)?tags\b(?!\s*\[)/.test(q)) return true;
+        if (/\barraySort\(\s*tags\s*\)/.test(q)) return true;
+      }
       const vars = new Set<string>();
       for (const m of q.matchAll(/\b(\w+)\s*=\s*getNodeField\([^,]+,\s*"tags:aws"\s*\)/g)) vars.add(m[1]!);
       if (vars.size === 0) return false;

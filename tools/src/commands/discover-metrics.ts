@@ -10,11 +10,13 @@
  * prefer a populated sibling (`live-metrics.ts` → `preferPopulatedVariant`).
  *
  * HOW: `fetch metric.series | filter dt.da.source == <source> | summarize
- * count() by metric.key`. One row per live key. ~700 keys on a typical AWS
- * tenant — small JSON.
+ * count() by metric.key`, split by key prefix wherever a part reaches Grail's
+ * silent 100,000-series cap (`lib/series-inventory.ts`). Before 2026-10-27 this
+ * was ONE query, so every inventory was a truncated sample of the keys.
  *
  * Output: `<tenant-out>/live-metrics.json`
- *   { generated, baseUrl, daSource, from, metricCount, metrics: { key: seriesCount } }
+ *   { generated, baseUrl, daSource, from, metricCount, queries, capped,
+ *     metrics: { key: seriesCount }, entities: { key: distinct dt.smartscape_source.id } }
  */
 
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -22,6 +24,7 @@ import { join } from 'node:path';
 
 import { DqlClient } from '../dynatrace/dql.ts';
 import { OUT_DIR } from '../lib/paths.ts';
+import { SERIES_CAP, inventorySeries, partFilter } from '../lib/series-inventory.ts';
 
 export interface DiscoverMetricsArgs {
   baseUrl: string;
@@ -46,24 +49,35 @@ export async function runDiscoverMetrics(args: DiscoverMetricsArgs): Promise<voi
       console.log(`  retry ${info.attempt}: ${info.reason} (${info.delayMs.toFixed(0)}ms)`),
   });
 
-  const query =
-    `fetch metric.series, from:${from} ` +
-    `| filter dt.da.source == "${daSource}" ` +
-    `| summarize seriesCount = count(), by:{ metric.key } ` +
-    `| sort metric.key asc`;
-
   console.log(`Inventorying live new-connection metrics on ${args.baseUrl}`);
   console.log(`  source=${daSource}  from=${from}`);
-  const result = await client.query({ query, maxResultRecords: 50_000, fetchTimeoutSeconds: 90 });
-
-  const metrics: Record<string, number> = {};
-  for (const rec of result.records ?? []) {
-    const key = rec['metric.key'];
-    const cnt = rec['seriesCount'];
-    if (typeof key === 'string' && key.length > 0) {
-      metrics[key] = typeof cnt === 'number' ? cnt : Number(cnt) || 0;
+  // Entities (distinct `dt.smartscape_source.id`) per key: how many resources a
+  // variant actually covers, which series counts overstate for finer variants
+  // (es CPUUtilization: DomainName 32 series / 8 domains, …NodeId 1769 / 92).
+  // A capped sample can only undercount, so keep the highest count seen.
+  const entities: Record<string, number> = {};
+  const num = (v: unknown): number => (typeof v === 'number' ? v : Number(v) || 0);
+  const inv = await inventorySeries(async (part) => {
+    const query =
+      `fetch metric.series, from:${from} ` +
+      `| filter dt.da.source == "${daSource}" and ${partFilter(part)} ` +
+      `| summarize seriesCount = count(), entities = countDistinct(dt.smartscape_source.id), by:{ metric.key }`;
+    const result = await client.query({ query, maxResultRecords: SERIES_CAP, fetchTimeoutSeconds: 90 });
+    const rows: Record<string, number> = {};
+    for (const rec of result.records ?? []) {
+      const key = rec['metric.key'];
+      if (typeof key !== 'string' || key.length === 0) continue;
+      rows[key] = num(rec['seriesCount']);
+      entities[key] = Math.max(entities[key] ?? 0, num(rec['entities']));
     }
-  }
+    return rows;
+  }, '', {
+    onProgress: (q, keys) => {
+      if (q % 25 === 0) console.log(`  … ${q} queries, ${keys} keys so far`);
+    },
+  });
+
+  const metrics = Object.fromEntries(Object.entries(inv.metrics).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
   const metricCount = Object.keys(metrics).length;
 
   const payload = {
@@ -72,11 +86,15 @@ export async function runDiscoverMetrics(args: DiscoverMetricsArgs): Promise<voi
     daSource,
     from,
     metricCount,
+    queries: inv.queries,
+    capped: inv.capped,
     metrics,
+    entities: Object.fromEntries(Object.keys(metrics).map((k) => [k, entities[k] ?? 0])),
   };
   const outPath = join(outDir, 'live-metrics.json');
   await writeFile(outPath, JSON.stringify(payload, null, 2));
 
-  console.log(`  ${metricCount} distinct live metric keys`);
+  console.log(`  ${metricCount} distinct live metric keys (${inv.queries} queries)`);
+  if (inv.capped.length) console.log(`  ${inv.capped.length} key(s) over ${SERIES_CAP} series, counted at the cap: ${inv.capped.join(', ')}`);
   console.log(`Wrote ${outPath}`);
 }

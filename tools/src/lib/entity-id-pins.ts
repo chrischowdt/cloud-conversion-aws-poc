@@ -83,9 +83,10 @@ function findHits(q: string, mask: boolean[]): Hit[] {
     const close = closingParen(q, mask, open);
     if (close < 0) continue;
     const args = q.slice(m.index + m[0].length, close);
-    // Pure id lists only: `"A", "B"` or `array("A", "B")`. A variable or a call
-    // in the list means we do not understand the filter, so we leave it alone.
-    const leftover = args.replace(ID_LITERAL, '').replace(/array\s*\(/g, '').replace(/[\s,()]/g, '');
+    // Pure id lists only: `"A", "B"`, `array("A", "B")` or `{ "A", "B" }` (the
+    // brace form: EAI DocDB, alert batch 21 prepare). A variable or a call in
+    // the list means we do not understand the filter, so we leave it alone.
+    const leftover = args.replace(ID_LITERAL, '').replace(/array\s*\(/g, '').replace(/[\s,(){}]/g, '');
     const ids = [...args.matchAll(ID_LITERAL)].map((x) => x[1]!);
     if (leftover !== '' || ids.length === 0) continue;
     hits.push({

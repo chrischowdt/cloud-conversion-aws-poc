@@ -29,7 +29,9 @@ import { entityCandidatesPathIfPresent } from '../lib/entity-candidates.ts';
 import { loadRecipeIndex } from '../lib/recipe-lookup.ts';
 import { isBlockingWarning } from '../lib/dql-rewriter.ts';
 import { lintAsset } from '../lib/output-lint.ts';
-import { rewriteDetector, detectorQuery } from '../lib/detector-rewrite.ts';
+import { rewriteDetector, detectorQuery, type DetectorRewriteResult } from '../lib/detector-rewrite.ts';
+import { applySourceBinding, DAVIS_SERIES_CAP, resolveBinding } from '../lib/detector-binding.ts';
+import { DqlClient } from '../dynatrace/dql.ts';
 import {
   buildDetectorNotebook,
   chunk,
@@ -76,6 +78,8 @@ export interface StageDetectorsArgs {
   mappingPath?: string;
   liveMetricsPath?: string;
   minOverrideSeries?: number;
+  /** Add the series' own entity to unbound alerts after a grain check on the tenant. Default on. */
+  bindEntities?: boolean;
 }
 
 interface ManifestEntry {
@@ -91,6 +95,67 @@ const notebookUiUrl = (baseUrl: string, id: string) =>
 function bucketOf(warnings: { kind: any }[]): ReviewBucket {
   if (warnings.some((w) => isBlockingWarning(w.kind))) return 'blocked';
   return warnings.length ? 'soft' : 'clean';
+}
+
+/** Days of data the binding check compares over (sparse alert metrics need more than the alert's window). */
+const BINDING_CHECK_DAYS = 7;
+
+async function bindEntities(
+  scoped: DetectorReviewItem[],
+  rewrites: Map<string, DetectorRewriteResult>,
+  args: StageDetectorsArgs,
+): Promise<void> {
+  const dql = new DqlClient({ baseUrl: args.baseUrl, token: args.token });
+  const end = new Date();
+  const start = new Date(end.getTime() - BINDING_CHECK_DAYS * 864e5);
+  const count = async (q: string): Promise<number> => {
+    const r = await dql.query({
+      query: q,
+      defaultTimeframeStart: start.toISOString(),
+      defaultTimeframeEnd: end.toISOString(),
+      // One past the cap is enough to know a split is too big for Davis.
+      maxResultRecords: DAVIS_SERIES_CAP + 1,
+      fetchTimeoutSeconds: 120,
+    });
+    return (r.records ?? []).length;
+  };
+  const tally: Record<string, number> = {};
+  const queue = [...scoped];
+  const worker = async () => {
+    for (let it = queue.shift(); it; it = queue.shift()) {
+      const r = rewrites.get(it.objectId);
+      if (!r?.query) continue;
+      const out = await resolveBinding(r.query.rewritten, count, `the last ${BINDING_CHECK_DAYS} days`);
+      tally[out.kind] = (tally[out.kind] ?? 0) + 1;
+      if (out.query) {
+        applySourceBinding(r, out.query, out.note!);
+        it.rewritten = r.query.rewritten;
+        it.targetDim = r.targetDim;
+        it.eventTemplateChanges = r.eventTemplateChanges;
+        it.bindingNote = out.note;
+        it.lint = lintAsset({ query: it.rewritten })
+          .filter((f) => f.severity === 'blocking')
+          .map((f) => ({ ruleId: f.ruleId, message: f.message, fix: f.fix }));
+      }
+      if (out.warning) {
+        it.warnings = [...it.warnings, out.warning];
+        it.bucket = bucketOf(it.warnings);
+      }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  const say = (k: string, label: string) => (tally[k] ? `${tally[k]} ${label}` : '');
+  console.log(
+    `Entity binding: ${[
+      say('already', 'already bound'),
+      say('bound', 'bound, grain unchanged'),
+      say('per-entity', 'bound per resource (threshold to check)'),
+      say('unverified', 'bound without data to check the grain'),
+      say('too-many', `left unbound: over ${DAVIS_SERIES_CAP} series`),
+      say('skipped', 'not bindable automatically'),
+      say('error', 'check failed'),
+    ].filter(Boolean).join(', ') || 'nothing to check'}.`,
+  );
 }
 
 export async function runStageDetectors(args: StageDetectorsArgs): Promise<void> {
@@ -178,6 +243,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
 
   // Rewrite every AWS detector; keep the ones in the wanted buckets.
   const items: DetectorReviewItem[] = [];
+  const rewrites = new Map<string, DetectorRewriteResult>();
   let skippedStaged = 0;
   let unreadable = 0;
   for (const o of objects) {
@@ -196,6 +262,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
     if (!r.query) continue;
     const bucket = bucketOf(r.warnings);
     if (!wantBuckets.has(bucket)) continue;
+    rewrites.set(o.objectId, r);
     items.push({
       objectId: o.objectId,
       title: (o.value?.title as string) ?? o.summary ?? o.objectId,
@@ -309,6 +376,11 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
   }
 
   const scoped = args.limit ? items.slice(0, args.limit) : items;
+
+  // Attach each alert to its entity where the classic query never named one
+  // (lib/detector-binding.ts). Only for what is being staged: it runs each
+  // candidate on the tenant, read-only, in prepare mode too.
+  if (args.bindEntities !== false) await bindEntities(scoped, rewrites, args);
 
   // Group by the team prefix detector titles already carry ("CWE - Lambda
   // Timeout is High"). 629 of the 807 AWS detectors have one, so this makes each

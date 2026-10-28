@@ -23,10 +23,16 @@ export interface LiveMetricsIndex {
   byKey: Map<string, number>;
   /** base (`cloud.aws.<svc>.<Metric>`, i.e. up to `.By.`) → variant keys. */
   byBase: Map<string, string[]>;
+  /**
+   * metric.key → distinct `dt.smartscape_source.id`: the resources a variant
+   * covers. Absent in inventories written before 2026-10-27.
+   */
+  entities?: Map<string, number>;
 }
 
 interface LiveMetricsFile {
   metrics: Record<string, number>;
+  entities?: Record<string, number>;
 }
 
 /** Strip the `.By.<Dim>[.<Dim>…]` suffix, leaving `cloud.aws.<svc>.<Metric>`. */
@@ -46,7 +52,8 @@ export async function loadLiveMetrics(path: string): Promise<LiveMetricsIndex> {
     if (!byBase.has(base)) byBase.set(base, []);
     byBase.get(base)!.push(key);
   }
-  return { byKey, byBase };
+  const entities = file.entities ? new Map(Object.entries(file.entities)) : undefined;
+  return { byKey, byBase, entities };
 }
 
 /**

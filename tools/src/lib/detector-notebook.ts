@@ -42,6 +42,8 @@ export interface DetectorReviewItem {
    * warning, the query here is known-bad rather than merely unverified.
    */
   lint?: Array<{ ruleId: string; message: string; fix?: string }>;
+  /** Set when the stager added the entity to the split (`detector-binding.ts`). */
+  bindingNote?: string;
 }
 
 /** Minimal notebook `content` shape the Document Service accepts (`type: notebook`). */
@@ -158,6 +160,7 @@ export function buildDetectorMarkdown(item: DetectorReviewItem): string {
   lines.push(`\`detector ${item.objectId}\``);
   lines.push('');
   if (item.nodeType) lines.push(`**Resolved node:** \`${item.nodeType}\` (\`${item.targetDim}\`)`);
+  if (item.bindingNote) lines.push(`**Alert binding:** ${item.bindingNote}`);
   lines.push(thresholdLine(item.thresholdAction));
   if (item.eventTemplateChanges.length) {
     // The notebook carries the QUERY only — the event template lives in the

@@ -17,6 +17,15 @@ The rules this migration runs by. Most came from something going wrong once. If 
 
   Names outside the convention fall back to the downloaded zone rules. If neither works, the filter stays blocked.
 - **Classic entity ids don't exist on the new side.** A query pinned to one resource by id is re-pinned by its **ARN**, which every classic entity, new metric series and new entity carries.
+- **An alert must attach to an entity, or it reaches the incident tool with none, and Dynatrace can't correlate it.** Many classic AWS alerts split by the resource's own dimensions (cluster name, queue name), so their translation has no entity column. The stager adds the series' own entity, `dt.smartscape_source.id`, to the split.
+  - It checks the series count with and without it. Adding a dimension can only split groups, so an unchanged count means the alert's grain is unchanged.
+  - **If the count grows,** the classic alert combined several resources into one series. The entity is added anyway, so the alert now fires per resource, and the card asks the reviewer to check the threshold. Reviewers chose per resource every time this came up, and an entity on every alert is the goal.
+  - It is left out only when the split would pass Davis's limit of 10,000 series per detector (beyond it, new series are silently not monitored), or when the query's shape can't be edited safely.
+  - Every new AWS series of a resource service carries `dt.smartscape_source.id`, at the metric's own grain (an RDS cluster metric points at the cluster), so no entity type has to be guessed.
+  - **The event property must name a column the query emits:** `{dt.smartscape_source.id}` with that dimension in the split. The same property without it bound no events at all. Watch for the alias form `by:{dt.smartscape_source.id = dt.smartscape.X}`: the column it emits is `dt.smartscape_source.id`, so a `{dt.smartscape.X}` property binds nothing.
+- **Use the metric variant that covers the resources.** A metric often exists in several dimension variants, and the mapping names one of them. If a sibling the query can use unchanged covers at least twice as many resources on the environment, the translation uses the sibling and the card says so. Cluster vs instance variants are never swapped this way; that's a grain decision.
+- **Inside a metric query, filter on the metric's own dimensions.** Reading an entity's name there (`getNodeName(...)` in a `timeseries` filter) looks up every entity of the type and fails on longer timeframes. The series already carry the resource name as a dimension, measured equal to the entity name for each type it's used for. After the `timeseries`, only the columns in its split exist, so tag filters there read the entity's tags instead.
+- **Inventories must be complete.** `fetch metric.series` stops at 100,000 series without saying so. `discover-metrics` splits by key prefix until every part is under the cap, because a key missing from a truncated inventory looks "not collected" and steers the translation to the wrong metric variant.
 
 ## How assets are published
 

@@ -155,6 +155,27 @@ describe('rewriteDetector — eventTemplate binding sync', () => {
     assert.equal(props.find((p) => p.key === 'dt.smartscape_source.id')!.value, '{dt.smartscape.aws_rds_dbinstance}');
   });
 
+  it('binds to the column the split emits: an alias, or a native source id', () => {
+    // 32 Lower alerts (2026-10-27): DSC/UDH MSK with the alias split and a
+    // {dt.smartscape.aws_msk_cluster} property; EPI Step Functions with no property.
+    const alias = detector({
+      query: 'timeseries v = avg(cloud.aws.kafka.CpuSystem.By.Broker_ID.Cluster_Name), by:{aws.region, dt.smartscape_source.id = dt.smartscape.aws_msk_cluster}',
+      template: [{ key: 'dt.smartscape_source.id', value: '{dt.smartscape.aws_msk_cluster}' }],
+    });
+    const a = rewriteDetector(alias, buildIndex([]));
+    const ap = (a.rewrittenValue.eventTemplate as any).properties as Array<{ key: string; value: string }>;
+    assert.equal(ap.find((p) => p.key === 'dt.smartscape_source.id')!.value, '{dt.smartscape_source.id}');
+
+    const native = detector({
+      query: 'timeseries v = sum(cloud.aws.states.ExecutionsFailed.By.StateMachineArn), by:{StateMachineArn, dt.smartscape_source.id}',
+      template: [{ key: 'event.name', value: 'Executions failed' }],
+    });
+    const n = rewriteDetector(native, buildIndex([]));
+    const np = (n.rewrittenValue.eventTemplate as any).properties as Array<{ key: string; value: string }>;
+    assert.equal(np.find((p) => p.key === 'dt.smartscape_source.id')!.value, '{dt.smartscape_source.id}');
+    assert.deepEqual(n.eventTemplateChanges, [{ field: 'dt.smartscape_source.id', before: '(absent)', after: '{dt.smartscape_source.id}' }]);
+  });
+
   it('flags (does not guess) when the query did not resolve to a smartscape dim', () => {
     // A non-AWS entity query: custom_device stays, no dt.smartscape.<type> emitted.
     const v = detector({

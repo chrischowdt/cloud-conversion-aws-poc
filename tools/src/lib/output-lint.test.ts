@@ -42,6 +42,17 @@ describe('output-lint — shapes proven to return nothing', () => {
     );
   });
 
+  it('blocks expanding the tag record of an AWS smartscapeNodes query', () => {
+    // The published EA Infra Dashboard variable: 0 values where classic offered 445.
+    const q =
+      'smartscapeNodes AWS_ELASTICLOADBALANCINGV2_LOADBALANCER\n| expand appci = tags\n| filter contains(appci, "ApplicationCI")\n' +
+      '| fieldsAdd applicationci = (splitString(appci,":"))[1]\n| dedup applicationci';
+    assert.ok(ids(q).includes('tags-record-treated-as-array'));
+    assert.ok(ids('smartscapeNodes AWS_SQS_QUEUE | expand tags').includes('tags-record-treated-as-array'));
+    // The key read is the correct form.
+    assert.ok(!ids('smartscapeNodes AWS_ELASTICLOADBALANCINGV2_LOADBALANCER | fields applicationci = tags[ApplicationCI] | dedup applicationci').includes('tags-record-treated-as-array'));
+  });
+
   it('blocks the emr_ec2 namespace the connection never emits', () => {
     assert.ok(ids('timeseries v=avg(`cloud.aws.emr_ec2.HDFSUtilization.By.JobFlowId`)').includes('emr-ec2-namespace'));
   });
@@ -169,6 +180,8 @@ describe('classic-entity-id-vs-smartscape-dim', () => {
     assert.equal(fires('| filter dt.smartscape.aws_ec2_instance != "HOST-0123456789ABCDEF"'), true);
     assert.equal(fires('| filter in(dt.smartscape.aws_ec2_instance, "HOST-0123456789ABCDEF")'), true);
     assert.equal(fires('| filter toString(dt.smartscape.aws_ec2_instance) == "HOST-0123456789ABCDEF"'), true);
+    // The brace-set form (EAI DocDB, batch 21 prepare): staged as soft, returned nothing.
+    assert.equal(fires('| filter in(toString(dt.smartscape.aws_docdb_dbcluster), { "CUSTOM_DEVICE-6358AFB836FFAF55", "CUSTOM_DEVICE-7CB3F03A6CF85AC9" })'), true);
   });
 
   it('passes a Smartscape id literal, which IS in the right id space', () => {

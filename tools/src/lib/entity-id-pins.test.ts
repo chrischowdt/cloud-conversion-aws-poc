@@ -207,3 +207,38 @@ describe('Pass 1.52 through rewriteDql', () => {
     assert.equal(lintAsset({ query: r.rewritten }).some((f) => f.ruleId === 'classic-entity-id-vs-smartscape-dim'), true);
   });
 });
+
+describe('alert batch 21 prepare (2026-10-27): brace lists and the pinned grain', () => {
+  const C1 = 'CUSTOM_DEVICE-6358AFB836FFAF55';
+  const C2 = 'CUSTOM_DEVICE-7CB3F03A6CF85AC9';
+  const cluster = (n: string) => `arn:aws:rds:us-east-1:560380317052:cluster:${n}`;
+  const entityArns: EntityArnIndex = new Map([
+    [C1, { arn: cluster('eai-green-docdbcluster'), name: 'eai-green-docdbcluster', type: 'custom_device' }],
+    [C2, { arn: cluster('eai-db'), name: 'eai-db', type: 'custom_device' }],
+  ]);
+  const live = (keys: string[]) => {
+    const byBase = new Map<string, string[]>();
+    for (const k of keys) {
+      const b = k.slice(0, k.indexOf('.By.'));
+      byBase.set(b, [...(byBase.get(b) ?? []), k]);
+    }
+    return { byKey: new Map(keys.map((k) => [k, 10] as [string, number])), byBase };
+  };
+
+  it('converts in(dim, { ids }) and moves an instance variant to the pinned cluster grain', () => {
+    const idx = {
+      byClassicId: new Map([['cloud.aws.docdb.index_buffer_cache_hit_ratio', { classicMetricId: 'cloud.aws.docdb.index_buffer_cache_hit_ratio', newDtMetricKey: 'cloud.aws.docdb.IndexBufferCacheHitRatio.By.DBInstanceIdentifier', service: 'docdb' }]]),
+      byDqlClassicKey: new Map(),
+      entityArns,
+      liveMetrics: live(['cloud.aws.docdb.IndexBufferCacheHitRatio.By.DBInstanceIdentifier', 'cloud.aws.docdb.IndexBufferCacheHitRatio.By.DBClusterIdentifier']),
+    } as unknown as RecipeIndex;
+    const r = rewriteDql(
+      `timeseries v = avg(cloud.aws.docdb.index_buffer_cache_hit_ratio), by: { dt.entity.custom_device }, interval: 1m\n| filter in(dt.entity.custom_device, { "${C1}", "${C2}" })`,
+      idx,
+    );
+    assert.match(r.rewritten, /in\(aws\.arn, array\("arn:aws:rds:us-east-1:560380317052:cluster:eai-green-docdbcluster"/);
+    assert.match(r.rewritten, /IndexBufferCacheHitRatio\.By\.DBClusterIdentifier`/);
+    assert.doesNotMatch(r.rewritten, /By\.DBInstanceIdentifier/);
+    assert.doesNotMatch(r.rewritten, /aws_docdb_dbinstance/);
+  });
+});

@@ -1670,26 +1670,42 @@ describe('rewriteDql — enriched tag reads become native metric dimensions', ()
     return idx as RecipeIndex;
   };
 
-  it('swaps a case-mismatched tag read for the native dim (the null-filter bug)', () => {
+  it('swaps a case-mismatched tag read for the native dim inside the timeseries (the null-filter bug)', () => {
     // tags:aws[applicationci] returns null on this tenant — the resources are
     // tagged ApplicationCI — so the filter silently matched nothing.
     const r = rewriteDql(
-      'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}\n' +
-        '| filter getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci] == "dys"',
+      'timeseries v=avg(cloud.aws.rds.deadlocks, filter:{ getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci] == "dys" }), by:{dt.entity.custom_device}',
       withTags()
     );
     assert.ok(r.rewritten.includes('`aws.tags.applicationci` == "dys"'), r.rewritten);
     assert.ok(!r.rewritten.includes('"tags:aws")[applicationci]'));
   });
 
-  it('swaps a display read too — a null column is just as wrong as a null filter', () => {
-    const r = rewriteDql(
+  it('after the timeseries keeps the node read, re-cased — the dim is not a column there', () => {
+    // nic55601 2026-10-27: `by:{<node>} | filter `aws.tags.applicationci` == …`
+    // fails "The field aws.tags.applicationci doesn't exist".
+    const filter = rewriteDql(
+      'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}\n' +
+        '| filter getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci] == "dys"',
+      withTags()
+    );
+    assert.ok(filter.rewritten.includes('"tags:aws")[ApplicationCI] == "dys"'), filter.rewritten);
+    assert.ok(!filter.rewritten.includes('`aws.tags.applicationci`'));
+    const display = rewriteDql(
       'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}\n' +
         '| fieldsAdd appci = getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci]',
       withTags()
     );
-    // the assignment keeps its own column name — nothing downstream is renamed
-    assert.ok(r.rewritten.includes('appci = `aws.tags.applicationci`'), r.rewritten);
+    assert.ok(display.rewritten.includes('appci = getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[ApplicationCI]'), display.rewritten);
+  });
+
+  it('after the timeseries uses the dim when the split carries it', () => {
+    const r = rewriteDql(
+      'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device, aws.tags.applicationci}\n' +
+        '| filter getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci] == "dys"',
+      withTags()
+    );
+    assert.ok(r.rewritten.includes('| filter `aws.tags.applicationci` == "dys"'), r.rewritten);
   });
 
   it('leaves a tag the tenant does NOT enrich as an entity lookup', () => {
@@ -1754,8 +1770,7 @@ describe('rewriteDql — enriched tag dims are AWS-metric only', () => {
 
   it('still substitutes on an AWS metric', () => {
     const r = rewriteDql(
-      'timeseries v=avg(cloud.aws.rds.deadlocks), by:{dt.entity.custom_device}\n' +
-        '| filter getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci] == "dys"',
+      'timeseries v=avg(cloud.aws.rds.deadlocks, filter:{ getNodeField(dt.smartscape.aws_rds_dbinstance, "tags:aws")[applicationci] == "dys" }), by:{dt.entity.custom_device}',
       withTags()
     );
     assert.ok(r.rewritten.includes('`aws.tags.applicationci` == "dys"'), r.rewritten);
@@ -2364,5 +2379,131 @@ describe('tag keys are read with the casing resources actually use', () => {
   it('leaves an unmeasured key exactly as written', () => {
     const r = rewriteDql(q('CostCentre:1234'), buildIndex([]));
     assert.match(r.rewritten, /tags\[CostCentre\]/);
+  });
+});
+
+describe('Pass 1.57 — the metric variant that covers the resources', () => {
+  // nic55601 2026-10-27, distinct dt.smartscape_source.id over 3 days.
+  const live = (entities: Record<string, number>) => {
+    const byBase = new Map<string, string[]>();
+    for (const k of Object.keys(entities)) {
+      const b = k.slice(0, k.indexOf('.By.'));
+      byBase.set(b, [...(byBase.get(b) ?? []), k]);
+    }
+    return { byKey: new Map(Object.keys(entities).map((k) => [k, 10] as [string, number])), byBase, entities: new Map(Object.entries(entities)) };
+  };
+  const idx = (classic: string, mapped: string, entities: Record<string, number>) => ({
+    ...buildIndex([{ classicMetricId: classic, newDtMetricKey: mapped, service: 'x' } as any]),
+    liveMetrics: live(entities),
+  });
+
+  it('moves to a finer variant that covers far more resources', () => {
+    const r = rewriteDql(
+      'timeseries val = avg(cloud.aws.es.cpu_utilization_maximum_by_client_id), interval:1m, by:{dt.entity.custom_device}',
+      idx('cloud.aws.es.cpu_utilization_maximum_by_client_id', 'cloud.aws.es.CPUUtilization.By.ClientId.DomainName', {
+        'cloud.aws.es.CPUUtilization.By.ClientId.DomainName': 8,
+        'cloud.aws.es.CPUUtilization.By.ClientId.DomainName.NodeId': 92,
+      }),
+    );
+    assert.match(r.rewritten, /CPUUtilization\.By\.ClientId\.DomainName\.NodeId/);
+    assert.ok(r.warnings.some((w) => w.kind === 'dim-variant-override' && /8 resource\(s\) and this one 92/.test(w.text)));
+  });
+
+  it('moves to a coarser variant only when the query never uses the dropped dimensions', () => {
+    const entities = {
+      'cloud.aws.apigateway.Latency.By.ApiName.Method.Resource.Stage': 20,
+      'cloud.aws.apigateway.Latency.By.ApiName.Stage': 118,
+    };
+    const ix = idx('cloud.aws.apigateway.latency', 'cloud.aws.apigateway.Latency.By.ApiName.Method.Resource.Stage', entities);
+    const unused = rewriteDql('timeseries l = avg(cloud.aws.apigateway.latency), by:{aws.account.id, aws.region, ApiName}', ix);
+    assert.match(unused.rewritten, /Latency\.By\.ApiName\.Stage\b(?!\.)/);
+    const used = rewriteDql('timeseries l = avg(cloud.aws.apigateway.latency), by:{ApiName, Resource}', ix);
+    assert.match(used.rewritten, /Latency\.By\.ApiName\.Method\.Resource\.Stage/, 'Resource is split on, so the coarser variant cannot serve');
+  });
+
+  it('needs at least twice the resources, and never touches instance vs cluster', () => {
+    const near = rewriteDql(
+      'timeseries v = avg(cloud.aws.es.free_storage_space)',
+      idx('cloud.aws.es.free_storage_space', 'cloud.aws.es.FreeStorageSpace.By.ClientId.DomainName', {
+        'cloud.aws.es.FreeStorageSpace.By.ClientId.DomainName': 8,
+        'cloud.aws.es.FreeStorageSpace.By.ClientId.DomainName.NodeId': 12,
+      }),
+    );
+    assert.match(near.rewritten, /FreeStorageSpace\.By\.ClientId\.DomainName`?\)/);
+    const rds = rewriteDql(
+      'timeseries v = avg(cloud.aws.rds.deadlocks)',
+      idx('cloud.aws.rds.deadlocks', 'cloud.aws.rds.Deadlocks.By.DBClusterIdentifier', {
+        'cloud.aws.rds.Deadlocks.By.DBClusterIdentifier': 83,
+        'cloud.aws.rds.Deadlocks.By.DBInstanceIdentifier': 400,
+      }),
+    );
+    assert.match(rds.rewritten, /Deadlocks\.By\.DBClusterIdentifier/);
+  });
+
+  it('does nothing without entity counts (older inventories)', () => {
+    const ix = idx('cloud.aws.es.cpu', 'cloud.aws.es.CPUUtilization.By.ClientId.DomainName', {
+      'cloud.aws.es.CPUUtilization.By.ClientId.DomainName': 8,
+      'cloud.aws.es.CPUUtilization.By.ClientId.DomainName.NodeId': 92,
+    });
+    delete (ix.liveMetrics as any).entities;
+    assert.match(rewriteDql('timeseries v = avg(cloud.aws.es.cpu)', ix).rewritten, /DomainName`?\)/);
+  });
+});
+
+describe('Pass 2.52 — a node name inside a timeseries reads the metric dimension', () => {
+  const ix = (classic: string, key: string) => buildIndex([{ classicMetricId: classic, newDtMetricKey: key, service: 'x' } as any]);
+
+  it('filters on the series name dimension instead of looking up every node', () => {
+    // nic55601: getNodeName == FunctionName on 5,027 of 5,027 series; the node
+    // lookup failed at 24h ("subquery read too much data").
+    const r = rewriteDql(
+      'timeseries e = sum(cloud.aws.lambda.errors_sum, filter:{ startsWith(entityName(dt.entity.custom_device), "edk") }), by:{dt.entity.custom_device}\n| fieldsAdd n = entityName(dt.entity.custom_device)',
+      ix('cloud.aws.lambda.errors_sum', 'cloud.aws.lambda.Errors.By.FunctionName'),
+    );
+    assert.match(r.rewritten, /filter:\{ startsWith\(FunctionName, "edk"\) \}/);
+    assert.match(r.rewritten, /by:\{dt\.smartscape\.aws_lambda_function\}/);
+    assert.match(r.rewritten, /\| fieldsAdd n = getNodeName\(dt\.smartscape\.aws_lambda_function\)/, 'after the timeseries the node read is cheap and stays');
+  });
+
+  it('uses the spaced MSK column, and field reads of "name" too', () => {
+    const r = rewriteDql(
+      'timeseries o = max(cloud.aws.kafka.offline_partitions_count, filter:{ contains(lower(entityAttr(dt.entity.custom_device, "name")), "cpn") }), by:{dt.entity.custom_device}',
+      ix('cloud.aws.kafka.offline_partitions_count', 'cloud.aws.kafka.OfflinePartitionsCount.By.Cluster_Name'),
+    );
+    assert.match(r.rewritten, /contains\(lower\(`Cluster Name`\), "cpn"\)/);
+  });
+
+  it('leaves types whose node name is not the dimension, and authors\' own reads', () => {
+    const kinesis = rewriteDql(
+      'timeseries v = avg(cloud.aws.kinesis.incoming_records, filter:{ contains(entityName(dt.entity.custom_device), "ecp") }), by:{dt.entity.custom_device}',
+      ix('cloud.aws.kinesis.incoming_records', 'cloud.aws.kinesis.IncomingRecords.By.StreamName'),
+    );
+    assert.doesNotMatch(kinesis.rewritten, /contains\(StreamName/, 'kinesis node names are ARNs');
+    const own = 'timeseries e = sum(`cloud.aws.lambda.Errors.By.FunctionName`, filter:{ startsWith(getNodeName(dt.smartscape.aws_lambda_function), "edk") }), by:{dt.smartscape.aws_lambda_function}';
+    assert.equal(rewriteDql(own, buildIndex([])).rewritten, own);
+  });
+});
+
+describe('alert batch 21-26 prepare findings (2026-10-27)', () => {
+  it('does not create dt.smartscape_source.id twice when the author already set it', () => {
+    const q =
+      'timeseries util = max(cloud.aws.dynamodb.AccountProvisionedWriteCapacityUtilization), interval:1m, by:{ aws.account.id } ' +
+      '| fieldsAdd dt.source_entity = acct_id, dt.smartscape_source.id = acct_id';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /\| fieldsAdd dt\.smartscape_source\.id = acct_id$/);
+    const other = rewriteDql('timeseries v = max(cloud.aws.x.Y.By.Z) | fieldsAdd dt.smartscape_source.id = a, dt.source_entity = a', buildIndex([]));
+    assert.match(other.rewritten, /\| fieldsAdd dt\.smartscape_source\.id = a$/);
+  });
+
+  it('reads a classic tag filter after the timeseries from the node record, not a missing dim', () => {
+    const idx = buildIndex([{ classicMetricId: 'cloud.aws.kafka.max_offset_lag_sum_by_consumer_group_topic', newDtMetricKey: 'cloud.aws.kafka.MaxOffsetLag.By.Cluster_Name.Consumer_Group.Topic', service: 'kafka' } as any]) as any;
+    idx.enrichedTags = new Set(['applicationci', 'env']);
+    const r = rewriteDql(
+      'timeseries val = avg(cloud.aws.kafka.max_offset_lag_sum_by_consumer_group_topic), interval:1m, by:{ dt.entity.custom_device, Topic}\n' +
+        '| fieldsAdd entityAttr(dt.entity.custom_device, "tags")\n' +
+        '| filter in(dt.entity.custom_device.tags, "[AWS]env:qa")',
+      idx,
+    );
+    assert.doesNotMatch(r.rewritten, /\| filter `aws\.tags\.env`/, r.rewritten);
   });
 });
