@@ -142,7 +142,7 @@ That creates `[MIGRATION REVIEW] AWS alerts — batch-NN` notebooks (25 alerts e
   `--no-bind-entities` skips it.
 - **Before applying,** run a few prepared queries yourself. An empty result where the classic query has data is usually a metric that isn't collected in that account (add it to the AWS connection), not a translation mistake.
 - `--group-by-team` batches by the team prefix in the alert title instead.
-- `--restage` re-renders existing batches in place. It overwrites the tiles, so only use it on batches nobody has started.
+- `--restage` brings tool fixes to batches already out for review, in place (same notebook, link and sharing). It replaces only alerts nobody has touched: the card, query and verdict tiles must still be exactly as the tool last wrote them, and the alert's tracker row must have no decision, reviewer or notes. Everything else is kept as the reviewer left it. Prepare first; `--batches batch-14,batch-15` limits it. Snapshots go to `migration/detector-review/pre-restage/`.
 
 > ⚠️ **Publishing approved alerts is not built yet.** `stage-detectors` mentions `migrate-pull-detectors` / `migrate-promote-detectors`; those commands do not exist. Approved alerts currently stay at *Ready To Publish* in the tracker.
 

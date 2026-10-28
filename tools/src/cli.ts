@@ -239,6 +239,9 @@ COMMANDS
                     split. A read-only 7-day series count decides the card text:
                     unchanged, or per resource (threshold to check). Left
                     unbound only past 10,000 series. --no-bind-entities skips it.
+                    --restage [--batches batch-14,batch-15] brings today's
+                    conversion to published notebooks, replacing only cards
+                    still exactly as staged with nothing on the tracker.
   migrate-pull      Fetch the human-fixed review copies (Document API) into
                     migration/reviewed/ and mark rows in-review. Needs the admin
                     token. Flags: --ids, --limit, --tracker.
@@ -721,6 +724,7 @@ async function main(): Promise<void> {
         noShare: args.flags.get('no-share') === true,
         groupByTeam: args.flags.get('group-by-team') === true,
         restage: args.flags.get('restage') === true,
+        batches: getString(args.flags, 'batches')?.split(',').map((s) => s.trim()).filter(Boolean),
         shareGroupId: getString(args.flags, 'share-group') ?? process.env.DT_SHARE_GROUP_ID,
         batchSize: getNumber(args.flags, 'batch-size'),
         buckets: bucketsFlag

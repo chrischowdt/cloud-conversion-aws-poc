@@ -31,6 +31,7 @@ import { isBlockingWarning } from '../lib/dql-rewriter.ts';
 import { lintAsset } from '../lib/output-lint.ts';
 import { rewriteDetector, detectorQuery, type DetectorRewriteResult } from '../lib/detector-rewrite.ts';
 import { applySourceBinding, DAVIS_SERIES_CAP, resolveBinding } from '../lib/detector-binding.ts';
+import { planRestage } from '../lib/detector-restage.ts';
 import { DqlClient } from '../dynatrace/dql.ts';
 import {
   buildDetectorNotebook,
@@ -52,12 +53,13 @@ export interface StageDetectorsArgs {
   /** Create the notebook(s) but skip sharing — for a private validation run. */
   noShare?: boolean;
   /**
-   * Re-render the notebooks already published (from the manifest) IN PLACE
-   * instead of creating new ones — the way to push improved conversions to a
-   * review notebook without changing its id, url, or shares. Keeps the SAME
-   * detector-to-batch assignment so reviewers don't lose their place.
+   * Push improved conversions into notebooks already published (from the
+   * manifest), IN PLACE: same id, url, shares and detector-to-batch assignment.
+   * Card by card: only a card nobody has touched is replaced (see restageCards).
    */
   restage?: boolean;
+  /** With --restage: only these batches (e.g. batch-14,batch-15). Default: every published batch. */
+  batches?: string[];
   /** Batch by the team prefix in each detector title instead of arbitrary runs of N. */
   groupByTeam?: boolean;
   batchSize?: number;
@@ -155,6 +157,97 @@ async function bindEntities(
       say('skipped', 'not bindable automatically'),
       say('error', 'check failed'),
     ].filter(Boolean).join(', ') || 'nothing to check'}.`,
+  );
+}
+
+/**
+ * --restage: bring today's conversion to published review notebooks, card by
+ * card (lib/detector-restage.ts). The base for each batch is the payload the
+ * tool last wrote, `<batch>.json`; a batch without one is skipped, since there
+ * is then no way to tell an untouched card from an edited one. The tracker is
+ * read, not written: placement doesn't change, and a reviewer may have it open.
+ */
+async function restageCards(
+  items: DetectorReviewItem[],
+  rewrites: Map<string, DetectorRewriteResult>,
+  args: StageDetectorsArgs,
+  reviewDir: string,
+  trackerPath: string,
+): Promise<void> {
+  const prior = JSON.parse(await readFile(join(reviewDir, 'manifest.json'), 'utf8')) as { batches?: ManifestEntry[] };
+  const wanted = args.batches?.length ? new Set(args.batches) : null;
+  const published = (prior.batches ?? []).filter((b) => b.notebookId && (!wanted || wanted.has(b.batch)));
+  if (!published.length) throw new Error('stage-detectors --restage: no published notebooks match.');
+
+  // A decision, reviewer or notes on the tracker row means a person has judged
+  // the card as it stands. An assignee alone is a plan, not a review.
+  const reviewed = new Set<string>();
+  try {
+    for (const [id, r] of await readRows(trackerPath, ALERTS_SHEET)) {
+      if (['decision', 'reviewer', 'notes'].some((k) => String(r[k] ?? '').trim())) reviewed.add(id);
+    }
+  } catch (e) {
+    throw new Error(`stage-detectors --restage: cannot read ${trackerPath} (${(e as Error).message.slice(0, 80)}) — it is how reviewed cards are kept.`);
+  }
+
+  const inScope = new Set(published.flatMap((b) => b.detectors.map((d) => d.objectId)));
+  const scoped = items.filter((it) => inScope.has(it.objectId));
+  if (args.bindEntities !== false) await bindEntities(scoped, rewrites, args);
+  const byId = new Map(scoped.map((it) => [it.objectId, it]));
+
+  const client = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
+  const totals: Record<string, number> = {};
+  for (const b of published) {
+    let base: { name: string; type: string; content: { sections: any[] } };
+    try {
+      base = JSON.parse(await readFile(join(reviewDir, `${b.batch}.json`), 'utf8'));
+    } catch {
+      console.log(`  - ${b.batch}: no saved payload to compare against — skipped`);
+      continue;
+    }
+    const fresh = new Map<string, any[]>();
+    for (const d of b.detectors) {
+      const it = byId.get(d.objectId);
+      if (it) fresh.set(d.objectId, buildDetectorNotebook(b.batch, [it]).sections.slice(1, 3));
+    }
+    const live = await client.getDocumentFull(b.notebookId!, true);
+    const liveContent = typeof live.content === 'string' ? JSON.parse(live.content) : live.content;
+    const { next, nextBase, plans } = planRestage(liveContent, base.content, fresh, b.detectors.map((d) => d.objectId), reviewed);
+    const count: Record<string, number> = {};
+    for (const p of plans) { count[p.action] = (count[p.action] ?? 0) + 1; totals[p.action] = (totals[p.action] ?? 0) + 1; }
+    const summary = Object.entries(count).map(([k, n]) => `${n} ${k}`).join(', ');
+    const restaged = plans.filter((p) => p.action === 'restage').map((p) => p.objectId);
+    if (!restaged.length) { console.log(`  = ${b.batch}: nothing to restage (${summary})`); continue; }
+    if (!args.apply) {
+      await writeFile(join(reviewDir, `${b.batch}.restage.json`), JSON.stringify({ name: live.metadata.name, type: 'notebook', content: next }, null, 2));
+      console.log(`  · ${b.batch}: would restage ${restaged.length} card(s) in ${b.notebookId} v${live.metadata.version} (${summary})`);
+      continue;
+    }
+    try {
+      await mkdir(join(reviewDir, 'pre-restage'), { recursive: true });
+      await writeFile(join(reviewDir, 'pre-restage', `${b.notebookId}.v${live.metadata.version}.json`), JSON.stringify(live, null, 2));
+      await client.updateContent(b.notebookId!, { name: live.metadata.name, type: 'notebook', content: next, version: live.metadata.version, adminAccess: true });
+      // Prove it: every section outside the restaged cards is byte-identical.
+      const back = await client.getDocumentFull(b.notebookId!, true);
+      const bc = typeof back.content === 'string' ? JSON.parse(back.content) : back.content;
+      const touchedIds = new Set(restaged.flatMap((id) => [`md-${id}`, `dql-${id}`]));
+      const othersSame = liveContent.sections.every((s: any) => touchedIds.has(s.id) || JSON.stringify(bc.sections.find((x: any) => x.id === s.id)) === JSON.stringify(s));
+      const written = next.sections.every((s: any) => !touchedIds.has(s.id) || JSON.stringify(bc.sections.find((x: any) => x.id === s.id)) === JSON.stringify(s));
+      await writeFile(join(reviewDir, `${b.batch}.json`), JSON.stringify({ ...base, content: nextBase }, null, 2));
+      console.log(
+        `  ✓ ${b.batch}: restaged ${restaged.length} card(s), v${live.metadata.version} → v${back.metadata.version} (${summary}); ` +
+          `written: ${written}; every other section identical: ${othersSame && bc.sections.length === liveContent.sections.length}`
+      );
+    } catch (e) {
+      const msg = e instanceof DocumentApiError ? `HTTP ${e.status}: ${e.body.slice(0, 120)}` : (e as Error).message;
+      console.log(`  ! ${b.batch}: restage failed — ${msg}`);
+    }
+  }
+  console.log(
+    `\n${args.apply ? 'Restaged' : 'Would restage'} ${totals.restage ?? 0} card(s) across ${published.length} notebook(s); ` +
+      `kept ${(totals.edited ?? 0) + (totals.reviewed ?? 0)} a reviewer touched, ${totals.current ?? 0} already current, ` +
+      `${(totals.missing ?? 0) + (totals.unresolved ?? 0)} not comparable.` +
+      (args.apply ? '' : ` Proposed notebooks: ${reviewDir}/<batch>.restage.json; no writes made. Re-run with --apply.`)
   );
 }
 
@@ -302,76 +395,8 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
     return;
   }
 
-  // --restage: rebuild exactly the batches already published, from the manifest,
-  // so a notebook keeps its id/url/shares and its reviewers keep their place.
   if (args.restage) {
-    const prior = JSON.parse(await readFile(join(reviewDir, 'manifest.json'), 'utf8')) as {
-      batches?: ManifestEntry[];
-    };
-    const published = (prior.batches ?? []).filter((b) => b.notebookId);
-    if (!published.length) throw new Error('stage-detectors --restage: no published notebooks in the manifest.');
-    const byId = new Map(items.map((it) => [it.objectId, it]));
-    const client2 = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
-    const restageTrackerRows: TrackerRow[] = [];
-    let updated = 0;
-    for (const b of published) {
-      const batch = b.detectors.map((d) => byId.get(d.objectId)).filter((x): x is DetectorReviewItem => !!x);
-      if (!batch.length) {
-        console.log(`  - ${b.batch}: no detectors resolve (bucket filter?) — skipped`);
-        continue;
-      }
-      const content = buildDetectorNotebook(`${b.batch} of ${published.length}`, batch);
-      // Same name the batch was created with. Adding "of N" here used to be
-      // ignored by the API; now that renames take effect it would rename every
-      // review notebook on each restage, and again whenever a batch is added.
-      const name = `[MIGRATION REVIEW] AWS alerts — ${b.batch}`;
-      if (!args.apply) {
-        await writeFile(join(reviewDir, `${b.batch}.json`), JSON.stringify({ name, type: 'notebook', content }, null, 2));
-        console.log(`  · ${b.batch}: prepared refresh for notebook ${b.notebookId} (${batch.length} detectors)`);
-        continue;
-      }
-      try {
-        const live = await client2.getDocumentFull(b.notebookId!, true);
-        await client2.updateContent(b.notebookId!, {
-          name,
-          type: 'notebook',
-          content,
-          version: live.metadata.version,
-          adminAccess: true,
-        });
-        updated++;
-        // Restage doubles as the tracker BACKFILL: batches published before the
-        // sheet was wired up — or while a reviewer had it locked — land here.
-        for (const it of batch) {
-          restageTrackerRows.push({
-            asset_id: it.objectId,
-            asset_type: 'anomaly-detector',
-            name: it.title,
-            status: 'staged',
-            review_copy_id: b.notebookId!,
-            review_copy_url: b.notebookUrl ?? notebookUiUrl(args.baseUrl, b.notebookId!),
-            reasons: `review batch ${b.batch}`,
-          });
-        }
-        console.log(`  ✓ ${b.batch}: refreshed notebook ${b.notebookId} in place (${batch.length} detectors)`);
-      } catch (e) {
-        const msg = e instanceof DocumentApiError ? `HTTP ${e.status}: ${e.body.slice(0, 120)}` : (e as Error).message;
-        console.log(`  ! ${b.batch}: refresh failed — ${msg}`);
-      }
-    }
-    if (args.apply && restageTrackerRows.length) {
-      try {
-        const { added, updated: upd } = await upsertRows(trackerPath, restageTrackerRows, ALERTS_SHEET);
-        console.log(`  Tracker ${trackerPath}: ${added} added, ${upd} updated.`);
-      } catch (e) {
-        console.log(`  ! Could not write ${trackerPath}: ${(e as Error).message.slice(0, 120)}`);
-      }
-    }
-    console.log(
-      args.apply
-        ? `\nRefreshed ${updated}/${published.length} notebook(s) in place — same ids, urls and shares.`
-        : `\nPrepared refreshes in ${reviewDir}; no writes made. Re-run with --apply.`
-    );
+    await restageCards(items, rewrites, args, reviewDir, trackerPath);
     return;
   }
 
