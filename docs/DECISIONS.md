@@ -9,7 +9,8 @@ The rules this migration runs by. Most came from something going wrong once. If 
 - **Proven, not plausible.** A translation rule is added only after running the classic and translated forms side by side on a real environment and comparing rows. The measurement goes in the code comment and the test.
 - **Output proven to return nothing is blocked** (`lib/output-lint.ts`). The typical failure isn't an error. It's a query that runs and returns nothing, which on a dashboard looks like a quiet tile and on an alert looks like no incidents.
 - **Tag keys use the casing resources actually carry** (`ApplicationCI`, `env`, `Environment`, `Name`). Teams whose tags don't follow the standard fix their tags; the tool doesn't case-fold.
-- **Region comes from the resource's `aws.region` field,** not from the classic `location` tag, which isn't present everywhere.
+- **Region comes from the resource's `aws.region` field,** not from the classic `location` tag, which isn't present everywhere, nor from `customProperties`, which the new AWS entities don't have at all. A region dropdown that parses `customProperties` offers nothing on the new side, and every filter on it then drops every row.
+- **A classic entity type keeps its scope.** The classic ALB and NLB types both map to one new type that holds every v2 load balancer, so the translation filters it back to the kind the classic type listed, by the load balancer type in its ARN.
 - **Management zones are decoded from their name.** Zones don't exist on the new AWS resources. Zone names follow the convention `<APP> : <name> : <ENV>`, which matched the zones' own rules for every zone checked (one exception in over 3,000), so the name translates directly to tag filters:
   - the app becomes `ApplicationCI` and the last part becomes `env`;
   - a phrase with only the app (e.g. `"ABC"`) means every environment;

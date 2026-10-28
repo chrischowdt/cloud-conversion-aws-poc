@@ -2507,3 +2507,125 @@ describe('alert batch 21-26 prepare findings (2026-10-27)', () => {
     assert.doesNotMatch(r.rewritten, /\| filter `aws\.tags\.env`/, r.rewritten);
   });
 });
+
+describe('an AWS node’s own tags and customProperties (2026-10-28)', () => {
+  // The ApplicationCI dropdown copied into 24 dashboards across both tenants.
+  // nic55601: classic 445 values; translated literally, 0.
+  const albDropdown =
+    'fetch  dt.entity.aws_application_load_balancer\n' +
+    '| expand appci = tags\n' +
+    '| filter contains(appci, "ApplicationCI")\n' +
+    '| expand env = tags\n' +
+    '| filter contains(env, "env")\n' +
+    '| fields appci\n' +
+    '| fieldsAdd applicationci = (splitString(appci,":"))[1]\n' +
+    '| fields applicationci\n' +
+    '| dedup applicationci\n' +
+    '| filterOut contains(applicationci,"ApplicationCI")';
+
+  it('reads the key an aliased expand + contains picks, and its value split, from the record', () => {
+    const r = rewriteDql(albDropdown, buildIndex([]));
+    assert.match(r.rewritten, /\| fieldsAdd appci = tags\[ApplicationCI\]\n\| filter isNotNull\(appci\)\n/);
+    assert.match(r.rewritten, /\| fieldsAdd env = tags\[env\]\n\| filter isNotNull\(env\)\n/);
+    assert.match(r.rewritten, /\| fieldsAdd applicationci = appci\n/);
+    assert.match(r.rewritten, /\| fields appci\n[\s\S]*\| dedup applicationci\n\| filterOut contains\(applicationci,"ApplicationCI"\)$/);
+    assert.doesNotMatch(r.rewritten, /expand|splitString/);
+    assert.deepEqual(lintQuery(r.rewritten).filter((f) => f.ruleId === 'tags-record-treated-as-array'), []);
+  });
+
+  it('does the same when the author already wrote smartscapeNodes', () => {
+    const r = rewriteDql(
+      albDropdown.replace('fetch  dt.entity.aws_application_load_balancer', 'smartscapeNodes AWS_ELASTICLOADBALANCINGV2_LOADBALANCER'),
+      buildIndex([]),
+    );
+    assert.match(r.rewritten, /\| fieldsAdd appci = tags\[ApplicationCI\]/);
+  });
+
+  it('leaves a contains() on a VALUE alone: it matched any tag, which a key read cannot', () => {
+    // "ebi" picked 13 values out of Name and stack tags as well as ApplicationCI.
+    const r = rewriteDql(albDropdown.replace('contains(appci, "ApplicationCI")', 'contains(appci, "ebi")'), buildIndex([]));
+    assert.match(r.rewritten, /\| expand appci = tags/);
+    assert.ok(lintQuery(r.rewritten).some((f) => f.ruleId === 'tags-record-treated-as-array'));
+  });
+
+  it('leaves an alias used any other way alone', () => {
+    const r = rewriteDql(albDropdown.replace('| fields appci\n', '| fields appci, k = lower(appci)\n'), buildIndex([]));
+    assert.match(r.rewritten, /\| expand appci = tags/);
+  });
+
+  it('keeps an application_load_balancer list to ALBs: the new node type holds NLBs too', () => {
+    // nic55601: 4,885 app, 1,408 net, 2 gwy. Unfiltered, the dropdown gained 67 NLB-only values.
+    const r = rewriteDql('fetch dt.entity.aws_application_load_balancer, from:-30m\n| fields entity.name', buildIndex([]));
+    assert.equal(
+      r.rewritten,
+      'smartscapeNodes AWS_ELASTICLOADBALANCINGV2_LOADBALANCER, from:-30m\n| filter contains(aws.arn, ":loadbalancer/app/")\n| fields name',
+    );
+    const nlb = rewriteDql('fetch dt.entity.aws_network_load_balancer', buildIndex([]));
+    assert.equal(nlb.rewritten, 'smartscapeNodes AWS_ELASTICLOADBALANCINGV2_LOADBALANCER | filter contains(aws.arn, ":loadbalancer/net/")');
+    const sub = rewriteDql(
+      'timeseries r = sum(cloud.aws.applicationelb.request_count_sum), by:{dt.entity.aws_application_load_balancer}\n' +
+        '| lookup [fetch dt.entity.aws_application_load_balancer], sourceField:dt.entity.aws_application_load_balancer, lookupField:id',
+      buildIndex([]),
+    );
+    assert.match(sub.rewritten, /\[smartscapeNodes AWS_ELASTICLOADBALANCINGV2_LOADBALANCER \| filter contains\(aws\.arn, ":loadbalancer\/app\/"\)\]/);
+  });
+
+  it('reads parsed tag keys from the node’s own record', () => {
+    // EIF - AWS Lambda / CMT AWS Lambda & Logs dropdowns.
+    const q =
+      'fetch dt.entity.aws_lambda_function\n' +
+      `| parse lower(toString(arraySort(tags))), "LD 'applicationci:'ALPHA:appci LD 'env:'ALPHA:env LD 'location:' [a-zA-Z0-9-]*:location"\n` +
+      '| filter in(appci, array($appci))';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /\| fieldsAdd appci = lower\(tags\[ApplicationCI\]\), env = lower\(tags\[env\]\), location = lower\(aws\.region\)\n/);
+    assert.deepEqual(lintQuery(r.rewritten).filter((f) => f.ruleId === 'tags-record-treated-as-array'), []);
+    const already = rewriteDql(q.replace('fetch dt.entity.aws_lambda_function', 'smartscapeNodes AWS_LAMBDA_FUNCTION'), buildIndex([]));
+    assert.match(already.rewritten, /\| fieldsAdd appci = lower\(tags\[ApplicationCI\]\)/);
+  });
+
+  it('keeps the line break after a bare fieldsAdd it names, even in a comment', () => {
+    // Untitled notebookV: `// | fieldsAdd entityName(id)` swallowed the next, live,
+    // `| fields …` line into the comment, so it silently stopped running.
+    const r = rewriteDql(
+      'fetch `dt.entity.cloud:aws:ecs`\n// | fieldsAdd entityName(id)\n| fields id, entity.name\n',
+      buildIndex([]),
+    );
+    assert.match(r.rewritten, /\/\/ \| fieldsAdd `id\.name` = getNodeName\(id\)\n\| fields id, name\n$/);
+  });
+
+  it('reads the node’s own ARN from aws.arn', () => {
+    // nic55601: 36 of 36 EIF Lambda nodes have aws.arn, none has arn.
+    const q =
+      'fetch dt.entity.aws_lambda_function\n' +
+      `| parse arn, """LD 'lambda:' LDATA{0,9}:region ':' WORD:accountnumber LD 'function:' LDATA:functionname"""\n` +
+      '| fields entity.name, arn';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /\| parse aws\.arn, """/);
+    assert.match(r.rewritten, /\| fields name, aws\.arn$/);
+    const own = rewriteDql('smartscapeNodes AWS_LAMBDA_FUNCTION\n| fieldsAdd arn = aws.arn\n| filter contains(arn, "x")', buildIndex([]));
+    assert.match(own.rewritten, /fieldsAdd arn = aws\.arn\n\| filter contains\(arn, "x"\)/);
+  });
+
+  it('reads the region a customProperties parse extracted from aws.region', () => {
+    // EA AWS Services Usage Dashboard's Region dropdown: classic us-east-1 + us-east-2,
+    // translated literally one null. ~700 uses across the downloaded dashboards.
+    // nic55601: 0 of 48,488 ECS/Lambda/ELBv2 nodes carry customProperties; all carry aws.region.
+    const q =
+      'timeseries cpu = avg(cloud.aws.ecs.cpu_utilization_by_service_name), by: {dt.entity.custom_device, ServiceName}\n' +
+      '| fieldsAdd customProperties = entityAttr(dt.entity.custom_device, "customProperties")\n' +
+      `| parse toString(customProperties), "LD 'REGION_NAME' LD DQS:region"\n` +
+      '| fields region\n| dedup region';
+    const r = rewriteDql(q, buildIndex([]));
+    assert.match(r.rewritten, /\| fieldsAdd region = getNodeField\(dt\.smartscape\.aws_ecs_cluster, "aws\.region"\)\n/);
+    assert.doesNotMatch(r.rewritten, /parse toString\(customProperties\)/);
+
+    const native = rewriteDql(
+      `fetch dt.entity.aws_lambda_function\n| parse toString(customProperties), "LD 'REGION_NAME' LD DQS:Region"`,
+      buildIndex([]),
+    );
+    assert.match(native.rewritten, /\| fieldsAdd Region = aws\.region$/);
+
+    const other = rewriteDql(q.replace(`"LD 'REGION_NAME' LD DQS:region"`, `"LD 'Version' LD DQS:region"`), buildIndex([]));
+    assert.match(other.rewritten, /parse toString\(customProperties\)/);
+  });
+});

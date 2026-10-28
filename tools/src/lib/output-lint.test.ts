@@ -135,6 +135,29 @@ describe('output-lint — ignores code the engine never runs', () => {
   });
 });
 
+describe('custom-properties-on-node', () => {
+  // nic55601 2026-10-28: 0 of 48,488 AWS nodes carry customProperties.
+  const fires = (q: string) => lintQuery(q).some((f) => f.ruleId === 'custom-properties-on-node');
+  const ecs =
+    'timeseries c = avg(`cloud.aws.ecs.CPUUtilization.By.ClusterName.ServiceName`), by:{dt.smartscape.aws_ecs_cluster}\n' +
+    '| fieldsAdd customProperties = getNodeField(dt.smartscape.aws_ecs_cluster, "customProperties")\n';
+
+  it('blocks reading a key of a node’s customProperties', () => {
+    assert.equal(fires('timeseries c = avg(m), by:{dt.smartscape.aws_ecs_cluster}\n| fieldsAdd v = getNodeField(dt.smartscape.aws_ecs_cluster, "customProperties")[Version]'), true);
+    assert.equal(fires(ecs + '| fieldsAdd v = customProperties[Version]'), true);
+    assert.equal(fires(ecs + `| parse toString(customProperties), "LD 'Version' LD DQS:v"`), true);
+    assert.equal(fires(`smartscapeNodes AWS_LAMBDA_FUNCTION\n| fieldsAdd v = customProperties[Version]`), true);
+  });
+
+  it('passes an assignment that nothing reads', () => {
+    assert.equal(fires(ecs + '| fieldsRemove customProperties'), false);
+  });
+
+  it('leaves a classic entity query alone, where the field exists', () => {
+    assert.equal(fires('fetch dt.entity.custom_device\n| fieldsAdd r = customProperties[REGION_NAME]'), false);
+  });
+});
+
 describe('tag-record-in-string-comparison', () => {
   const base =
     'timeseries failed = sum(`cloud.aws.sns.NumberOfNotificationsFailed.By.TopicName`), by:{dt.smartscape.aws_sns_topic}\n' +

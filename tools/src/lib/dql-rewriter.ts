@@ -33,7 +33,7 @@ import { ENTITY_FIELD_MAPPINGS_BY_NODE_TYPE } from './entity-field-mappings.ts';
 import { classicEntityToSmartscape, lookupByDimRef, entityScope } from './entity-mappings.ts';
 import { lookupEolForClassicKey } from './eol-lookup.ts';
 import { isMetricCarrier, isKnownNonCarrier } from './metric-dim-carriers.ts';
-import { canonicalTagKey } from './tag-key-casing.ts';
+import { CANONICAL_TAG_KEYS, canonicalTagKey } from './tag-key-casing.ts';
 import { codeMask, timeseriesCommands, topLevelBy } from './dql-command.ts';
 import { metricBase } from './live-metrics.ts';
 import { rewriteEntityIdPins } from './entity-id-pins.ts';
@@ -1046,6 +1046,8 @@ export function rewriteDql(input: string, index: RecipeIndex): RewriteResult {
   // Must run BEFORE 2.75: left alone, that pass wraps these in toString() and
   // produces a filter that parses, runs, and matches nothing.
   rewritten = rewriteClassicTagSubstringFilters(rewritten, transforms);
+  // Pass 2.73d: `expand x = tags | filter contains(x, "Key")` on an AWS node list → key read.
+  rewritten = rewriteAliasedTagExpand(rewritten, transforms);
   rewritten = rewriteClassicTagExpandIdiom(rewritten, transforms);
   // Pass 2.73c: `parse toString(arraySort(tags)), "LD 'Key:'ALPHA:x …"` → key reads.
   rewritten = rewriteClassicTagParseIdiom(rewritten, transforms);
@@ -1835,13 +1837,57 @@ function rewriteCustomDeviceViaService(
   return out;
 }
 
+// The classic ALB and NLB entity types both become AWS_ELASTICLOADBALANCINGV2_LOADBALANCER,
+// which holds every v2 load balancer: on nic55601 4,885 application, 1,408 network
+// and 2 gateway. A classic ALB list was ALBs only, so the ARN's load balancer type
+// keeps it that way. Without it the EA ApplicationCI dropdown gained 67 values
+// that exist only on NLBs (2026-10-27).
+const ELBV2_KIND_BY_CLASSIC: Record<string, string> = {
+  aws_application_load_balancer: 'app',
+  'cloud:aws:applicationelb': 'app',
+  aws_network_load_balancer: 'net',
+};
+const ELBV2_KIND_MARK = /\u0002ELBV2:(\w+)\u0002/;
+
+/** Put `| filter contains(aws.arn, ":loadbalancer/<kind>/")` after each marked smartscapeNodes command. */
+function insertElbv2KindFilters(input: string, transforms: Transform[]): string {
+  let out = input;
+  for (let m = ELBV2_KIND_MARK.exec(out); m; m = ELBV2_KIND_MARK.exec(out)) {
+    out = out.slice(0, m.index) + out.slice(m.index + m[0].length);
+    const filter = `filter contains(aws.arn, ":loadbalancer/${m[1]}/")`;
+    // The end of the command: the next pipe or closing bracket at its own depth.
+    const mask = codeMask(out);
+    let depth = 0;
+    let at = out.length;
+    for (let i = m.index; i < out.length; i++) {
+      if (!mask[i]) continue;
+      const ch = out[i]!;
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === ')' || ch === ']' || ch === '}') {
+        if (depth === 0) { at = i; break; }
+        depth--;
+      } else if (ch === '|' && depth === 0) { at = i; break; }
+    }
+    out = out[at] === '|'
+      ? `${out.slice(0, at)}| ${filter}\n${out.slice(at)}`
+      : `${out.slice(0, at).replace(/\s*$/, '')} | ${filter}${out.slice(at).replace(/^[ \t]*/, '')}`;
+    transforms.push({
+      kind: 'entity-dim',
+      before: 'smartscapeNodes AWS_ELASTICLOADBALANCINGV2_LOADBALANCER',
+      after: `… | ${filter}`,
+      detail: 'the v2 load balancer node type holds ALBs, NLBs and gateway LBs; the classic type was one of them',
+    });
+  }
+  return out;
+}
+
 function rewriteFetchEntity(
   input: string,
   transforms: Transform[],
   warnings: Warning[],
   ctx: FetchContext
 ): string {
-  return input.replace(FETCH_ENTITY_PATTERN, (full, entityType: string) => {
+  const out = input.replace(FETCH_ENTITY_PATTERN, (full, entityType: string) => {
     // Only restructure AWS entities. Non-AWS `fetch dt.entity.X` stays classic.
     if (entityScope(entityType) === 'non-aws') {
       noteNonAwsEntity(warnings, entityType);
@@ -1891,8 +1937,10 @@ function rewriteFetchEntity(
       after: `smartscapeNodes ${mapping.smartscapeNodeType}`,
       detail: `Situation-3 restructure: pure entity list query`,
     });
-    return `smartscapeNodes ${mapping.smartscapeNodeType}`;
+    const kind = ELBV2_KIND_BY_CLASSIC[entityType];
+    return `smartscapeNodes ${mapping.smartscapeNodeType}${kind ? `\u0002ELBV2:${kind}\u0002` : ''}`;
   });
+  return insertElbv2KindFilters(out, transforms);
 }
 
 // ─── Pass 1.7: <edge>[dt.entity.X] → references[<edge>.<x>] ───────────────
@@ -2586,12 +2634,52 @@ const LOOKUP_PREFIX_RE =
 const PREFIX_PROP_REGION_RE =
   /\b([A-Za-z_]\w*)\.customProperties\s*\[\s*([A-Za-z_]*REGION[A-Za-z_]*)\s*\]/gi;
 
+// The same read written as a parse of the stringified properties:
+//   | parse toString(customProperties), "LD 'REGION_NAME' LD DQS:region"
+// About 700 uses in the downloaded dashboards; it is how the EA dashboards build
+// their Region dropdown. The properties come from a var bound to
+// getNodeField(<node>, "customProperties"), that call inline, or the node's own
+// field in an AWS node list. nic55601 (2026-10-28): 0 of 48,488 ECS, Lambda and
+// ELBv2 nodes carry customProperties, all carry aws.region; the EA AWS Services
+// Usage Region dropdown went from one null to classic's us-east-1, us-east-2.
+const CUSTOM_PROP_ASSIGN_RE = /\b([A-Za-z_]\w*)\s*=\s*getNodeField\(\s*([^,()]+?)\s*,\s*"customProperties"\s*\)/g;
+const CUSTOM_PROP_REGION_PATTERN = String.raw`\s*,\s*"\s*LD\s*'[A-Za-z_]*REGION[A-Za-z_]*'\s*LD\s+DQS\s*:\s*([A-Za-z_]\w*)\s*"`;
+
+function rewriteCustomPropertiesRegionParse(input: string, transforms: Transform[]): string {
+  // Each source: the parse it matches, and the region read from its captures (the last capture is the column name).
+  const sources: Array<[RegExp, (caps: string[]) => string]> = [];
+  const bound = new Map<string, string>();
+  for (const m of input.matchAll(CUSTOM_PROP_ASSIGN_RE)) bound.set(m[1]!, m[2]!.trim());
+  for (const [v, dim] of bound) {
+    sources.push([new RegExp(String.raw`\|\s*parse\s+toString\(\s*${escapeRegExp(v)}\s*\)` + CUSTOM_PROP_REGION_PATTERN, 'g'), () => regionRead(dim)]);
+  }
+  sources.push([
+    new RegExp(String.raw`\|\s*parse\s+toString\(\s*getNodeField\(\s*([^,()]+?)\s*,\s*"customProperties"\s*\)\s*\)` + CUSTOM_PROP_REGION_PATTERN, 'g'),
+    (caps) => regionRead(caps[0]!.trim()),
+  ]);
+  if (!bound.has('customProperties') && listsAwsNodesOnly(input)) {
+    sources.push([new RegExp(String.raw`\|\s*parse\s+toString\(\s*customProperties\s*\)` + CUSTOM_PROP_REGION_PATTERN, 'g'), () => regionRead(OWN_NODE)]);
+  }
+  let out = input;
+  for (const [re, read] of sources) {
+    out = out.replace(re, (full, ...groups) => {
+      const caps = groups.slice(0, -2) as string[];
+      const name = caps[caps.length - 1]!;
+      const repl = `| fieldsAdd ${name} = ${read(caps)}`;
+      transforms.push({ kind: 'entity-dim', before: full.trim(), after: repl, detail: 'region parsed from customProperties → aws.region field (new AWS nodes carry no customProperties)' });
+      return repl;
+    });
+  }
+  return out;
+}
+
 function rewriteAwsRegionField(input: string, transforms: Transform[]): string {
   let out = input.replace(CUSTOM_PROP_REGION_RE, (full, arg: string) => {
     const repl = `getNodeField(${arg}, "aws.region")`;
     transforms.push({ kind: 'entity-dim', before: full, after: repl, detail: 'region from customProperties → aws.region field (carried on every AWS node)' });
     return repl;
   });
+  out = rewriteCustomPropertiesRegionParse(out, transforms);
 
   // Map lookup prefixes → their source node, then repoint <prefix>.customProperties[REGION].
   const prefixNode = new Map<string, string>();
@@ -2693,7 +2781,7 @@ const GETNODEFIELD_RENAME: Record<string, string> = {
   awsVpcName: 'aws.vpc.id',
 };
 function rewriteAwsFieldRenames(input: string, transforms: Transform[]): string {
-  return input.replace(
+  const out = input.replace(
     /getNodeField\(\s*([^,()]+?)\s*,\s*"([^"]+)"\s*\)/g,
     (full, arg: string, field: string) => {
       const nf = GETNODEFIELD_RENAME[field];
@@ -2703,6 +2791,25 @@ function rewriteAwsFieldRenames(input: string, transforms: Transform[]): string 
       return repl;
     }
   );
+  return renameOwnArnField(out, transforms);
+}
+
+/**
+ * The same rename for a node list's own field: `parse arn, …` in the EIF and CMT
+ * Lambda dropdowns. nic55601: 36 of 36 EIF Lambda nodes have aws.arn, none has
+ * arn. Every reference changes together, so later uses of the column still
+ * line up; a query that assigns its own `arn` is left alone.
+ */
+function renameOwnArnField(input: string, transforms: Transform[]): string {
+  if (!listsAwsNodesOnly(input)) return input;
+  const mask = codeMask(input);
+  const refs = [...input.matchAll(/(?<![\w.$`])arn(?![\w.`:])/g)].filter((m) => mask[m.index!]);
+  if (!refs.length) return input;
+  if (refs.some((m) => /^\s*=(?!=)/.test(input.slice(m.index! + 3)))) return input;
+  let out = input;
+  for (const m of refs.reverse()) out = `${out.slice(0, m.index!)}aws.arn${out.slice(m.index! + 3)}`;
+  transforms.push({ kind: 'entity-dim', before: 'arn', after: 'aws.arn', detail: 'the node’s ARN is the aws.arn field; arn reads null on new AWS nodes' });
+  return out;
 }
 
 // ─── Pass 2.6b: <dt.smartscape.X>.entity.name → getNodeName(X) ─────────────
@@ -3176,11 +3283,34 @@ const tagKeyRef = (key: string): string => {
   return /^[A-Za-z_]\w*$/.test(k) ? k : `\`${k}\``;
 };
 
+/**
+ * Stands for "the node's own field" where the tag passes keep a var → node-dim
+ * map: in a query that lists AWS nodes, a bare `tags` is the node's record.
+ */
+const OWN_NODE = '';
+const regionRead = (dim: string): string => (dim === OWN_NODE ? 'aws.region' : `getNodeField(${dim}, "aws.region")`);
+
+/**
+ * True when the query lists AWS nodes and nothing else, so a bare `tags` (or
+ * `customProperties`) is that node's own field. Dashboards write these lists
+ * as `fetch dt.entity.aws_*` (restructured by Pass 1.6) or, hand-migrated, as
+ * `smartscapeNodes AWS_*`. Subqueries are out: there the field may belong to
+ * another source.
+ */
+function listsAwsNodesOnly(q: string): boolean {
+  const mask = codeMask(q);
+  const code = Array.from(q, (ch, i) => (mask[i] ? ch : ' ')).join('');
+  return /^\s*smartscapeNodes\s+"?AWS_/.test(q.replace(/^(?:\s*\/\/[^\n]*(?:\n|$))*/, '')) &&
+    !/\b(?:lookup|join|joinNested|append)\s*\[/.test(code);
+}
+
 function rewriteClassicTagParseIdiom(input: string, transforms: Transform[]): string {
   // Like the expand idiom, this binds the tag field WITHOUT toString().
   const assignRe = /\b([A-Za-z_]\w*)\s*=\s*getNodeField\(\s*([^,()]+?)\s*,\s*"tags:aws"\s*\)/g;
   const bound = new Map<string, string>();
   for (let m = assignRe.exec(input); m; m = assignRe.exec(input)) bound.set(m[1]!, m[2]!.trim());
+  // EIF - AWS Lambda and CMT AWS Lambda & Logs parse the Lambda node's own tags.
+  if (!bound.has('tags') && listsAwsNodesOnly(input)) bound.set('tags', OWN_NODE);
   if (bound.size === 0) return input;
 
   let out = input;
@@ -3194,7 +3324,7 @@ function rewriteClassicTagParseIdiom(input: string, transforms: Transform[]): st
       new RegExp(`contains\\(\\s*toString\\(\\s*${V}\\s*\\)\\s*,\\s*"(?:\\[AWS\\])?([A-Za-z][\\w-]*):([^":]*)"\\s*\\)`, 'g'),
       (full, key: string, value: string) => {
         const repl = CLASSIC_REGION_TAG.test(key)
-          ? `matchesValue(getNodeField(${dim}, "aws.region"), ${JSON.stringify(value)})`
+          ? `matchesValue(${regionRead(dim)}, ${JSON.stringify(value)})`
           : `contains(${v}[${tagKeyRef(key)}], ${JSON.stringify(value)})`;
         transforms.push({
           kind: 'entity-dim',
@@ -3209,7 +3339,7 @@ function rewriteClassicTagParseIdiom(input: string, transforms: Transform[]): st
       const items = tagParseItems(pattern);
       if (!items) return full;
       const reads = items.map(({ key, name }) => {
-        const read = CLASSIC_REGION_TAG.test(key) ? `getNodeField(${dim}, "aws.region")` : `${v}[${tagKeyRef(key)}]`;
+        const read = CLASSIC_REGION_TAG.test(key) ? regionRead(dim) : `${v}[${tagKeyRef(key)}]`;
         return `${name} = ${lowered ? `lower(${read})` : read}`;
       });
       const repl = `| fieldsAdd ${reads.join(', ')}`;
@@ -3222,6 +3352,89 @@ function rewriteClassicTagParseIdiom(input: string, transforms: Transform[]): st
       return repl;
     });
   }
+  return out;
+}
+
+// ─── Pass 2.73d: aliased `expand x = tags` + contains(x, "Key") → key read ────
+//
+// The ApplicationCI dropdown copied into 24 dashboards across both tenants
+// expands the tag ARRAY under an alias, keeps the "[AWS]Key:value" entries whose
+// text contains the key, and splits the value off:
+//
+//   fetch dt.entity.aws_application_load_balancer
+//   | expand appci = tags | filter contains(appci, "ApplicationCI")
+//   | expand env = tags   | filter contains(env, "env")
+//   | fields appci | fieldsAdd applicationci = (splitString(appci,":"))[1]
+//
+// On the record the expand yields one null row, so the dropdown is empty
+// (published EA Infra Dashboard: 0 values, classic 445). Each alias becomes that
+// key's value, and its filter "the key is present":
+//
+//   | fieldsAdd appci = tags[ApplicationCI] | filter isNotNull(appci)
+//   | fieldsAdd env = tags[env]             | filter isNotNull(env)
+//   | fields appci | fieldsAdd applicationci = appci
+//
+// Measured on nic55601 with the ALB scope from Pass 1.6: 441 of the 445 classic
+// values and none extra; the 4 are load balancers missing on the new connection.
+// Classic contains() was a substring test on "Key:value", so `"env"` also matched
+// a value containing "env"; reading the key is the intent the dropdowns show.
+//
+// Only when the literal names a KEY (written "[AWS]Key" or "Key:", or a measured
+// key in CANONICAL_TAG_KEYS). `contains(appci, "ebi")` searched every tag's text
+// (it returned Name and stack values too), which a key read cannot reproduce, so
+// that query is left alone and the lint keeps it blocked. Likewise any other use
+// of the alias.
+function rewriteAliasedTagExpand(input: string, transforms: Transform[]): string {
+  if (!listsAwsNodesOnly(input)) return input;
+  const aliasRe = /\|\s*expand\s+([A-Za-z_]\w*)\s*=\s*tags\b(?!\s*\[)/g;
+  const aliases = [...input.matchAll(aliasRe)].map((m) => m[1]!).filter((a) => a !== 'tags');
+  if (!aliases.length) return input;
+
+  let out = input;
+  const notes: Transform[] = [];
+  for (const a of new Set(aliases)) {
+    const A = escapeRegExp(a);
+    const expandRe = new RegExp(`(\\|\\s*)expand\\s+${A}\\s*=\\s*tags\\b`, 'g');
+    const filterRe = new RegExp(`(\\|\\s*)filter\\s+contains\\(\\s*${A}\\s*,\\s*"([^"]*)"\\s*\\)(?=\\s*(?:\\||$))`, 'g');
+    const splitRe = new RegExp(`\\(\\s*splitString\\(\\s*${A}\\s*,\\s*":"\\s*\\)\\s*\\)\\s*\\[\\s*1\\s*\\]|splitString\\(\\s*${A}\\s*,\\s*":"\\s*\\)\\s*\\[\\s*1\\s*\\]`, 'g');
+    if ([...out.matchAll(expandRe)].length !== 1) return input;
+    const filters = [...out.matchAll(filterRe)];
+    if (filters.length !== 1) return input;
+    const lit = filters[0]![2]!;
+    const km = /^(\[AWS\])?([A-Za-z][\w-]*)(:?)$/.exec(lit);
+    if (!km || !(km[1] || km[3] || CANONICAL_TAG_KEYS[km[2]!.toLowerCase()])) return input;
+    const key = tagKeyRef(km[2]!);
+
+    const next = out
+      .replace(expandRe, (_m, pipe: string) => `${pipe}fieldsAdd ${a} = tags[${key}]`)
+      .replace(filterRe, (_m, pipe: string) => `${pipe}filter isNotNull(${a})`)
+      .replace(splitRe, a);
+    // Whatever is left must be a plain column reference in a field list (or the
+    // two lines just written). Anything else treated the alias as tag TEXT.
+    const mask = codeMask(next);
+    // Not inside `tags[…]`: the env alias reads the key of the same name.
+    const useRe = new RegExp(`(?<![\\w.$\`[])${A}(?![\\w\`\\]])`, 'g');
+    for (const m of next.matchAll(useRe)) {
+      if (!mask[m.index!]) continue;
+      const lineStart = next.lastIndexOf('|', m.index!) + 1;
+      const head = next.slice(lineStart, m.index!);
+      const tail = next.slice(m.index! + a.length, m.index! + a.length + 1);
+      const ok =
+        new RegExp(`^\\s*fieldsAdd\\s+$`).test(head) && /^\s/.test(tail) ? true // `fieldsAdd a = tags[K]`
+        : new RegExp(`^\\s*filter\\s+isNotNull\\($`).test(head) ? true
+        : /^\s*(?:fields|fieldsKeep|dedup|sort)\s+(?:[\w.`]+\s*,\s*)*$/.test(head) && /^(?:\s|,|$)/.test(tail) ? true // listed column
+        : /=\s*$/.test(head) && /^\s*fieldsAdd\b/.test(head) && /^(?:\s|,|$)/.test(tail); // `fieldsAdd x = a`
+      if (!ok) return input;
+    }
+    notes.push({
+      kind: 'entity-dim',
+      before: `expand ${a} = tags | filter contains(${a}, ${JSON.stringify(lit)})`,
+      after: `fieldsAdd ${a} = tags[${key}] | filter isNotNull(${a})`,
+      detail: `classic tag array expanded under an alias → the ${km[2]} key read; tags:aws is a record, so the expand yields one null row`,
+    });
+    out = next;
+  }
+  transforms.push(...notes);
   return out;
 }
 
@@ -3371,7 +3584,10 @@ function nameBareEntityOperands(input: string, transforms: Transform[]): string 
       let i = 2;
       while (seen.has(name)) name = `${nm}_${i++}`;
       seen.add(name);
-      return ` \`${name}\` = ${t}`;
+      // Keep the operand's own surrounding whitespace. Trimming the line break
+      // that ends a commented-out `// | fieldsAdd entityName(x)` pulled the next,
+      // live, line into the comment (found on nic55601 Untitled notebookV).
+      return `${/^\s*/.exec(p)![0]}\`${name}\` = ${t}${/\s*$/.exec(p)![0]}`;
     });
     if (!changed) return full;
     transforms.push({ kind: 'entity-dim', before: 'fieldsAdd <bare entity fn>', after: 'named', detail: 'named a bare getNodeName/getNodeField fieldsAdd operand (classic auto-named the column)' });

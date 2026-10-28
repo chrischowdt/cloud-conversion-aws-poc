@@ -147,6 +147,24 @@ export const LINT_RULES: LintRule[] = [
     },
   },
   {
+    id: 'custom-properties-on-node',
+    severity: 'blocking',
+    message:
+      'Reads customProperties off a new AWS node. Classic custom devices carried them (REGION_NAME and ' +
+      'others); the Smartscape nodes do not: 0 of 48,488 ECS, Lambda and ELBv2 nodes on nic55601 ' +
+      '(2026-10-28). The read is null, so a filter on it drops every row without erroring.',
+    fix: 'Region is the aws.region field on every AWS node; other properties need a field from the new node.',
+    test: (q) => {
+      const read = (src: string) => new RegExp(`(?:${src})\\s*\\[|toString\\(\\s*(?:${src})\\s*\\)`).test(q);
+      const gnf = String.raw`getNodeField\([^()]*,\s*"customProperties"\s*\)`;
+      if (read(gnf)) return true;
+      for (const m of q.matchAll(/\b([A-Za-z_]\w*)\s*=\s*getNodeField\([^()]*,\s*"customProperties"\s*\)/g)) {
+        if (read(String.raw`\b${m[1]!}\b`)) return true;
+      }
+      return /^\s*smartscapeNodes\s+"?AWS_/.test(q) && read(String.raw`\bcustomProperties\b`);
+    },
+  },
+  {
     id: 'service-tags-null',
     severity: 'blocking',
     message:
