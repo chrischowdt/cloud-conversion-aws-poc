@@ -9,11 +9,12 @@
  * manifest), not already published. `--ids` narrows, `--limit` caps.
  *
  * Every read is live: the approved query from the batch's review notebook (by the
- * tile's marker line), the detector from the Settings API, the classic query the
- * card was staged from from the base payload `<batch>.json` (else the archived
- * payload of that name, else the tile's reference block). Then the gates, in
- * order; the first failure decides: empty query, drift (owner edited or
- * migrated the alert since staging, or the staged version is unknown), blocking
+ * tile's marker line), the detector from the Settings API, and every known copy
+ * of the classic query the card was staged from: the base payload `<batch>.json`,
+ * the archived payload of that name and the tile's reference block. Then the
+ * gates, in order; the first failure decides: empty query, drift (the live query
+ * equals none of those copies: the owner edited or migrated the alert since
+ * staging; or no copy is known), blocking
  * lint, the approved query fails over the last 2 hours, the entity (an approved
  * query that emits none: the 7-day binding check plus the reviewer's
  * `publish_override`), at most 10,000 series over the last 2 hours, event fields
@@ -56,7 +57,7 @@ import {
   mapEventFields,
   publishedPartsEqual,
   selectForPublish,
-  stagedQueryOf,
+  stagedQueriesOf,
   staticColumns,
   withColumnAliases,
   withNodeNameColumn,
@@ -108,8 +109,8 @@ export interface PublishPlanItem {
   series?: number;
   /** The entity column the published query emits and the binding property names. */
   entityColumn?: string;
-  /** Where the classic query the card was staged from was read, for the drift check. */
-  stagedFrom?: StagedFrom;
+  /** The copies of the staged classic query (see `stagedQueriesOf`) the live query still equals: why it is not drift. Empty when it equals none. */
+  stagedFrom?: StagedFrom[];
   diff: { query?: { before: string; after: string }; fields: EventTemplateChange[] };
 }
 
@@ -249,7 +250,6 @@ const STAGED_FROM_TEXT: Record<StagedFrom, string> = {
   base: 'the base payload',
   archive: 'the archived payload',
   tile: 'the notebook tile',
-  none: 'nowhere',
 };
 
 /** Read everything one alert needs and run its gates. Throws only on an auth failure. */
@@ -287,14 +287,14 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   const liveQuery = detectorQuery(value);
   if (liveQuery === undefined) return skip('the alert has no query input', 'the live alert has no query input, so there is nowhere to put the approved query.');
 
-  // 3. The classic query the card was staged from: base payload, archived
-  // payload, then the live tile.
+  // 3. Every known copy of the classic query the card was staged from: base
+  // payload, archived payload, live tile.
   const [base, archive] = await Promise.all([ctx.payload('base', c.batch), ctx.payload('archive', c.batch)]);
   for (const [kind, read] of [['base payload', base], ['archived payload', archive]] as const) {
     if (read.problem) notes.push(`the ${kind} of ${c.batch} could not be read (${read.problem}).`);
   }
-  const staged = stagedQueryOf(c.objectId, { base: base.sections, archive: archive.sections, tileValue: tile.value });
-  item.stagedFrom = staged.from;
+  const staged = stagedQueriesOf(c.objectId, { base: base.sections, archive: archive.sections, tileValue: tile.value });
+  item.stagedFrom = staged.filter((s) => s.query.trim() === liveQuery.trim()).map((s) => s.from);
 
   // Empty first: an empty approved query must never reach the drift check, where
   // it would read as "already published" against an empty live query.
@@ -311,13 +311,19 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   } catch {
     /* unreadable to the rewriter: read as an owner edit, the more cautious reason */
   }
-  const drift = driftOf({ liveQuery, stagedQuery: staged.query, approvedQuery: approved, publishedQuery: await ctx.publishedQuery(c.objectId), liveIsMigrated });
+  const drift = driftOf({
+    liveQuery,
+    stagedQueries: staged.map((s) => s.query),
+    approvedQuery: approved,
+    publishedQuery: await ctx.publishedQuery(c.objectId),
+    liveIsMigrated,
+  });
   if (drift !== 'none' && drift !== 'already-published') {
     const text = DRIFT_TEXT[drift];
-    const where = `(staged query from ${STAGED_FROM_TEXT[staged.from]})`;
+    const where = staged.length ? `(compared with ${staged.map((s) => STAGED_FROM_TEXT[s.from]).join(', ')}; it matches none)` : '';
     const forced = ctx.args.force === true && (ctx.args.ids ?? []).includes(c.objectId);
-    if (!forced) return skip(text.gate, `${text.reason} ${where}`);
-    notes.push(`${text.gate.replace(/^drift: /, '')} ${where}; published anyway: --force with --ids names it.`);
+    if (!forced) return skip(text.gate, `${text.reason}${where ? ` ${where}` : ''}`);
+    notes.push(`${text.gate.replace(/^drift: /, '')}${where ? ` ${where}` : ''}; published anyway: --force with --ids names it.`);
   }
 
   // Every query text that ran without error in this plan; a final query that is
@@ -556,7 +562,7 @@ function renderReport(outcomes: Outcome[], meta: { env: string; batches: string[
       if (i.result === 'skipped') facts.push(`skipped: ${o.gate}`);
       if (i.entityColumn) facts.push(`entity column \`${i.entityColumn}\``);
       if (i.series !== undefined) facts.push(`${i.series > DAVIS_SERIES_CAP ? `more than ${CAP_TEXT}` : i.series} series over 2 hours`);
-      if (i.stagedFrom) facts.push(`staged query from ${STAGED_FROM_TEXT[i.stagedFrom]}`);
+      if (i.stagedFrom?.length) facts.push(`unchanged since staging per ${i.stagedFrom.map((s) => STAGED_FROM_TEXT[s]).join(', ')}`);
       if (i.override) facts.push(`publish_override: ${overrideLabel(i.override)}`);
       lines.push(facts.join(' · '), '');
       for (const r of i.reasons) lines.push(`- ${r}`);
@@ -586,7 +592,7 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
     throw new Error('migrate-promote-detectors: --batches is required, e.g. --batches batch-03,batch-04. There is no "publish everything Ready" mode.');
   }
   if (args.limit !== undefined && !(Number.isInteger(args.limit) && args.limit > 0)) {
-    throw new Error(`migrate-promote-detectors: --limit must be a positive whole number, got "${args.limit}".`);
+    throw new Error(`migrate-promote-detectors: --limit "${args.limit}" must be a positive integer`);
   }
   assertAllowedEnv(args.baseUrl, args.allowEnv, args.apply === true);
   if (args.apply) {

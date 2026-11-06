@@ -46,6 +46,7 @@ import { runMigrateVerify } from './commands/migrate-verify.ts';
 import { runMigrateRollback } from './commands/migrate-rollback.ts';
 import { runStageDetectors } from './commands/stage-detectors.ts';
 import { runPromoteDetectors } from './commands/migrate-promote-detectors.ts';
+import { parseLimit } from './lib/detector-publish.ts';
 import { runMigrateMergeDrift } from './commands/migrate-merge-drift.ts';
 import { runDiscoverManagementZones } from './commands/discover-management-zones.ts';
 import { runDiscoverUsers } from './commands/discover-users.ts';
@@ -758,7 +759,7 @@ async function main(): Promise<void> {
         trackerPath: trackerPath(args.flags),
         batches: getString(args.flags, 'batches')?.split(',').map((s) => s.trim()).filter(Boolean) ?? [],
         ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
-        limit: getNumber(args.flags, 'limit'),
+        limit: parseLimit(args.flags.get('limit')),
         apply: args.flags.get('apply') === true,
         force: args.flags.get('force') === true,
         allowEnv: getString(args.flags, 'allow-env'),

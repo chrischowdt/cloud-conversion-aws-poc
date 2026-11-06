@@ -112,14 +112,16 @@ export function selectForPublish(
  *   edited            an owner changed it after review
  *   owner-migrated    differs, and no classic references are left: the owner
  *                     already migrated it
- *   unknown           the staged query could not be found, so no comparison is possible
+ *   unknown           no copy of the staged query could be found, so no comparison is possible
  */
 export type Drift = 'none' | 'edited' | 'owner-migrated' | 'already-published' | 'unknown';
 
 /**
  * Compare the live query with the approved one, the one a previous apply
- * published (when given) and the one the card was staged from, ignoring leading
- * and trailing whitespace. `already-published` is checked first: after a publish
+ * published (when given) and the known copies of the one the card was staged
+ * from, ignoring leading and trailing whitespace. Equal to any staged copy is
+ * `none`; it drifts only when it equals none of them, and is `unknown` when no
+ * copy is known. `already-published` is checked first: after a publish
  * the live query differs from the staged one and must not read as an owner edit.
  * It equals the approved query only when the publish changed nothing else; a
  * publish also adds the entity to the split or appends a node-name column, so
@@ -128,6 +130,8 @@ export type Drift = 'none' | 'edited' | 'owner-migrated' | 'already-published' |
 export function driftOf(a: {
   liveQuery: string;
   stagedQuery?: string;
+  /** More copies of the staged query (see `stagedQueriesOf`); equal to any of them, or to `stagedQuery`, is `none`. */
+  stagedQueries?: string[];
   approvedQuery: string;
   /** The query a previous apply recorded as published, when there is one. */
   publishedQuery?: string;
@@ -137,9 +141,9 @@ export function driftOf(a: {
   if (live === a.approvedQuery.trim()) return 'already-published';
   const published = a.publishedQuery?.trim();
   if (published && live === published) return 'already-published';
-  const staged = a.stagedQuery?.trim();
-  if (!staged) return 'unknown';
-  if (live === staged) return 'none';
+  const staged = [a.stagedQuery, ...(a.stagedQueries ?? [])].map((q) => q?.trim()).filter((q): q is string => !!q);
+  if (!staged.length) return 'unknown';
+  if (staged.includes(live)) return 'none';
   return a.liveIsMigrated ? 'owner-migrated' : 'edited';
 }
 
@@ -230,35 +234,38 @@ export function findApprovedTile(
   return { value: hits[0]! };
 }
 
-/** Where the classic query a card was staged from was read. */
-export type StagedFrom = 'base' | 'archive' | 'tile' | 'none';
+/** A place the classic query a card was staged from can be read. */
+export type StagedFrom = 'base' | 'archive' | 'tile';
 
 type PayloadSections = Array<{ id?: string; state?: { input?: { value?: string } } }>;
 
 /**
- * The classic query a review card was staged from, and where it came from. In
+ * Every known copy of the classic query a review card was staged from, in this
  * order: the base payload `<batch>.json` (what the tool last wrote), the
- * archived payload of the same name (a later prepare run once overwrote a base
- * payload, and the archive kept the one the notebook was created from), then the
- * reference block of the live tile. The tile comes last because reviewers edit
- * it: text typed below the block, or a reformatted line, reads as an owner edit.
- * A card counts only when its reference block is there.
+ * archived payload of the same name, and the reference block of the live tile.
+ * None of them is right every time: a prepare run once overwrote a base payload;
+ * an archived payload can predate the notebook (the prepare run wrote it, the
+ * apply run that created the notebook did not); reviewers edit the tile's block.
+ * So the drift check takes them all (`driftOf` `stagedQueries`): an alert still
+ * equal to any of them was not changed by its owner. A source counts only when
+ * it has the card and the card its reference block.
  */
-export function stagedQueryOf(
+export function stagedQueriesOf(
   objectId: string,
   sources: { base?: PayloadSections; archive?: PayloadSections; tileValue: string },
-): { query?: string; from: StagedFrom } {
+): Array<{ from: StagedFrom; query: string }> {
   const fromPayload = (sections: PayloadSections | undefined): string | undefined => {
     const value = (sections ?? []).find((s) => s?.id === `dql-${objectId}`)?.state?.input?.value;
     return typeof value === 'string' ? parseOriginalBlock(value) || undefined : undefined;
   };
+  const out: Array<{ from: StagedFrom; query: string }> = [];
   const base = fromPayload(sources.base);
-  if (base) return { query: base, from: 'base' };
+  if (base) out.push({ from: 'base', query: base });
   const archive = fromPayload(sources.archive);
-  if (archive) return { query: archive, from: 'archive' };
+  if (archive) out.push({ from: 'archive', query: archive });
   const tile = parseOriginalBlock(sources.tileValue);
-  if (tile) return { query: tile, from: 'tile' };
-  return { from: 'none' };
+  if (tile) out.push({ from: 'tile', query: tile });
+  return out;
 }
 
 /**
@@ -285,6 +292,18 @@ export function assertAllowedEnv(baseUrl: string, allowEnv: string | undefined, 
   if (allowed !== connected) {
     throw new Error(`Connected to "${connected}" but --allow-env says "${allowed}". Refusing.`);
   }
+}
+
+/**
+ * The `--limit` flag as the CLI parsed it: a value, `true` when given with no
+ * value, or absent. Anything but a positive integer throws, naming what was
+ * typed: a limit that silently read as "no limit" would publish more than asked.
+ */
+export function parseLimit(raw: string | boolean | undefined): number | undefined {
+  if (raw === undefined || raw === false) return undefined;
+  if (raw === true) throw new Error('--limit needs a value: a positive integer');
+  if (!/^\s*[1-9]\d*\s*$/.test(raw)) throw new Error(`--limit "${raw}" must be a positive integer`);
+  return Number(raw.trim());
 }
 
 // ---------------------------------------------------------------------------

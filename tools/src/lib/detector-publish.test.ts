@@ -13,10 +13,11 @@ import {
   findApprovedTile,
   isAuthFailure,
   mapEventFields,
+  parseLimit,
   publishedPartsEqual,
   selectForPublish,
   staticColumns,
-  stagedQueryOf,
+  stagedQueriesOf,
   withColumnAliases,
   withNodeNameColumn,
   type EventProp,
@@ -275,6 +276,35 @@ describe('driftOf', () => {
 
   it('is edited when it differs otherwise', () => {
     assert.equal(driftOf({ liveQuery: 'other', stagedQuery: staged, approvedQuery: approved, liveIsMigrated: false }), 'edited');
+  });
+
+  describe('with several staged candidates', () => {
+    const fromTile = `${staged}\nnew proposed dql`;
+    const fromArchive = 'timeseries avg(classic), interval:1m';
+
+    it('is none when the live query matches any of them, ignoring surrounding whitespace', () => {
+      assert.equal(driftOf({ liveQuery: staged, stagedQueries: [fromArchive, staged], approvedQuery: approved, liveIsMigrated: false }), 'none');
+      assert.equal(driftOf({ liveQuery: ` ${staged}\n`, stagedQueries: [fromTile, fromArchive, `${staged}  `], approvedQuery: approved, liveIsMigrated: false }), 'none');
+    });
+
+    it('drifts only when it matches none of them', () => {
+      const a = { stagedQueries: [fromArchive, fromTile], approvedQuery: approved };
+      assert.equal(driftOf({ ...a, liveQuery: 'other', liveIsMigrated: false }), 'edited');
+      assert.equal(driftOf({ ...a, liveQuery: 'other', liveIsMigrated: true }), 'owner-migrated');
+    });
+
+    it('is unknown when no candidate is known', () => {
+      assert.equal(driftOf({ liveQuery: staged, stagedQueries: [], approvedQuery: approved, liveIsMigrated: false }), 'unknown');
+      assert.equal(driftOf({ liveQuery: staged, stagedQueries: ['', '  '], approvedQuery: approved, liveIsMigrated: false }), 'unknown');
+    });
+
+    it('counts stagedQuery as one more candidate', () => {
+      assert.equal(driftOf({ liveQuery: staged, stagedQuery: fromArchive, stagedQueries: [staged], approvedQuery: approved, liveIsMigrated: false }), 'none');
+    });
+
+    it('still checks already-published first', () => {
+      assert.equal(driftOf({ liveQuery: approved, stagedQueries: [staged, approved], approvedQuery: approved, liveIsMigrated: true }), 'already-published');
+    });
   });
 });
 
@@ -887,7 +917,7 @@ describe('isAuthFailure', () => {
   });
 });
 
-describe('stagedQueryOf', () => {
+describe('stagedQueriesOf', () => {
   const card = (id: string, classic: string) => ({
     id: `dql-${id}`,
     type: 'dql',
@@ -895,26 +925,51 @@ describe('stagedQueryOf', () => {
   });
   const tile = buildReviewQuery('A-1', 'timeseries x = avg(new)', 'timeseries x = avg(from_tile)');
 
-  it('takes the base payload first', () => {
-    const r = stagedQueryOf('A-1', { base: [card('A-1', 'timeseries x = avg(from_base)')], archive: [card('A-1', 'timeseries x = avg(from_archive)')], tileValue: tile });
-    assert.deepEqual(r, { query: 'timeseries x = avg(from_base)', from: 'base' });
+  it('lists every source that holds the card, base payload, archive, then tile', () => {
+    const r = stagedQueriesOf('A-1', { base: [card('A-1', 'timeseries x = avg(from_base)')], archive: [card('A-1', 'timeseries x = avg(from_archive)')], tileValue: tile });
+    assert.deepEqual(r, [
+      { from: 'base', query: 'timeseries x = avg(from_base)' },
+      { from: 'archive', query: 'timeseries x = avg(from_archive)' },
+      { from: 'tile', query: 'timeseries x = avg(from_tile)' },
+    ]);
   });
 
-  it('falls back to the archived payload when the base has no card for the alert', () => {
-    const r = stagedQueryOf('A-1', { base: [card('B-1', 'other')], archive: [card('A-1', 'timeseries x = avg(from_archive)')], tileValue: tile });
-    assert.deepEqual(r, { query: 'timeseries x = avg(from_archive)', from: 'archive' });
+  it('leaves out a payload that has no card for the alert', () => {
+    const r = stagedQueriesOf('A-1', { base: [card('B-1', 'other')], archive: [card('A-1', 'timeseries x = avg(from_archive)')], tileValue: tile });
+    assert.deepEqual(r.map((c) => c.from), ['archive', 'tile']);
   });
 
-  it('falls back to the live tile last', () => {
-    assert.deepEqual(stagedQueryOf('A-1', { tileValue: tile }), { query: 'timeseries x = avg(from_tile)', from: 'tile' });
+  it('has only the tile when there are no payloads', () => {
+    assert.deepEqual(stagedQueriesOf('A-1', { tileValue: tile }), [{ from: 'tile', query: 'timeseries x = avg(from_tile)' }]);
   });
 
-  it('skips a card whose reference block is gone', () => {
+  it('leaves out a card whose reference block is gone', () => {
     const noBlock = { id: 'dql-A-1', type: 'dql', state: { input: { value: '// [CCT-DETECTOR objectId=A-1]\ntimeseries x = avg(new)' } } };
-    assert.deepEqual(stagedQueryOf('A-1', { base: [noBlock], tileValue: tile }), { query: 'timeseries x = avg(from_tile)', from: 'tile' });
+    assert.deepEqual(stagedQueriesOf('A-1', { base: [noBlock], tileValue: tile }).map((c) => c.from), ['tile']);
   });
 
-  it('is none when no source has the classic query', () => {
-    assert.deepEqual(stagedQueryOf('A-1', { base: [], archive: [], tileValue: '// [CCT-DETECTOR objectId=A-1]\nq' }), { from: 'none' });
+  it('is empty when no source has the classic query', () => {
+    assert.deepEqual(stagedQueriesOf('A-1', { base: [], archive: [], tileValue: '// [CCT-DETECTOR objectId=A-1]\nq' }), []);
+  });
+});
+
+describe('parseLimit', () => {
+  it('reads a positive integer', () => {
+    assert.equal(parseLimit('25'), 25);
+    assert.equal(parseLimit(' 3 '), 3);
+  });
+
+  it('is undefined when the flag is absent', () => {
+    assert.equal(parseLimit(undefined), undefined);
+  });
+
+  it('throws naming the value given for anything else', () => {
+    for (const raw of ['x', '0', '-2', '2.5', '1e3', '']) {
+      assert.throws(() => parseLimit(raw), (e: Error) => e.message === `--limit "${raw}" must be a positive integer`, raw);
+    }
+  });
+
+  it('throws when the flag has no value', () => {
+    assert.throws(() => parseLimit(true), (e: Error) => e.message === '--limit needs a value: a positive integer');
   });
 });
