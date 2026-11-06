@@ -29,11 +29,24 @@
  * migration/detector-promote/prepare/<stamp>/: plan.json, report.md and the
  * value each ready alert would get (payloads/<objectId>.json). No tenant write,
  * no workbook write: the workbook is a file reviewers keep open.
+ *
+ * APPLY (--apply, with --allow-env naming the connected environment) plans the
+ * same way, from fresh reads in the same run, never from files an earlier
+ * prepare left. Then, for each alert the plan marks ready, one at a time:
+ * re-read it and leave it alone if anything in it changed since planning;
+ * snapshot it to migration/detector-promote/pre/<objectId>.json (the first
+ * snapshot ever written wins); write the planned value with the update token of
+ * that re-read (never retried: a write that got no answer is settled by reading);
+ * re-read and check the stored query and event fields; record the value in
+ * published/<objectId>.json. Any HTTP 401/403 stops further writes. One write
+ * to the alerts sheet at the end: published and recorded alerts become promoted
+ * / Published, skipped ones get their reason. A failed sheet write never undoes a
+ * publish; the command names the ids to record.
  */
 
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { REPO_ROOT, SKILL_DAC_AWS_METRICS, SKILL_MANUAL_AWS_METRICS, SKILL_PER_KEY_AWS_METRICS, envIdFromBaseUrl } from '../lib/paths.ts';
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
@@ -51,6 +64,7 @@ import {
   assertAllowedEnv,
   buildPublishValue,
   decideEntity,
+  detectorValuesEqual,
   driftOf,
   findApprovedTile,
   isAuthFailure,
@@ -59,6 +73,7 @@ import {
   selectForPublish,
   stagedQueriesOf,
   staticColumns,
+  whyNotSelected,
   withColumnAliases,
   withNodeNameColumn,
   type Drift,
@@ -67,8 +82,8 @@ import {
   type ManifestBatch,
   type PublishCandidate,
 } from '../lib/detector-publish.ts';
-import { PUBLISH_OVERRIDES, type PublishOverride } from '../lib/decision-states.ts';
-import { ALERTS_SHEET, readRows } from '../lib/tracker-xlsx.ts';
+import { PUBLISHED, PUBLISH_OVERRIDES, type PublishOverride } from '../lib/decision-states.ts';
+import { ALERTS_SHEET, readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { DqlClient, DqlError, type DqlResult } from '../dynatrace/dql.ts';
 import { DocumentApiError, DocumentClient } from '../dynatrace/document.ts';
 import { SettingsApiError, SettingsClient, type SettingsObject } from '../dynatrace/settings.ts';
@@ -96,11 +111,12 @@ export interface PublishPlanItem {
   title: string;
   batch: string;
   /**
-   * ready: passes every gate and differs from live. recorded: the live alert
-   * already has exactly what a publish would write, so only the sheet needs it.
+   * ready: passes every gate and differs from live (after an apply: not written,
+   * because the run stopped). recorded: the live alert already has exactly what a
+   * publish would write, so only the sheet needs it. published: an apply wrote it.
    * skipped: see reasons.
    */
-  result: 'ready' | 'skipped' | 'recorded';
+  result: 'ready' | 'skipped' | 'recorded' | 'published';
   /** Why it was skipped (first entry), or notes about how it goes out. */
   reasons: string[];
   /** The reviewer's override, when the alert's entity decision went through it. */
@@ -115,7 +131,7 @@ export interface PublishPlanItem {
 }
 
 /** The payload file of an alert: what an apply would PUT, and the live query it was planned against. */
-interface PayloadFile {
+export interface PayloadFile {
   objectId: string;
   title: string;
   batch: string;
@@ -126,11 +142,15 @@ interface PayloadFile {
 }
 
 /** One planned alert plus what only this run needs: the summary label and the payload. */
-interface Outcome {
+export interface Outcome {
   item: PublishPlanItem;
   /** Short label the report groups skipped alerts by. */
   gate: string;
   payload?: PayloadFile;
+  /** The whole live value the payload was built from; an apply writes nothing if the alert differs from it. */
+  liveValue?: Record<string, unknown>;
+  /** When an apply wrote it. */
+  publishedAt?: string;
 }
 
 const SEVEN_DAYS_MS = 7 * 864e5;
@@ -267,6 +287,7 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   try {
     sections = await ctx.sections(c.notebookId);
   } catch (e) {
+    if (isAuthFailure(e)) throw e;
     return skip('review notebook could not be read', `the review notebook ${c.notebookId} could not be read: ${errText(e)}`);
   }
   const tile = findApprovedTile(sections, c.objectId);
@@ -346,6 +367,7 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   try {
     run2h = await run(approved, TWO_HOURS_MS);
   } catch (e) {
+    if (isAuthFailure(e)) throw e;
     return skip('the query fails on the tenant', `the approved query fails on the tenant over the last 2 hours: ${errText(e)}`);
   }
 
@@ -390,6 +412,7 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
     try {
       final2h = await run(finalQuery, TWO_HOURS_MS);
     } catch (e) {
+      if (isAuthFailure(e)) throw e;
       return skip('the query fails on the tenant', `the query to publish fails on the tenant over the last 2 hours: ${errText(e)}`);
     }
   }
@@ -404,6 +427,7 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   try {
     columns = columnsOf(await run7d(finalQuery));
   } catch (e) {
+    if (isAuthFailure(e)) throw e;
     columns = columnsOf(final2h);
     notes.push(`the 7-day run failed (${errText(e)}), so the columns come from the 2-hour run.`);
   }
@@ -449,6 +473,7 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
     try {
       await run(finalQuery, TWO_HOURS_MS);
     } catch (e) {
+      if (isAuthFailure(e)) throw e;
       return skip('the query fails on the tenant', `the query to publish fails on the tenant over the last 2 hours: ${errText(e)}`);
     }
   }
@@ -491,7 +516,7 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
 
   item.result = 'ready';
   item.reasons = notes;
-  return { item, gate: 'ready', payload };
+  return { item, gate: 'ready', payload, liveValue: value };
 }
 
 // ---------------------------------------------------------------------------
@@ -506,30 +531,66 @@ function countBy<T>(xs: T[], key: (x: T) => string): Array<[string, number]> {
   return [...m].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 
-function renderReport(outcomes: Outcome[], meta: { env: string; batches: string[]; tracker: string; stamp: string; unknownBatches: string[] }): string {
+interface ReportMeta {
+  mode: 'prepare' | 'apply';
+  env: string;
+  batches: string[];
+  tracker: string;
+  stamp: string;
+  unknownBatches: string[];
+  /** Apply only: why the run stopped before writing every ready alert. */
+  stopped?: string;
+}
+
+function renderReport(outcomes: Outcome[], meta: ReportMeta): string {
   const items = outcomes.map((o) => o.item);
   const n = (r: PublishPlanItem['result']) => items.filter((i) => i.result === r).length;
+  const apply = meta.mode === 'apply';
   const lines: string[] = [];
-  lines.push('# Publishing alerts: prepare', '');
-  lines.push(
-    `Prepared ${meta.stamp} against \`${meta.env}\` for ${meta.batches.join(', ')}, from the alerts sheet of \`${meta.tracker}\`. ` +
-      'Nothing was written to the tenant or the workbook. Server validation ran with `validateOnly`, which persists nothing.',
-    '',
-  );
+  lines.push(`# Publishing alerts: ${meta.mode}`, '');
+  if (apply) {
+    lines.push(
+      `Applied ${meta.stamp} against \`${meta.env}\` for ${meta.batches.join(', ')}, from the alerts sheet of \`${meta.tracker}\`. ` +
+        'Each ready alert was written one at a time: re-read (and left alone if it had changed since planning), snapshotted to `pre/`, ' +
+        'written with the update token of that re-read, re-read again to check, and recorded in `published/`. ' +
+        'The alerts sheet gets one row per alert.',
+      '',
+    );
+    if (meta.stopped) lines.push(`**Stopped:** ${meta.stopped}`, '');
+  } else {
+    lines.push(
+      `Prepared ${meta.stamp} against \`${meta.env}\` for ${meta.batches.join(', ')}, from the alerts sheet of \`${meta.tracker}\`. ` +
+        'Nothing was written to the tenant or the workbook. Server validation ran with `validateOnly`, which persists nothing.',
+      '',
+    );
+  }
   if (meta.unknownBatches.length) {
     lines.push(`Not found in the manifest, or never published as a review notebook: ${meta.unknownBatches.join(', ')}.`, '');
   }
+  // The results this mode can leave: [result, summary label, batch column]. An
+  // apply leaves `ready` only when it stopped.
+  type Column = [PublishPlanItem['result'], string, string];
+  const stoppedColumn: Column[] = n('ready') ? [['ready', 'Not written: the run stopped', 'Not written']] : [];
+  const columns: Column[] = apply
+    ? [
+        ['published', 'Published', 'Published'],
+        ['recorded', 'Already published, recorded only', 'Recorded'],
+        ['skipped', 'Skipped', 'Skipped'],
+        ...stoppedColumn,
+      ]
+    : [
+        ['ready', 'Ready to publish (server validation passed)', 'Ready'],
+        ['recorded', 'Already published, recorded only', 'Recorded'],
+        ['skipped', 'Skipped', 'Skipped'],
+      ];
   lines.push('| Result | Alerts |', '|---|---|');
-  lines.push(`| Ready to publish (server validation passed) | ${n('ready')} |`);
-  lines.push(`| Already published, recorded only | ${n('recorded')} |`);
-  lines.push(`| Skipped | ${n('skipped')} |`);
+  for (const [r, label] of columns) lines.push(`| ${label} | ${n(r)} |`);
   lines.push(`| **Total** | **${items.length}** |`, '');
 
-  lines.push('## By batch', '', '| Batch | Ready | Recorded | Skipped |', '|---|---|---|---|');
+  lines.push('## By batch', '', `| Batch | ${columns.map((c) => c[2]).join(' | ')} |`, `|---|${columns.map(() => '---|').join('')}`);
   for (const b of [...new Set(items.map((i) => i.batch))]) {
     const inB = items.filter((i) => i.batch === b);
-    const c = (r: PublishPlanItem['result']) => inB.filter((i) => i.result === r).length;
-    lines.push(`| ${b} | ${c('ready')} | ${c('recorded')} | ${c('skipped')} |`);
+    lines.push(`| ${b} | ${columns.map(([r]) => inB.filter((i) => i.result === r).length).join(' | ')} |`);
   }
   lines.push('');
 
@@ -571,7 +632,8 @@ function renderReport(outcomes: Outcome[], meta: { env: string; batches: string[
         if (i.diff.query.before.trim() === i.diff.query.after.trim()) {
           lines.push('Query unchanged.', '');
         } else {
-          lines.push('Query, live:', '', fence(i.diff.query.before), '', `Query, ${i.result === 'ready' ? 'to publish' : 'approved'}:`, '', fence(i.diff.query.after), '');
+          const label = i.result === 'published' ? 'published' : i.result === 'ready' ? 'to publish' : 'approved';
+          lines.push(`Query, ${i.result === 'published' ? 'before' : 'live'}:`, '', fence(i.diff.query.before), '', `Query, ${label}:`, '', fence(i.diff.query.after), '');
         }
       }
       if (i.diff.fields.length) {
@@ -585,6 +647,283 @@ function renderReport(outcomes: Outcome[], meta: { env: string; batches: string[
 }
 
 // ---------------------------------------------------------------------------
+// Apply
+
+export interface ApplyDeps {
+  /** The two Settings calls a write makes. */
+  settings: Pick<SettingsClient, 'getObject' | 'putObject'>;
+  /** `<tenant>/migration/detector-promote`: `pre/` snapshots and `published/` records go under it. */
+  promoteDir: string;
+  /** The workbook whose alerts sheet gets one row per alert. */
+  trackerPath: string;
+  /** Defaults to `upsertRows`. */
+  upsert?: (path: string, rows: TrackerRow[], sheet: string) => Promise<unknown>;
+  log?: (line: string) => void;
+  now?: () => Date;
+}
+
+export interface ApplyRun {
+  /** The alerts this run wrote, in order. */
+  published: string[];
+  /** Ready alerts left unwritten because the run stopped. */
+  notAttempted: string[];
+  /** The HTTP 401/403 that stopped the run. */
+  stop?: unknown;
+  /** The rows given to the alerts sheet. */
+  rows: TrackerRow[];
+  /** False when the sheet write failed; the publishes stand. */
+  recorded: boolean;
+}
+
+type ResolvedDeps = Required<ApplyDeps>;
+
+const RECORDED_REASON = 'already published, recorded';
+/** A cell holds at most 32,767 characters; a reason past this is a server message nobody reads whole. */
+const REASONS_MAX = 2000;
+
+/** The reasons as one cell: sentences joined by a space, clipped. */
+function reasonsText(reasons: string[]): string {
+  const text = reasons.map((r) => r.trim()).filter(Boolean).join(' ');
+  return text.length > REASONS_MAX ? `${text.slice(0, REASONS_MAX)}…` : text;
+}
+
+/**
+ * Write one ready alert and update its outcome: `published`, or `skipped` with
+ * the reason first. Returns the HTTP 401/403 that must stop the run, if one came;
+ * the alert it came on stays `ready` (not written: nothing to record about the
+ * alert itself), unless its write had already gone through.
+ */
+async function applyOne(o: Outcome, deps: ResolvedDeps): Promise<unknown> {
+  const { item, payload } = o;
+  const id = item.objectId;
+  const log = deps.log;
+  const skip = (gate: string, reason: string): undefined => {
+    item.result = 'skipped';
+    item.reasons = [reason, ...item.reasons];
+    o.gate = gate;
+    log(`  ! ${id} (${item.title}): ${reason}`);
+    return undefined;
+  };
+  const stopHere = (e: unknown, what: string): unknown => {
+    item.reasons = [...item.reasons, `not written: the run stopped here, ${what}: ${errText(e)}`];
+    log(`  ! ${id} (${item.title}): ${what}: ${errText(e)}. Stopping.`);
+    return e;
+  };
+  if (!payload || !o.liveValue) return skip('apply: nothing planned to write', 'not written: the plan holds no value to write for it.');
+
+  // 1. Re-read. A change of any kind since planning is left alone: the planned
+  // value is the live value of then, so writing it would undo the change.
+  let live: SettingsObject;
+  try {
+    live = await deps.settings.getObject(id);
+  } catch (e) {
+    if (isAuthFailure(e)) return stopHere(e, 'the re-read before the write was refused');
+    if (e instanceof SettingsApiError && e.status === 404) return skip('the alert no longer exists', 'not written: the alert no longer exists (HTTP 404).');
+    return skip('apply: the re-read failed', `not written: the re-read before the write failed: ${errText(e)}`);
+  }
+  const value = live.value ?? {};
+  if (detectorQuery(value) !== payload.liveQuery) {
+    return skip(
+      'drift: changed since planned',
+      'not written: its live query changed after this run planned it, so someone is editing the alert now. Re-run to plan it again.',
+    );
+  }
+  if (!detectorValuesEqual(value, o.liveValue)) {
+    return skip(
+      'drift: changed since planned',
+      'not written: the alert changed after this run planned it (not its query: e.g. its threshold, enabled state or event fields), ' +
+        'and writing the planned value would undo that. Re-run to plan it again.',
+    );
+  }
+
+  // 2. Snapshot. The first one ever written wins, so a re-run after a partial
+  // failure keeps the original; nothing is written without one.
+  const prePath = join(deps.promoteDir, 'pre', `${id}.json`);
+  try {
+    await mkdir(dirname(prePath), { recursive: true });
+    await writeFile(prePath, JSON.stringify({ objectId: id, title: item.title, snapshotAt: deps.now().toISOString(), value }, null, 2), { flag: 'wx' });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') {
+      return skip('apply: snapshot failed', `not written: the snapshot ${prePath} could not be written (${errText(e)}), and nothing is written without one.`);
+    }
+  }
+
+  // 3. The write, locked to the value just read. Never sent twice: a write that
+  // got no answer may have landed, so it is settled by reading.
+  const notes: string[] = [];
+  let checked = false;
+  try {
+    await deps.settings.putObject(id, {
+      value: payload.value,
+      updateToken: typeof live.updateToken === 'string' ? live.updateToken : undefined,
+      schemaVersion: typeof live.schemaVersion === 'string' ? live.schemaVersion : payload.schemaVersion,
+    });
+  } catch (e) {
+    if (isAuthFailure(e)) return stopHere(e, 'the write was refused');
+    if (e instanceof SettingsApiError) {
+      const why = e.status === 409 ? ' (the alert changed between the re-read and the write)' : '';
+      return skip('apply: the write was refused', `not written: the write was refused${why}: ${errText(e)}`);
+    }
+    let after: SettingsObject;
+    try {
+      after = await deps.settings.getObject(id);
+    } catch (e2) {
+      skip(
+        'apply: the write may have landed',
+        `the write got no answer (${errText(e)}) and the re-read after it failed too (${errText(e2)}), so whether it landed is unknown. ` +
+          'Re-read the alert before re-running.',
+      );
+      return isAuthFailure(e2) ? e2 : undefined;
+    }
+    if (!publishedPartsEqual(after.value ?? {}, payload.value)) {
+      return skip('apply: the write failed', `not written: the write got no answer (${errText(e)}) and a re-read shows it did not land.`);
+    }
+    notes.push(`the write got no answer (${errText(e)}), but a re-read shows it landed.`);
+    checked = true;
+  }
+
+  // 4. Re-read and check the parts the publish wrote. A mismatch does not undo
+  // the write (it went through); it is recorded and printed for a person.
+  let stop: unknown;
+  if (!checked) {
+    try {
+      const after = await deps.settings.getObject(id);
+      if (!publishedPartsEqual(after.value ?? {}, payload.value)) {
+        const part = detectorQuery(after.value ?? {}) !== detectorQuery(payload.value) ? 'query' : 'event fields';
+        notes.push(`the re-read after the write does not show the published ${part}: the stored value differs from what was written. Check the alert.`);
+      }
+    } catch (e) {
+      notes.push(`the re-read after the write failed (${errText(e)}), so the stored value was not checked.`);
+      if (isAuthFailure(e)) stop = e;
+    }
+  }
+
+  // 5. The record verify, rollback and the next run's drift check read.
+  const publishedAt = deps.now().toISOString();
+  const publishedPath = join(deps.promoteDir, 'published', `${id}.json`);
+  try {
+    await mkdir(dirname(publishedPath), { recursive: true });
+    await writeFile(publishedPath, JSON.stringify({ objectId: id, publishedAt, value: payload.value }, null, 2));
+  } catch (e) {
+    notes.push(`its record ${publishedPath} could not be written (${errText(e)}); verify and rollback need it, so copy this run's payloads/${id}.json there.`);
+  }
+
+  item.result = 'published';
+  item.reasons = [...item.reasons, ...notes];
+  o.gate = 'published';
+  o.publishedAt = publishedAt;
+  log(`  ✓ published ${id} (${item.title})`);
+  for (const note of notes) log(`      ${note}`);
+  if (stop) log(`  ! the re-read after writing ${id} was refused. Stopping.`);
+  return stop;
+}
+
+/** When an earlier apply published an alert, from its record; undefined when there is none. */
+async function earlierPublishAt(promoteDir: string, objectId: string): Promise<string | undefined> {
+  try {
+    const rec = JSON.parse(await readFile(join(promoteDir, 'published', `${objectId}.json`), 'utf8')) as { publishedAt?: unknown };
+    return typeof rec.publishedAt === 'string' ? rec.publishedAt : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * One row per alert the run decided: published and recorded become promoted /
+ * Published, skipped ones get their reason and nothing else. A ready alert the
+ * run stopped before writing gets no row.
+ */
+async function sheetRows(outcomes: Outcome[], deps: ResolvedDeps): Promise<TrackerRow[]> {
+  const rows: TrackerRow[] = [];
+  for (const o of outcomes) {
+    const i = o.item;
+    const row: TrackerRow = { asset_id: i.objectId, asset_type: 'anomaly-detector', name: i.title };
+    if (i.result === 'published' || i.result === 'recorded') {
+      rows.push({
+        ...row,
+        status: 'promoted',
+        decision: PUBLISHED,
+        promoted_at: (i.result === 'published' ? o.publishedAt : await earlierPublishAt(deps.promoteDir, i.objectId)) ?? deps.now().toISOString(),
+        review_batch: i.batch,
+        reasons: i.result === 'recorded' ? RECORDED_REASON : reasonsText(i.reasons),
+      });
+    } else if (i.result === 'skipped') {
+      rows.push({ ...row, reasons: reasonsText(i.reasons) });
+    }
+  }
+  return rows;
+}
+
+/** One write to the alerts sheet. A failure never undoes a publish: it names the ids to record. */
+async function recordOnSheet(rows: TrackerRow[], deps: ResolvedDeps): Promise<boolean> {
+  if (!rows.length) return true;
+  try {
+    await deps.upsert(deps.trackerPath, rows, ALERTS_SHEET);
+    deps.log(`Recorded ${rows.length} row(s) on the ${ALERTS_SHEET} sheet of ${deps.trackerPath}.`);
+    return true;
+  } catch (e) {
+    const msg = clip((e as Error)?.message ?? String(e), 100);
+    const ids = rows.filter((r) => r.status === 'promoted').map((r) => r.asset_id);
+    if (ids.length) {
+      deps.log(`\n  ! Published, but could not write the tracker (${msg}).`);
+      deps.log(
+        `    Close ${deps.trackerPath} and re-run with --apply --ids ${ids.join(',')} to record them: ` +
+          'a re-run finds them already published and records them without writing again.',
+      );
+    } else {
+      deps.log(`\n  ! Could not write the tracker (${msg}). Nothing was published in this run; the skip reasons are in the report.`);
+    }
+    return false;
+  }
+}
+
+/**
+ * The apply: write every `ready` outcome, one at a time, in order; stop at the
+ * first HTTP 401/403; then one write to the alerts sheet for every alert the run
+ * decided, the ones published before a stop included. Only outcomes planned in
+ * this run reach here, so nothing is written from a payload file on disk.
+ */
+export async function applyAndRecord(outcomes: Outcome[], deps: ApplyDeps): Promise<ApplyRun> {
+  const d: ResolvedDeps = {
+    ...deps,
+    upsert: deps.upsert ?? upsertRows,
+    log: deps.log ?? ((line: string) => console.log(line)),
+    now: deps.now ?? (() => new Date()),
+  };
+  const published: string[] = [];
+  const notAttempted: string[] = [];
+  let stop: unknown;
+  for (const o of outcomes) {
+    if (o.item.result !== 'ready') continue;
+    if (stop) {
+      o.item.reasons = [...o.item.reasons, 'not written: the run stopped before this alert.'];
+      notAttempted.push(o.item.objectId);
+      continue;
+    }
+    const refused = await applyOne(o, d);
+    // applyOne moved the result on; read it afresh rather than through the narrowing above.
+    const after: PublishPlanItem['result'] = o.item.result as PublishPlanItem['result'];
+    if (after === 'published') published.push(o.item.objectId);
+    else if (after === 'ready') notAttempted.push(o.item.objectId);
+    if (refused) stop = refused;
+  }
+  const rows = await sheetRows(outcomes, d);
+  const recorded = await recordOnSheet(rows, d);
+  return { published, notAttempted, stop, rows, recorded };
+}
+
+/** Why the token was refused, and what it needs, by the API that refused it. */
+function authStopText(e: unknown): string {
+  if (e instanceof DqlError) {
+    return `the DQL query API refused the token (${errText(e)}). It needs the storage read scopes the alerts' queries use.`;
+  }
+  if (e instanceof DocumentApiError) {
+    return `the Document API refused the token (${errText(e)}). It needs document:documents:read, with admin access for review notebooks it does not own.`;
+  }
+  return `the Settings API refused the token (${errText(e)}). It needs settings:objects:read and settings:objects:write for builtin:davis.anomaly-detectors.`;
+}
+
+// ---------------------------------------------------------------------------
 
 export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<void> {
   const batches = (args.batches ?? []).map((b) => b.trim()).filter(Boolean);
@@ -594,10 +933,15 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
   if (args.limit !== undefined && !(Number.isInteger(args.limit) && args.limit > 0)) {
     throw new Error(`migrate-promote-detectors: --limit "${args.limit}" must be a positive integer`);
   }
-  assertAllowedEnv(args.baseUrl, args.allowEnv, args.apply === true);
-  if (args.apply) {
-    throw new Error('migrate-promote-detectors: --apply is not available yet. Run without it to prepare and read the report.');
+  // A filter that reads as "no filter" would widen an apply to the whole batch.
+  if (args.ids && !args.ids.length) {
+    throw new Error('migrate-promote-detectors: --ids names no alert id. Leave it out to take every Ready alert of the batches.');
   }
+  if (args.force && !args.ids?.length) {
+    throw new Error('migrate-promote-detectors: --force needs --ids: it publishes named alerts their owner changed after review, never a whole batch.');
+  }
+  assertAllowedEnv(args.baseUrl, args.allowEnv, args.apply === true);
+  const mode: ReportMeta['mode'] = args.apply ? 'apply' : 'prepare';
 
   const base = args.outDir;
   const reviewDir = join(base, 'migration', 'detector-review');
@@ -615,15 +959,25 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
     throw new Error(`migrate-promote-detectors: no workbook at ${trackerPath}. Pass --tracker <path> or set DT_TRACKER_PATH.`);
   }
   const rows = await readRows(trackerPath, ALERTS_SHEET);
-  const { candidates, unknownBatches } = selectForPublish(rows, manifest.batches ?? [], { batches, ids: args.ids, limit: args.limit });
+  const selected = selectForPublish(rows, manifest.batches ?? [], { batches, ids: args.ids });
+  const unknownBatches = selected.unknownBatches;
   if (unknownBatches.length) {
     console.log(`Not found in the manifest, or never published as a review notebook: ${unknownBatches.join(', ')}. Continuing with the rest.`);
   }
+  if (args.ids?.length) {
+    const picked = new Set(selected.candidates.map((c) => c.objectId));
+    const left = whyNotSelected(args.ids.filter((id) => !picked.has(id)), rows, manifest.batches ?? [], { batches });
+    if (left.length) {
+      console.log(`${left.length} of the --ids not selected:`);
+      for (const l of left) console.log(`  ${l.id}: ${l.reason}`);
+    }
+  }
+  const candidates = args.limit === undefined ? selected.candidates : selected.candidates.slice(0, args.limit);
   if (!candidates.length) {
     console.log(`Nothing to publish: no Ready To Publish alert on the alerts sheet of ${trackerPath} is in ${batches.join(', ')}${args.ids?.length ? ' with the given --ids' : ''}.`);
     return;
   }
-  console.log(`Preparing ${candidates.length} alert(s) from ${batches.join(', ')}…`);
+  console.log(`${args.apply ? 'Planning' : 'Preparing'} ${candidates.length} alert(s) from ${batches.join(', ')}…`);
 
   const mappingPath = join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
   const index = await loadRecipeIndex(mappingPath, {
@@ -641,6 +995,16 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
   const docs = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
   const dql = new DqlClient({ baseUrl: args.baseUrl, token: args.token });
 
+  // The first HTTP 401/403 from any API. The workers stop taking alerts once it
+  // is set. Recorded here as well as thrown, because some callers (the binding
+  // check) turn a failed query into an outcome instead of passing it on.
+  let stop: unknown;
+  const noteAuth = <T>(p: Promise<T>): Promise<T> =>
+    p.catch((e: unknown) => {
+      if (isAuthFailure(e)) stop ??= e;
+      throw e;
+    });
+
   // One read per notebook and per payload file, shared by every alert in it.
   const notebooks = new Map<string, ReturnType<Ctx['sections']>>();
   const payloads = new Map<string, Promise<PayloadRead>>();
@@ -650,19 +1014,21 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
     settings,
     run: (query, windowMs) => {
       const end = new Date();
-      return dql.query({
-        query,
-        defaultTimeframeStart: new Date(end.getTime() - windowMs).toISOString(),
-        defaultTimeframeEnd: end.toISOString(),
-        // One past the cap is enough to know a split is too big for Davis.
-        maxResultRecords: DAVIS_SERIES_CAP + 1,
-        fetchTimeoutSeconds: 120,
-      });
+      return noteAuth(
+        dql.query({
+          query,
+          defaultTimeframeStart: new Date(end.getTime() - windowMs).toISOString(),
+          defaultTimeframeEnd: end.toISOString(),
+          // One past the cap is enough to know a split is too big for Davis.
+          maxResultRecords: DAVIS_SERIES_CAP + 1,
+          fetchTimeoutSeconds: 120,
+        }),
+      );
     },
     sections: (notebookId) => {
       let p = notebooks.get(notebookId);
       if (!p) {
-        p = docs.getDocumentFull(notebookId, true).then((d) => {
+        p = noteAuth(docs.getDocumentFull(notebookId, true)).then((d) => {
           const content = (typeof d.content === 'string' ? JSON.parse(d.content) : d.content) as { sections?: unknown };
           return Array.isArray(content?.sections) ? content.sections : [];
         });
@@ -706,7 +1072,6 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
   const outcomes: Array<Outcome | undefined> = new Array(candidates.length);
   let next = 0;
   let done = 0;
-  let stop: unknown;
   const worker = async (): Promise<void> => {
     while (!stop && next < candidates.length) {
       const k = next++;
@@ -729,38 +1094,65 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
   };
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
   if (stop) {
-    throw new Error(
-      `migrate-promote-detectors: the Settings API refused the token (${errText(stop)}). ` +
-        'It needs settings:objects:read and settings:objects:write for builtin:davis.anomaly-detectors. Stopped; nothing was written.',
-    );
+    throw new Error(`migrate-promote-detectors: ${authStopText(stop)} Stopped; nothing was written.`);
   }
 
   const finished = outcomes.filter((o): o is Outcome => o !== undefined);
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
-  const runDir = join(promoteDir, 'prepare', stamp);
+  const runDir = join(promoteDir, mode, stamp);
   await mkdir(join(runDir, 'payloads'), { recursive: true });
-  await writeFile(join(runDir, 'plan.json'), JSON.stringify(finished.map((o) => o.item), null, 2));
+  const writePlan = async (stopped?: string): Promise<void> => {
+    await writeFile(join(runDir, 'plan.json'), JSON.stringify(finished.map((o) => o.item), null, 2));
+    const meta = { mode, env: envIdFromBaseUrl(args.baseUrl), batches, tracker: trackerPath, stamp: new Date().toISOString(), unknownBatches, stopped };
+    await writeFile(join(runDir, 'report.md'), renderReport(finished, meta));
+  };
   for (const o of finished) {
     if (o.payload) await writeFile(join(runDir, 'payloads', `${o.item.objectId}.json`), JSON.stringify(o.payload, null, 2));
   }
-  const report = renderReport(finished, {
-    env: envIdFromBaseUrl(args.baseUrl),
-    batches,
-    tracker: trackerPath,
-    stamp: new Date().toISOString(),
-    unknownBatches,
-  });
-  await writeFile(join(runDir, 'report.md'), report);
 
   const n = (r: PublishPlanItem['result']) => finished.filter((o) => o.item.result === r).length;
-  console.log('');
-  console.log(`${n('ready')} ready (server validation passed), ${n('recorded')} already published (recorded only), ${n('skipped')} skipped, of ${finished.length}.`);
-  for (const [gate, k] of countBy(finished.filter((o) => o.item.result === 'skipped'), (o) => o.gate)) {
-    console.log(`  ${String(k).padStart(4)}  ${gate}`);
+  const printSkips = (): void => {
+    for (const [gate, k] of countBy(finished.filter((o) => o.item.result === 'skipped'), (o) => o.gate)) {
+      console.log(`  ${String(k).padStart(4)}  ${gate}`);
+    }
+    const overridden = finished.filter((o) => o.item.override && o.item.result !== 'skipped').length;
+    if (overridden) console.log(`  ${overridden} going out under a publish_override (listed in the report).`);
+  };
+
+  if (!args.apply) {
+    await writePlan();
+    console.log('');
+    console.log(`${n('ready')} ready (server validation passed), ${n('recorded')} already published (recorded only), ${n('skipped')} skipped, of ${finished.length}.`);
+    printSkips();
+    console.log('');
+    console.log(`Report: ${join(runDir, 'report.md')}`);
+    console.log(`Plan and payloads: ${runDir}. Nothing was written to the tenant or the workbook.`);
+    return;
   }
-  const overridden = finished.filter((o) => o.item.override && o.item.result !== 'skipped').length;
-  if (overridden) console.log(`  ${overridden} going out under a publish_override (listed in the report).`);
+
+  // The payloads are on disk before the first write; the plan and report are
+  // written once the run's results are known.
+  console.log('');
+  console.log(`${n('ready')} ready, ${n('recorded')} already published (recorded only), ${n('skipped')} skipped. Writing the ready ones, one at a time…`);
+  const run = await applyAndRecord(finished, { settings, promoteDir, trackerPath });
+  const stopped = run.stop
+    ? `${authStopText(run.stop)} ${run.notAttempted.length} ready alert(s) not written: ${run.notAttempted.join(', ')}.`
+    : undefined;
+  await writePlan(stopped);
+
+  console.log('');
+  console.log(
+    `${n('published')} published, ${n('recorded')} already published (recorded only), ${n('skipped')} skipped` +
+      `${run.notAttempted.length ? `, ${run.notAttempted.length} not written (the run stopped)` : ''}, of ${finished.length}.`,
+  );
+  printSkips();
   console.log('');
   console.log(`Report: ${join(runDir, 'report.md')}`);
-  console.log(`Plan and payloads: ${runDir}. Nothing was written to the tenant or the workbook.`);
+  console.log(`Snapshots: ${join(promoteDir, 'pre')}. Published values: ${join(promoteDir, 'published')}.`);
+  if (run.stop) {
+    throw new Error(
+      `migrate-promote-detectors: stopped. ${stopped} ` +
+        `${run.published.length} alert(s) published before it ${run.recorded ? 'are recorded on the sheet' : 'are not on the sheet yet (see above)'}.`,
+    );
+  }
 }

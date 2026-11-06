@@ -16,6 +16,8 @@ import { DETECTOR_MARKER_RE, parseOriginalBlock } from './detector-notebook.ts';
 import { codeMask, timeseriesCommands } from './dql-command.ts';
 import { envIdFromBaseUrl } from './paths.ts';
 import { SettingsApiError } from '../dynatrace/settings.ts';
+import { DqlError } from '../dynatrace/dql.ts';
+import { DocumentApiError } from '../dynatrace/document.ts';
 
 /** One review batch as the stage-detectors manifest records it. */
 export interface ManifestBatch {
@@ -102,6 +104,39 @@ export function selectForPublish(
   });
 
   return { candidates: opts.limit === undefined ? candidates : candidates.slice(0, opts.limit), unknownBatches };
+}
+
+/**
+ * Why each of `ids` is not a candidate under the rules of `selectForPublish`:
+ * the first rule it fails. For ids named with `--ids` that the selection left
+ * out, so a typo or a stale id is reported rather than silently dropped.
+ */
+export function whyNotSelected(
+  ids: string[],
+  rows: Map<string, Record<string, string>>,
+  batches: ManifestBatch[],
+  opts: { batches: string[] },
+): Array<{ id: string; reason: string }> {
+  // The batch holding each alert's newest card, as selectForPublish decides it.
+  const ownerBatch = new Map<string, string>();
+  for (const b of batches.filter((x) => x.notebookId)) {
+    for (const d of b.detectors ?? []) ownerBatch.set(d.objectId, b.batch);
+  }
+  const wanted = new Set(opts.batches);
+  return ids.map((id) => {
+    const owner = ownerBatch.get(id);
+    if (!owner) return { id, reason: 'in no published review batch' };
+    if (!wanted.has(owner)) return { id, reason: `its review card is in ${owner}, not in ${opts.batches.join(', ')}` };
+    const row = rows.get(id);
+    if (!row) return { id, reason: 'not on the alerts sheet' };
+    const status = (row.status ?? '').trim();
+    if (PUBLISHED_STATUSES.has(status.toLowerCase())) return { id, reason: `already published (status ${status})` };
+    if (!isReadyToPublish(row.decision)) {
+      const decision = (row.decision ?? '').trim();
+      return { id, reason: `decision is ${decision ? `"${decision}"` : 'empty'}, not Ready To Publish` };
+    }
+    return { id, reason: 'not selected' };
+  });
 }
 
 /**
@@ -269,11 +304,15 @@ export function stagedQueriesOf(
 }
 
 /**
- * The token cannot read or write settings: every later call would fail the same
- * way, so the run stops at the first one instead of reporting each alert.
+ * The token was refused (HTTP 401 or 403) by one of the APIs a publish calls:
+ * Settings, DQL or the Document API. Every later call would fail the same way,
+ * and an apply must not keep writing with a token that is half working, so the
+ * run stops at the first one instead of reporting each alert.
  */
 export function isAuthFailure(e: unknown): boolean {
-  return e instanceof SettingsApiError && (e.status === 401 || e.status === 403);
+  return (
+    (e instanceof SettingsApiError || e instanceof DqlError || e instanceof DocumentApiError) && (e.status === 401 || e.status === 403)
+  );
 }
 
 /**
@@ -304,6 +343,19 @@ export function parseLimit(raw: string | boolean | undefined): number | undefine
   if (raw === true) throw new Error('--limit needs a value: a positive integer');
   if (!/^\s*[1-9]\d*\s*$/.test(raw)) throw new Error(`--limit "${raw}" must be a positive integer`);
   return Number(raw.trim());
+}
+
+/**
+ * The `--ids` flag as the CLI parsed it: a comma-separated list, `true` when
+ * given with no value, or absent. A flag with no ids throws: read as "no filter",
+ * it would turn `--apply --ids` into a publish of the whole batch.
+ */
+export function parseIds(raw: string | boolean | undefined): string[] | undefined {
+  if (raw === undefined || raw === false) return undefined;
+  if (raw === true) throw new Error('--ids needs a value: a comma-separated list of alert ids');
+  const ids = [...new Set(raw.split(',').map((s) => s.trim()).filter(Boolean))];
+  if (!ids.length) throw new Error(`--ids "${raw}" names no alert id`);
+  return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -708,4 +760,14 @@ function publishedParts(v: Record<string, unknown>): { query: string | null; pro
  */
 export function publishedPartsEqual(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
   return sortedJson(publishedParts(a)) === sortedJson(publishedParts(b));
+}
+
+/**
+ * Are two detector values the same, every field of them, ignoring object key
+ * order? For the apply re-read: a publish writes the whole value it planned, so
+ * any change made since planning (a threshold, `enabled`, an event field) would
+ * be undone by it, not only a change to the query.
+ */
+export function detectorValuesEqual(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  return sortedJson(a) === sortedJson(b);
 }

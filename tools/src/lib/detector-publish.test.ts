@@ -4,8 +4,13 @@ import assert from 'node:assert/strict';
 import type { BindingOutcome } from './detector-binding.ts';
 import { buildReviewQuery } from './detector-notebook.ts';
 import { SettingsApiError } from '../dynatrace/settings.ts';
+import { DqlError } from '../dynatrace/dql.ts';
+import { DocumentApiError } from '../dynatrace/document.ts';
 import {
   BUILTIN_PLACEHOLDERS,
+  detectorValuesEqual,
+  parseIds,
+  whyNotSelected,
   assertAllowedEnv,
   buildPublishValue,
   decideEntity,
@@ -914,6 +919,88 @@ describe('isAuthFailure', () => {
     assert.equal(isAuthFailure(err(404)), false);
     assert.equal(isAuthFailure(new Error('HTTP 403')), false);
     assert.equal(isAuthFailure(undefined), false);
+  });
+
+  it('is true for a DQL or Document API 401 or 403: every API a publish calls', () => {
+    assert.equal(isAuthFailure(new DqlError(401, 'https://example/query:execute', 'denied')), true);
+    assert.equal(isAuthFailure(new DqlError(403, 'https://example/query:execute', 'denied')), true);
+    assert.equal(isAuthFailure(new DocumentApiError(401, 'https://example/documents/x', 'denied')), true);
+    assert.equal(isAuthFailure(new DocumentApiError(403, 'https://example/documents/x', 'denied')), true);
+  });
+
+  it('is false for a DQL or Document API error that is not about the token', () => {
+    assert.equal(isAuthFailure(new DqlError(400, 'https://example/query:execute', 'syntax')), false);
+    assert.equal(isAuthFailure(new DocumentApiError(404, 'https://example/documents/x', 'gone')), false);
+  });
+});
+
+describe('parseIds', () => {
+  it('reads a comma-separated list, trimmed, without repeats', () => {
+    assert.deepEqual(parseIds('a, b,,c ,a'), ['a', 'b', 'c']);
+  });
+
+  it('is undefined when the flag is absent', () => {
+    assert.equal(parseIds(undefined), undefined);
+  });
+
+  it('throws when the flag has no value: with --apply that would publish the whole batch', () => {
+    assert.throws(() => parseIds(true), (e: Error) => e.message === '--ids needs a value: a comma-separated list of alert ids');
+  });
+
+  it('throws when the value names no id', () => {
+    for (const raw of ['', ' , ,']) {
+      assert.throws(() => parseIds(raw), (e: Error) => e.message === `--ids "${raw}" names no alert id`, raw);
+    }
+  });
+});
+
+describe('whyNotSelected', () => {
+  const batches: ManifestBatch[] = [
+    { batch: 'batch-01', notebookId: 'nb-1', detectors: [{ objectId: 'A', title: 'a' }, { objectId: 'MOVED', title: 'm' }] },
+    { batch: 'batch-02', notebookId: 'nb-2', detectors: [{ objectId: 'OTHER', title: 'o' }, { objectId: 'MOVED', title: 'm' }] },
+    { batch: 'batch-03', detectors: [{ objectId: 'UNPUBLISHED', title: 'u' }] },
+  ];
+  const rows = new Map<string, Record<string, string>>([
+    ['A', { decision: 'Needs Review', status: 'staged' }],
+    ['OTHER', { decision: 'Ready To Publish', status: 'staged' }],
+    ['MOVED', { decision: 'Ready To Publish', status: 'staged' }],
+  ]);
+  const why = (ids: string[], extraRows: Array<[string, Record<string, string>]> = []) =>
+    Object.fromEntries(whyNotSelected(ids, new Map([...rows, ...extraRows]), batches, { batches: ['batch-01'] }).map((x) => [x.id, x.reason]));
+
+  it('names the rule each id fails', () => {
+    const r = why(['NOPE', 'UNPUBLISHED', 'OTHER', 'MOVED', 'A']);
+    assert.match(r['NOPE']!, /in no published review batch/);
+    assert.match(r['UNPUBLISHED']!, /in no published review batch/);
+    assert.match(r['OTHER']!, /batch-02, not in batch-01/);
+    assert.match(r['MOVED']!, /batch-02, not in batch-01/, 'its newest card decides');
+    assert.match(r['A']!, /decision is "Needs Review", not Ready To Publish/);
+  });
+
+  it('says when an alert is already published, or missing from the sheet', () => {
+    const extra: ManifestBatch[] = [{ batch: 'batch-01', notebookId: 'nb-1', detectors: [{ objectId: 'P', title: 'p' }, { objectId: 'NOROW', title: 'n' }] }];
+    const r = Object.fromEntries(
+      whyNotSelected(['P', 'NOROW'], new Map([['P', { decision: 'Published', status: 'promoted' }]]), extra, { batches: ['batch-01'] }).map((x) => [x.id, x.reason]),
+    );
+    assert.match(r['P']!, /already published \(status promoted\)/);
+    assert.match(r['NOROW']!, /not on the alerts sheet/);
+  });
+
+  it('calls an empty decision empty', () => {
+    assert.match(why(['A'], [['A', { decision: '', status: 'staged' }]])['A']!, /decision is empty/);
+  });
+});
+
+describe('detectorValuesEqual', () => {
+  const v = { enabled: true, analyzer: { input: [{ key: 'query', value: 'q' }, { key: 'threshold', value: '1' }] } };
+
+  it('ignores key order', () => {
+    assert.equal(detectorValuesEqual(v, { analyzer: { input: [{ value: 'q', key: 'query' }, { key: 'threshold', value: '1' }] }, enabled: true }), true);
+  });
+
+  it('counts any other difference, not only the parts a publish writes', () => {
+    assert.equal(detectorValuesEqual(v, { ...v, enabled: false }), false);
+    assert.equal(detectorValuesEqual(v, { enabled: true, analyzer: { input: [{ key: 'query', value: 'q' }, { key: 'threshold', value: '2' }] } }), false);
   });
 });
 

@@ -46,7 +46,7 @@ import { runMigrateVerify } from './commands/migrate-verify.ts';
 import { runMigrateRollback } from './commands/migrate-rollback.ts';
 import { runStageDetectors } from './commands/stage-detectors.ts';
 import { runPromoteDetectors } from './commands/migrate-promote-detectors.ts';
-import { parseLimit } from './lib/detector-publish.ts';
+import { parseIds, parseLimit } from './lib/detector-publish.ts';
 import { runMigrateMergeDrift } from './commands/migrate-merge-drift.ts';
 import { runDiscoverManagementZones } from './commands/discover-management-zones.ts';
 import { runDiscoverUsers } from './commands/discover-users.ts';
@@ -246,8 +246,12 @@ COMMANDS
                     still exactly as staged with nothing on the tracker.
   migrate-promote-detectors
                     Alert lane: publish Ready alerts IN PLACE by review batch. PREPARE
-                    (default) runs every gate, writes only a report. Flags: --batches
-                    (required), --ids, --limit, --force, --tracker, --apply --allow-env.
+                    (default) runs every gate, writes only a report. --apply
+                    --allow-env <env-id> writes each ready alert, one at a time:
+                    snapshot, write locked to a fresh re-read, re-read check, then
+                    the alerts sheet. Stops at the first HTTP 401/403. Flags:
+                    --batches (required), --ids, --limit, --force (needs --ids),
+                    --tracker, --apply, --allow-env.
   migrate-pull      Fetch the human-fixed review copies (Document API) into
                     migration/reviewed/ and mark rows in-review. Needs the admin
                     token. Flags: --ids, --limit, --tracker.
@@ -748,17 +752,18 @@ async function main(): Promise<void> {
       return;
     }
     case 'migrate-promote-detectors': {
-      // Settings API reads + validateOnly writes, notebook reads, DQL runs:
-      // settings:objects:read+write, document:documents:read (admin), storage reads.
+      // Settings API reads + validateOnly writes (real writes with --apply), notebook
+      // reads, DQL runs: settings:objects:read+write, document:documents:read (admin),
+      // storage reads.
       const { baseUrl, token } = requireBaseAndToken(args.flags);
-      const ids = getString(args.flags, 'ids');
       await runPromoteDetectors({
         outDir: tenantOut(args.flags, baseUrl),
         baseUrl,
         token,
         trackerPath: trackerPath(args.flags),
         batches: getString(args.flags, 'batches')?.split(',').map((s) => s.trim()).filter(Boolean) ?? [],
-        ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+        // A bare --ids or --limit throws: read as "no filter", it would widen an apply to the whole batch.
+        ids: parseIds(args.flags.get('ids')),
         limit: parseLimit(args.flags.get('limit')),
         apply: args.flags.get('apply') === true,
         force: args.flags.get('force') === true,
