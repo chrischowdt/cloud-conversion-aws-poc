@@ -12,7 +12,7 @@
 import { SOURCE_ID_DIM, type BindingOutcome } from './detector-binding.ts';
 import { findQueryInput, type EventTemplateChange } from './detector-rewrite.ts';
 import { PUBLISH_OVERRIDES, isReadyToPublish, parsePublishOverride, type PublishOverride } from './decision-states.ts';
-import { DETECTOR_MARKER_RE } from './detector-notebook.ts';
+import { DETECTOR_MARKER_RE, parseOriginalBlock } from './detector-notebook.ts';
 import { codeMask, timeseriesCommands } from './dql-command.ts';
 import { envIdFromBaseUrl } from './paths.ts';
 import { SettingsApiError } from '../dynatrace/settings.ts';
@@ -230,6 +230,37 @@ export function findApprovedTile(
   return { value: hits[0]! };
 }
 
+/** Where the classic query a card was staged from was read. */
+export type StagedFrom = 'base' | 'archive' | 'tile' | 'none';
+
+type PayloadSections = Array<{ id?: string; state?: { input?: { value?: string } } }>;
+
+/**
+ * The classic query a review card was staged from, and where it came from. In
+ * order: the base payload `<batch>.json` (what the tool last wrote), the
+ * archived payload of the same name (a later prepare run once overwrote a base
+ * payload, and the archive kept the one the notebook was created from), then the
+ * reference block of the live tile. The tile comes last because reviewers edit
+ * it: text typed below the block, or a reformatted line, reads as an owner edit.
+ * A card counts only when its reference block is there.
+ */
+export function stagedQueryOf(
+  objectId: string,
+  sources: { base?: PayloadSections; archive?: PayloadSections; tileValue: string },
+): { query?: string; from: StagedFrom } {
+  const fromPayload = (sections: PayloadSections | undefined): string | undefined => {
+    const value = (sections ?? []).find((s) => s?.id === `dql-${objectId}`)?.state?.input?.value;
+    return typeof value === 'string' ? parseOriginalBlock(value) || undefined : undefined;
+  };
+  const base = fromPayload(sources.base);
+  if (base) return { query: base, from: 'base' };
+  const archive = fromPayload(sources.archive);
+  if (archive) return { query: archive, from: 'archive' };
+  const tile = parseOriginalBlock(sources.tileValue);
+  if (tile) return { query: tile, from: 'tile' };
+  return { from: 'none' };
+}
+
 /**
  * The token cannot read or write settings: every later call would fail the same
  * way, so the run stops at the first one instead of reporting each alert.
@@ -305,6 +336,29 @@ function matchColumn(name: string, columns: ReadonlySet<string>): string | undef
   return hits.find((c) => !/\s/.test(c)) ?? hits[0];
 }
 
+/** A query column renamed so a placeholder can read it: `| fieldsAdd <alias> = \`<column>\``. */
+export interface ColumnAlias {
+  alias: string;
+  column: string;
+}
+
+/**
+ * The name a placeholder should use for `column`. A name without whitespace is
+ * used as it is. For one with whitespace (`Cluster Name`), it is unproven that
+ * Davis fills `{dims:Cluster Name}`, while a column a later `fieldsAdd` adds is
+ * measured to fill. So the placeholder reads an emitted column of the same
+ * spelling without spaces when there is one, else an alias: the column with
+ * each whitespace run replaced by `_`, which the caller must add to the query.
+ */
+function placeholderColumn(column: string, columns: ReadonlySet<string>): { name: string; alias?: ColumnAlias } {
+  if (!/\s/.test(column)) return { name: column };
+  const want = squash(column);
+  const spaceFree = [...columns].find((c) => !/\s/.test(c) && squash(c) === want);
+  if (spaceFree) return { name: spaceFree };
+  const alias = column.trim().replace(/\s+/g, '_');
+  return { name: alias, alias: { alias, column } };
+}
+
 /**
  * Point an alert's event template at the columns the approved query emits.
  *
@@ -319,6 +373,9 @@ function matchColumn(name: string, columns: ReadonlySet<string>): string | undef
  *     whitespace around it closed; otherwise it is reported unresolved
  *   - anything else matches a column ignoring case, spaces, underscores and
  *     backticks (see `matchColumn`), else it is reported unresolved
+ *   - a placeholder that ends up naming a column with whitespace in it reads an
+ *     emitted spelling without whitespace instead, or an alias the caller adds
+ *     (`aliases`; see `placeholderColumn`)
  * Every placeholder keeps its form, `dims:` or bare.
  *
  * Two properties are rebuilt rather than mapped: the classic `dt.source_entity`
@@ -328,19 +385,29 @@ function matchColumn(name: string, columns: ReadonlySet<string>): string | undef
  *
  * `nameColumn` is `<entityColumn>.name` when the result references it. The query
  * may not emit it; the caller adds it (`withNodeNameColumn`) when it does not.
+ * `aliases` lists, once each, the `fieldsAdd <alias> = \`<column>\`` the query
+ * needs for the placeholders now naming an alias (`withColumnAliases`).
  * `unresolved` lists each unmapped placeholder once, as written. The properties
  * given are not modified.
  */
 export function mapEventFields(
   props: EventProp[],
   ctx: { columns: ReadonlySet<string>; entityColumn?: string; withoutEntity: boolean },
-): { props: EventProp[]; changes: EventTemplateChange[]; unresolved: string[]; nameColumn?: string } {
+): { props: EventProp[]; changes: EventTemplateChange[]; unresolved: string[]; nameColumn?: string; aliases: ColumnAlias[] } {
   const entity = ctx.entityColumn;
   const entityName = entity ? `${entity}.name` : undefined;
   const binding = entity ? `{${entity}}` : undefined;
   const changes: EventTemplateChange[] = [];
   const unresolved: string[] = [];
+  const aliases: ColumnAlias[] = [];
   let nameColumn: string | undefined;
+
+  /** The placeholder for an emitted column, through an alias when its name has whitespace. */
+  const placeholderFor = (form: string, column: string): string => {
+    const p = placeholderColumn(column, ctx.columns);
+    if (p.alias && !aliases.some((a) => a.alias === p.alias!.alias)) aliases.push(p.alias);
+    return `{${form}${p.name}}`;
+  };
 
   const mapText = (text: string): string => {
     let out = '';
@@ -356,7 +423,7 @@ export function mapEventFields(
       if (!form && BUILTIN_PLACEHOLDERS.has(name)) {
         out += whole;
       } else if (ctx.columns.has(name)) {
-        out += whole;
+        out += /\s/.test(name) ? placeholderFor(form, name) : whole;
       } else if (entityName && name === entityName) {
         // Already the name column of the entity; the query still has to emit it.
         out += whole;
@@ -377,7 +444,7 @@ export function mapEventFields(
       } else {
         const column = matchColumn(name, ctx.columns);
         if (column) {
-          out += `{${form}${column}}`;
+          out += placeholderFor(form, column);
         } else {
           out += whole;
           if (!unresolved.includes(whole)) unresolved.push(whole);
@@ -428,7 +495,7 @@ export function mapEventFields(
     changes.push({ field: SOURCE_ID_DIM, before: '(absent)', after: binding });
   }
 
-  return { props: out, changes, unresolved, nameColumn };
+  return { props: out, changes, unresolved, nameColumn, aliases };
 }
 
 /**
@@ -438,6 +505,16 @@ export function mapEventFields(
  */
 export function withNodeNameColumn(query: string, entityColumn: string): string {
   return `${query.trimEnd()}\n| fieldsAdd ${entityColumn}.name = getNodeName(${entityColumn})`;
+}
+
+/**
+ * The query with the alias columns `mapEventFields` asked for, on one new line:
+ * `| fieldsAdd Cluster_Name = \`Cluster Name\``. A copy after the timeseries does
+ * not change the series. Unchanged when there are none.
+ */
+export function withColumnAliases(query: string, aliases: ColumnAlias[]): string {
+  if (!aliases.length) return query;
+  return `${query.trimEnd()}\n| fieldsAdd ${aliases.map((a) => `${a.alias} = \`${a.column}\``).join(', ')}`;
 }
 
 // ---------------------------------------------------------------------------

@@ -10,15 +10,19 @@
  *
  * Every read is live: the approved query from the batch's review notebook (by the
  * tile's marker line), the detector from the Settings API, the classic query the
- * card was staged from from the base payload `<batch>.json` (else the tile's
- * reference block). Then the gates, in order; the first failure decides:
- *   drift (owner edited or migrated the alert since staging, or the staged
- *   version is unknown; already published = recorded only), empty query,
- *   blocking lint, the approved query fails over the last 2 hours, the entity
- *   (an approved query that emits none: the 7-day binding check plus the
- *   reviewer's `publish_override`; one that does: at most 10,000 series over 7
- *   days), event fields that name a column the query does not emit, and the
- *   server's own validation (`validateOnly`, which persists nothing).
+ * card was staged from from the base payload `<batch>.json` (else the archived
+ * payload of that name, else the tile's reference block). Then the gates, in
+ * order; the first failure decides: empty query, drift (owner edited or
+ * migrated the alert since staging, or the staged version is unknown), blocking
+ * lint, the approved query fails over the last 2 hours, the entity (an approved
+ * query that emits none: the 7-day binding check plus the reviewer's
+ * `publish_override`), at most 10,000 series over the last 2 hours, event fields
+ * that name a column the query does not emit, the query to publish (with the
+ * columns added for its event fields) fails over 2 hours, and the server's own
+ * validation (`validateOnly`, which persists nothing). An alert whose live value
+ * already has the query and event fields a publish would write is recorded, not
+ * written; one that already runs the approved query but lacks the event fields
+ * is an event-field-only update.
  *
  * PREPARE (the default) writes only files under
  * migration/detector-promote/prepare/<stamp>/: plan.json, report.md and the
@@ -41,7 +45,7 @@ import { rewriteDql } from '../lib/dql-rewriter.ts';
 import { lintQuery } from '../lib/output-lint.ts';
 import { detectorQuery, findQueryInput, type EventTemplateChange } from '../lib/detector-rewrite.ts';
 import { DAVIS_SERIES_CAP, SOURCE_ID_DIM, emittedEntityColumn, resolveBinding, type BindingOutcome } from '../lib/detector-binding.ts';
-import { isEffectivelyEmpty, parseOriginalBlock, parseReviewQuery } from '../lib/detector-notebook.ts';
+import { isEffectivelyEmpty, parseReviewQuery } from '../lib/detector-notebook.ts';
 import {
   assertAllowedEnv,
   buildPublishValue,
@@ -50,10 +54,14 @@ import {
   findApprovedTile,
   isAuthFailure,
   mapEventFields,
+  publishedPartsEqual,
   selectForPublish,
+  stagedQueryOf,
   staticColumns,
+  withColumnAliases,
   withNodeNameColumn,
   type Drift,
+  type StagedFrom,
   type EventProp,
   type ManifestBatch,
   type PublishCandidate,
@@ -86,16 +94,22 @@ export interface PublishPlanItem {
   objectId: string;
   title: string;
   batch: string;
-  /** ready: passes every gate. recorded: already live, only the sheet needs it. skipped: see reasons. */
+  /**
+   * ready: passes every gate and differs from live. recorded: the live alert
+   * already has exactly what a publish would write, so only the sheet needs it.
+   * skipped: see reasons.
+   */
   result: 'ready' | 'skipped' | 'recorded';
   /** Why it was skipped (first entry), or notes about how it goes out. */
   reasons: string[];
   /** The reviewer's override, when the alert's entity decision went through it. */
   override?: PublishOverride;
-  /** Series the published query produced over the last 7 days (at most the cap + 1). */
+  /** Series the query to publish produced over the last 2 hours, the scale Davis evaluates at (at most the cap + 1). */
   series?: number;
   /** The entity column the published query emits and the binding property names. */
   entityColumn?: string;
+  /** Where the classic query the card was staged from was read, for the drift check. */
+  stagedFrom?: StagedFrom;
   diff: { query?: { before: string; after: string }; fields: EventTemplateChange[] };
 }
 
@@ -137,7 +151,7 @@ const DRIFT_TEXT: Record<Exclude<Drift, 'none' | 'already-published'>, { gate: s
   unknown: {
     gate: 'drift: staged version unknown',
     reason:
-      'staged version unknown: the classic query the card was staged from is in neither the base payload nor the tile, ' +
+      'staged version unknown: the classic query the card was staged from is in none of the base payload, the archived payload and the tile, ' +
       'so an owner edit since staging cannot be ruled out.',
   },
 };
@@ -212,15 +226,31 @@ function unresolvedText(unresolved: string[], props: EventProp[]): string {
     .join(', ');
 }
 
+type Sections = Array<{ id?: string; type?: string; state?: { input?: { value?: string } } }>;
+
+/** A payload file's sections, or why a file that exists could not be read. Absent file: neither. */
+interface PayloadRead {
+  sections?: Sections;
+  problem?: string;
+}
+
 interface Ctx {
   args: PromoteDetectorsArgs;
   index: RecipeIndex;
   settings: SettingsClient;
   run: (query: string, windowMs: number) => Promise<DqlResult>;
-  sections: (notebookId: string) => Promise<Array<{ id?: string; type?: string; state?: { input?: { value?: string } } }>>;
-  stagedFromBase: (batch: string, objectId: string) => Promise<string | undefined>;
+  sections: (notebookId: string) => Promise<Sections>;
+  /** A batch's base payload (`detector-review/`) or archived one (`detector-review-archive/`). */
+  payload: (kind: 'base' | 'archive', batch: string) => Promise<PayloadRead>;
   publishedQuery: (objectId: string) => Promise<string | undefined>;
 }
+
+const STAGED_FROM_TEXT: Record<StagedFrom, string> = {
+  base: 'the base payload',
+  archive: 'the archived payload',
+  tile: 'the notebook tile',
+  none: 'nowhere',
+};
 
 /** Read everything one alert needs and run its gates. Throws only on an auth failure. */
 async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
@@ -233,7 +263,7 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   };
 
   // 1. The approved query, from the live review notebook.
-  let sections: Awaited<ReturnType<Ctx['sections']>>;
+  let sections: Sections;
   try {
     sections = await ctx.sections(c.notebookId);
   } catch (e) {
@@ -257,8 +287,14 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   const liveQuery = detectorQuery(value);
   if (liveQuery === undefined) return skip('the alert has no query input', 'the live alert has no query input, so there is nowhere to put the approved query.');
 
-  // 3. The classic query the card was staged from.
-  const staged = (await ctx.stagedFromBase(c.batch, c.objectId)) ?? parseOriginalBlock(tile.value);
+  // 3. The classic query the card was staged from: base payload, archived
+  // payload, then the live tile.
+  const [base, archive] = await Promise.all([ctx.payload('base', c.batch), ctx.payload('archive', c.batch)]);
+  for (const [kind, read] of [['base payload', base], ['archived payload', archive]] as const) {
+    if (read.problem) notes.push(`the ${kind} of ${c.batch} could not be read (${read.problem}).`);
+  }
+  const staged = stagedQueryOf(c.objectId, { base: base.sections, archive: archive.sections, tileValue: tile.value });
+  item.stagedFrom = staged.from;
 
   // Empty first: an empty approved query must never reach the drift check, where
   // it would read as "already published" against an empty live query.
@@ -267,26 +303,31 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   }
   item.diff.query = { before: liveQuery, after: approved };
 
-  // Gate 1: drift.
+  // Gate 1: drift. "already-published" goes on through the gates: whether
+  // anything is left to write is decided by comparing the payload with live.
   let liveIsMigrated = false;
   try {
     liveIsMigrated = rewriteDql(liveQuery, ctx.index).rewritten === liveQuery;
   } catch {
     /* unreadable to the rewriter: read as an owner edit, the more cautious reason */
   }
-  const drift = driftOf({ liveQuery, stagedQuery: staged, approvedQuery: approved, publishedQuery: await ctx.publishedQuery(c.objectId), liveIsMigrated });
-  if (drift === 'already-published') {
-    item.result = 'recorded';
-    item.reasons = ['already published: the live alert already runs the approved query, so it is recorded, not written again.', ...notes];
-    item.diff.query = undefined;
-    return { item, gate: 'already published, recorded only' };
-  }
-  if (drift !== 'none') {
+  const drift = driftOf({ liveQuery, stagedQuery: staged.query, approvedQuery: approved, publishedQuery: await ctx.publishedQuery(c.objectId), liveIsMigrated });
+  if (drift !== 'none' && drift !== 'already-published') {
     const text = DRIFT_TEXT[drift];
+    const where = `(staged query from ${STAGED_FROM_TEXT[staged.from]})`;
     const forced = ctx.args.force === true && (ctx.args.ids ?? []).includes(c.objectId);
-    if (!forced) return skip(text.gate, text.reason);
-    notes.push(`${text.gate.replace(/^drift: /, '')}; published anyway: --force with --ids names it.`);
+    if (!forced) return skip(text.gate, `${text.reason} ${where}`);
+    notes.push(`${text.gate.replace(/^drift: /, '')} ${where}; published anyway: --force with --ids names it.`);
   }
+
+  // Every query text that ran without error in this plan; a final query that is
+  // none of them runs once more before it can go out.
+  const ranOk = new Set<string>();
+  const run = async (q: string, windowMs: number): Promise<DqlResult> => {
+    const r = await ctx.run(q, windowMs);
+    ranOk.add(q);
+    return r;
+  };
 
   // Gate 3: blocking lint.
   const blocking = lintQuery(approved).filter((f) => f.severity === 'blocking');
@@ -297,18 +338,18 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   // Gate 4: the approved query runs.
   let run2h: DqlResult;
   try {
-    run2h = await ctx.run(approved, TWO_HOURS_MS);
+    run2h = await run(approved, TWO_HOURS_MS);
   } catch (e) {
     return skip('the query fails on the tenant', `the approved query fails on the tenant over the last 2 hours: ${errText(e)}`);
   }
 
   // Gate 5: the entity. One 7-day run per query text, shared by the binding
-  // check and the series/columns read below.
+  // check and the column read below.
   const runs7d = new Map<string, Promise<DqlResult>>();
   const run7d = (q: string): Promise<DqlResult> => {
     let p = runs7d.get(q);
     if (!p) {
-      p = ctx.run(q, SEVEN_DAYS_MS);
+      p = run(q, SEVEN_DAYS_MS);
       runs7d.set(q, p);
     }
     return p;
@@ -334,39 +375,33 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
     notes.push(`publish_override "${overrideLabel(c.override)}" not needed: the query already emits \`${entityColumn}\`.`);
   }
 
-  // The series cap, from one 7-day run of the final query.
-  let run7: DqlResult | undefined;
-  let run7Error: string | undefined;
-  try {
-    run7 = await run7d(finalQuery);
-  } catch (e) {
-    run7Error = errText(e);
-  }
-  if (run7) {
-    item.series = run7.records.length;
-    if (run7.records.length > DAVIS_SERIES_CAP) {
-      return skip('over the series cap', `produces more than ${CAP_TEXT} series over the last 7 days, the most one Davis detector monitors.`);
+  // The series cap, at the scale Davis evaluates: the last 2 hours of the query
+  // to publish (the gate-4 run when no entity was added).
+  let final2h: DqlResult;
+  if (finalQuery === approved) {
+    final2h = run2h;
+  } else {
+    try {
+      final2h = await run(finalQuery, TWO_HOURS_MS);
+    } catch (e) {
+      return skip('the query fails on the tenant', `the query to publish fails on the tenant over the last 2 hours: ${errText(e)}`);
     }
+  }
+  item.series = final2h.records.length;
+  if (final2h.records.length > DAVIS_SERIES_CAP) {
+    return skip('over the series cap', `produces more than ${CAP_TEXT} series over the last 2 hours, the most one Davis detector monitors.`);
   }
 
-  // Gate 6: the columns the final query emits.
-  let columns = run7 ? columnsOf(run7) : new Set<string>();
-  if (!columns.size && !run7) {
-    // The 7-day run failed: a 2-hour run of the same query stands in for it.
-    let run2: DqlResult | undefined = finalQuery === approved ? run2h : undefined;
-    if (!run2) {
-      try {
-        run2 = await ctx.run(finalQuery, TWO_HOURS_MS);
-      } catch {
-        /* no columns from a run; read them from the query text below */
-      }
-    }
-    if (run2 && run2.records.length > DAVIS_SERIES_CAP) {
-      return skip('over the series cap', `produces more than ${CAP_TEXT} series over the last 2 hours, the most one Davis detector monitors.`);
-    }
-    if (run2) columns = columnsOf(run2);
-    notes.push(`the 7-day run failed (${run7Error}), so the series count is ${run2 ? `from the last 2 hours only (${run2.records.length})` : 'unchecked'}.`);
+  // Gate 6: the columns the query emits: its 7-day run, else its 2-hour run,
+  // else its text.
+  let columns: Set<string>;
+  try {
+    columns = columnsOf(await run7d(finalQuery));
+  } catch (e) {
+    columns = columnsOf(final2h);
+    notes.push(`the 7-day run failed (${errText(e)}), so the columns come from the 2-hour run.`);
   }
+  if (!columns.size) columns = columnsOf(final2h);
   if (!columns.size) {
     columns = staticColumns(finalQuery);
     notes.push('no data to read the columns from; event fields were checked against the columns the query text names.');
@@ -383,9 +418,15 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   item.entityColumn = entityColumn;
   item.diff.fields = mapped.changes;
 
-  // Step 8: a name placeholder needs the name column in the result.
+  // Step 8: the columns the event fields read that the query does not emit yet:
+  // the entity's name, then aliases for column names with whitespace in them.
   if (mapped.nameColumn && entityColumn && !columns.has(mapped.nameColumn)) {
     finalQuery = withNodeNameColumn(finalQuery, entityColumn);
+  }
+  const aliases = mapped.aliases.filter((a) => !columns.has(a.alias));
+  if (aliases.length) {
+    finalQuery = withColumnAliases(finalQuery, aliases);
+    notes.push(`event fields read ${aliases.map((a) => `\`${a.column}\` as ${a.alias}`).join(', ')}: a column name with whitespace is not known to fill a placeholder.`);
   }
   item.diff.query = { before: liveQuery, after: finalQuery };
 
@@ -397,7 +438,17 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
     );
   }
 
-  // Gate 9: the value, and the server's own validation of it.
+  // The added columns never ran: run the query that would go out once.
+  if (!ranOk.has(finalQuery)) {
+    try {
+      await run(finalQuery, TWO_HOURS_MS);
+    } catch (e) {
+      return skip('the query fails on the tenant', `the query to publish fails on the tenant over the last 2 hours: ${errText(e)}`);
+    }
+  }
+
+  // Gate 9: the value; nothing to write when live already has it; else the
+  // server's own validation of it.
   let newValue: Record<string, unknown>;
   try {
     newValue = buildPublishValue(value, finalQuery, mapped.props);
@@ -406,6 +457,21 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   }
   const schemaVersion = typeof live.schemaVersion === 'string' ? live.schemaVersion : undefined;
   const payload: PayloadFile = { objectId: c.objectId, title: item.title, batch: c.batch, liveQuery, schemaVersion, value: newValue };
+
+  if (publishedPartsEqual(value, newValue)) {
+    item.result = 'recorded';
+    item.reasons = ['already published: the live alert already has the query and event fields a publish would write, so it is recorded, not written again.', ...notes];
+    return { item, gate: 'already published, recorded only' };
+  }
+  if (drift === 'already-published') {
+    const queryChanges = liveQuery.trim() !== finalQuery.trim();
+    notes.unshift(
+      queryChanges
+        ? 'the live alert already runs the approved query; this publish adds only what the entity binding and event fields need, and updates the event fields.'
+        : 'event-field-only update: the live alert already runs the approved query; this publish changes its event fields only.',
+    );
+  }
+
   try {
     await ctx.settings.putObject(
       c.objectId,
@@ -489,7 +555,8 @@ function renderReport(outcomes: Outcome[], meta: { env: string; batches: string[
       const facts = [`\`${i.objectId}\``];
       if (i.result === 'skipped') facts.push(`skipped: ${o.gate}`);
       if (i.entityColumn) facts.push(`entity column \`${i.entityColumn}\``);
-      if (i.series !== undefined) facts.push(`${i.series > DAVIS_SERIES_CAP ? `more than ${CAP_TEXT}` : i.series} series over 7 days`);
+      if (i.series !== undefined) facts.push(`${i.series > DAVIS_SERIES_CAP ? `more than ${CAP_TEXT}` : i.series} series over 2 hours`);
+      if (i.stagedFrom) facts.push(`staged query from ${STAGED_FROM_TEXT[i.stagedFrom]}`);
       if (i.override) facts.push(`publish_override: ${overrideLabel(i.override)}`);
       lines.push(facts.join(' · '), '');
       for (const r of i.reasons) lines.push(`- ${r}`);
@@ -528,6 +595,7 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
 
   const base = args.outDir;
   const reviewDir = join(base, 'migration', 'detector-review');
+  const archiveDir = join(base, 'migration', 'detector-review-archive');
   const promoteDir = join(base, 'migration', 'detector-promote');
   const trackerPath = args.trackerPath ?? join(base, 'migration-tracker.xlsx');
 
@@ -567,9 +635,9 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
   const docs = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
   const dql = new DqlClient({ baseUrl: args.baseUrl, token: args.token });
 
-  // One read per notebook and per base payload, shared by every alert in it.
+  // One read per notebook and per payload file, shared by every alert in it.
   const notebooks = new Map<string, ReturnType<Ctx['sections']>>();
-  const basePayloads = new Map<string, Promise<Array<{ id?: string; state?: { input?: { value?: string } } }>>>();
+  const payloads = new Map<string, Promise<PayloadRead>>();
   const ctx: Ctx = {
     args,
     index,
@@ -596,19 +664,24 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
       }
       return p;
     },
-    stagedFromBase: async (batch, objectId) => {
-      let p = basePayloads.get(batch);
+    payload: (kind, batch) => {
+      const dir = kind === 'base' ? reviewDir : archiveDir;
+      const file = join(dir, `${batch.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.json`);
+      let p = payloads.get(file);
       if (!p) {
-        const file = join(reviewDir, `${batch.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.json`);
-        p = readFile(file, 'utf8')
-          .then((t) => (JSON.parse(t) as { content?: { sections?: unknown } }).content?.sections)
-          .then((s) => (Array.isArray(s) ? s : []))
-          .catch(() => []);
-        basePayloads.set(batch, p);
+        p = (async (): Promise<PayloadRead> => {
+          if (!existsSync(file)) return {};
+          try {
+            const sections = (JSON.parse(await readFile(file, 'utf8')) as { content?: { sections?: unknown } }).content?.sections;
+            if (!Array.isArray(sections)) return { problem: `${file} has no content.sections` };
+            return { sections };
+          } catch (e) {
+            return { problem: `${file}: ${clip((e as Error).message, 120)}` };
+          }
+        })();
+        payloads.set(file, p);
       }
-      const section = (await p).find((s) => s?.id === `dql-${objectId}`);
-      const v = section?.state?.input?.value;
-      return typeof v === 'string' ? parseOriginalBlock(v) || undefined : undefined;
+      return p;
     },
     publishedQuery: async (objectId) => {
       const file = join(promoteDir, 'published', `${objectId}.json`);

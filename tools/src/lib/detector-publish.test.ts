@@ -16,6 +16,8 @@ import {
   publishedPartsEqual,
   selectForPublish,
   staticColumns,
+  stagedQueryOf,
+  withColumnAliases,
   withNodeNameColumn,
   type EventProp,
   type ManifestBatch,
@@ -522,30 +524,67 @@ describe('mapEventFields: placeholders', () => {
     assert.deepEqual(r.unresolved, []);
   });
 
-  it('matches a respelled dimension', () => {
-    const r = map([{ key: 'event.name', value: '{dims:cluster_name}' }], { columns: ['Cluster Name'] });
-    assert.equal(valueOf(r.props, 'event.name'), '{dims:Cluster Name}');
+  it('matches a respelled dimension that has no spaces', () => {
+    const r = map([{ key: 'event.name', value: '{dims:cluster_name}' }], { columns: ['ClusterName'] });
+    assert.equal(valueOf(r.props, 'event.name'), '{dims:ClusterName}');
     assert.deepEqual(r.unresolved, []);
+    assert.deepEqual(r.aliases, []);
+  });
+
+  it('reads a column whose name has spaces through an alias without them', () => {
+    const r = map([{ key: 'event.name', value: 'Lag on {dims:cluster_name}' }], { columns: ['Cluster Name'] });
+    assert.equal(valueOf(r.props, 'event.name'), 'Lag on {dims:Cluster_Name}');
+    assert.deepEqual(r.aliases, [{ alias: 'Cluster_Name', column: 'Cluster Name' }]);
+    assert.deepEqual(r.unresolved, []);
+  });
+
+  it('aliases a placeholder that names a spaced column exactly, each whitespace run becoming one underscore', () => {
+    const r = map([{ key: 'event.name', value: '{dims:Consumer  Group} on {dims:Broker ID}' }], { columns: ['Consumer  Group', 'Broker ID'] });
+    assert.equal(valueOf(r.props, 'event.name'), '{dims:Consumer_Group} on {dims:Broker_ID}');
+    assert.deepEqual(r.aliases, [
+      { alias: 'Consumer_Group', column: 'Consumer  Group' },
+      { alias: 'Broker_ID', column: 'Broker ID' },
+    ]);
+  });
+
+  it('lists each alias once, however many placeholders read it', () => {
+    const r = map(
+      [
+        { key: 'event.name', value: '{dims:cluster_name} {Cluster Name}' },
+        { key: 'event.description', value: '{dims:Cluster Name}' },
+      ],
+      { columns: ['Cluster Name'] },
+    );
+    assert.deepEqual(r.aliases, [{ alias: 'Cluster_Name', column: 'Cluster Name' }]);
   });
 
   it('matches regardless of case and backticks, and keeps the bare form', () => {
     const r = map([{ key: 'event.name', value: '{`CLUSTER_NAME`}' }], { columns: ['Cluster Name'] });
-    assert.equal(valueOf(r.props, 'event.name'), '{Cluster Name}');
+    assert.equal(valueOf(r.props, 'event.name'), '{Cluster_Name}');
+    assert.deepEqual(r.aliases, [{ alias: 'Cluster_Name', column: 'Cluster Name' }]);
   });
 
-  it('prefers the column without spaces', () => {
+  it('prefers the column without spaces, and needs no alias then', () => {
     for (const columns of [
       ['Broker ID', 'Broker_ID'],
       ['Broker_ID', 'Broker ID'],
     ]) {
       const r = map([{ key: 'event.name', value: '{dims:broker_id}' }], { columns });
       assert.equal(valueOf(r.props, 'event.name'), '{dims:Broker_ID}', columns.join(' | '));
+      assert.deepEqual(r.aliases, [], columns.join(' | '));
     }
   });
 
-  it('leaves a placeholder that already names a column as it is, even when a sibling spelling exists', () => {
-    const r = map([{ key: 'event.name', value: '{dims:Broker ID}' }], { columns: ['Broker ID', 'Broker_ID'] });
-    assert.equal(valueOf(r.props, 'event.name'), '{dims:Broker ID}');
+  it('moves a placeholder that names a spaced column to the emitted column without spaces', () => {
+    const r = map([{ key: 'event.name', value: '{dims:Broker ID} {Broker ID}' }], { columns: ['Broker ID', 'Broker_ID'] });
+    assert.equal(valueOf(r.props, 'event.name'), '{dims:Broker_ID} {Broker_ID}');
+    assert.deepEqual(r.aliases, []);
+  });
+
+  it('leaves a placeholder that already names a column without spaces as it is, even when a spaced sibling exists', () => {
+    const r = map([{ key: 'event.name', value: '{dims:Broker_ID}' }], { columns: ['Broker ID', 'Broker_ID'] });
+    assert.equal(valueOf(r.props, 'event.name'), '{dims:Broker_ID}');
+    assert.deepEqual(r.changes, []);
   });
 
   it('reports what it cannot map and leaves the text', () => {
@@ -626,6 +665,28 @@ describe('withNodeNameColumn', () => {
   it('starts the new command on its own line after a trailing comment', () => {
     const out = withNodeNameColumn(`timeseries x=avg(m), by:{${SQS}} // per queue`, SQS);
     assert.ok(out.includes('// per queue\n| fieldsAdd'));
+  });
+});
+
+describe('withColumnAliases', () => {
+  it('adds every alias on one new line', () => {
+    const q = 'timeseries x = avg(m), by:{`Cluster Name`, `Broker ID`}\n';
+    assert.equal(
+      withColumnAliases(q, [
+        { alias: 'Cluster_Name', column: 'Cluster Name' },
+        { alias: 'Broker_ID', column: 'Broker ID' },
+      ]),
+      'timeseries x = avg(m), by:{`Cluster Name`, `Broker ID`}\n| fieldsAdd Cluster_Name = `Cluster Name`, Broker_ID = `Broker ID`',
+    );
+  });
+
+  it('leaves the query alone without aliases', () => {
+    assert.equal(withColumnAliases('timeseries x = avg(m)\n', []), 'timeseries x = avg(m)\n');
+  });
+
+  it('emits columns the event fields then read, as the static column reader sees them', () => {
+    const q = withColumnAliases('timeseries x = avg(m), by:{`Cluster Name`} // note', [{ alias: 'Cluster_Name', column: 'Cluster Name' }]);
+    assert.ok(staticColumns(q).has('Cluster_Name'));
   });
 });
 
@@ -823,5 +884,37 @@ describe('isAuthFailure', () => {
     assert.equal(isAuthFailure(err(404)), false);
     assert.equal(isAuthFailure(new Error('HTTP 403')), false);
     assert.equal(isAuthFailure(undefined), false);
+  });
+});
+
+describe('stagedQueryOf', () => {
+  const card = (id: string, classic: string) => ({
+    id: `dql-${id}`,
+    type: 'dql',
+    state: { input: { value: buildReviewQuery(id, 'timeseries x = avg(new)', classic) } },
+  });
+  const tile = buildReviewQuery('A-1', 'timeseries x = avg(new)', 'timeseries x = avg(from_tile)');
+
+  it('takes the base payload first', () => {
+    const r = stagedQueryOf('A-1', { base: [card('A-1', 'timeseries x = avg(from_base)')], archive: [card('A-1', 'timeseries x = avg(from_archive)')], tileValue: tile });
+    assert.deepEqual(r, { query: 'timeseries x = avg(from_base)', from: 'base' });
+  });
+
+  it('falls back to the archived payload when the base has no card for the alert', () => {
+    const r = stagedQueryOf('A-1', { base: [card('B-1', 'other')], archive: [card('A-1', 'timeseries x = avg(from_archive)')], tileValue: tile });
+    assert.deepEqual(r, { query: 'timeseries x = avg(from_archive)', from: 'archive' });
+  });
+
+  it('falls back to the live tile last', () => {
+    assert.deepEqual(stagedQueryOf('A-1', { tileValue: tile }), { query: 'timeseries x = avg(from_tile)', from: 'tile' });
+  });
+
+  it('skips a card whose reference block is gone', () => {
+    const noBlock = { id: 'dql-A-1', type: 'dql', state: { input: { value: '// [CCT-DETECTOR objectId=A-1]\ntimeseries x = avg(new)' } } };
+    assert.deepEqual(stagedQueryOf('A-1', { base: [noBlock], tileValue: tile }), { query: 'timeseries x = avg(from_tile)', from: 'tile' });
+  });
+
+  it('is none when no source has the classic query', () => {
+    assert.deepEqual(stagedQueryOf('A-1', { base: [], archive: [], tileValue: '// [CCT-DETECTOR objectId=A-1]\nq' }), { from: 'none' });
   });
 });
