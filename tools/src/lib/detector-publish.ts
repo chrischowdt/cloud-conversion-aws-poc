@@ -9,8 +9,10 @@
  * whether a live alert is overwritten can be unit-tested without a tenant.
  */
 
-import type { BindingOutcome } from './detector-binding.ts';
+import { SOURCE_ID_DIM, type BindingOutcome } from './detector-binding.ts';
+import { findQueryInput, type EventTemplateChange } from './detector-rewrite.ts';
 import { PUBLISH_OVERRIDES, isReadyToPublish, parsePublishOverride, type PublishOverride } from './decision-states.ts';
+import { codeMask, timeseriesCommands } from './dql-command.ts';
 import { envIdFromBaseUrl } from './paths.ts';
 
 /** One review batch as the stage-detectors manifest records it. */
@@ -214,4 +216,362 @@ export function assertAllowedEnv(baseUrl: string, allowEnv: string | undefined, 
   if (allowed !== connected) {
     throw new Error(`Connected to "${connected}" but --allow-env says "${allowed}". Refusing.`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Event template fields
+
+/** One `eventTemplate.properties` entry. */
+export type EventProp = { key?: string; value?: unknown };
+
+/**
+ * Placeholders Davis fills itself, whatever the query emits. A bare `{name}` that
+ * is one of these is left alone.
+ */
+export const BUILTIN_PLACEHOLDERS: ReadonlySet<string> = new Set([
+  'threshold',
+  'severity',
+  'alert_condition',
+  'violating_samples',
+  'dealerting_samples',
+  'sliding_window',
+  'metricname',
+  'metric_value',
+  'baseline',
+  'dims',
+]);
+
+const PLACEHOLDER_RE = /\{(dims:)?([^{}]+)\}/g;
+/** A classic entity id placeholder name, and the same with its `.name` accessor. */
+const CLASSIC_ENTITY_ID_RE = /^(dt\.entity\.[\w:]+|dt\.source_entity)$/;
+const CLASSIC_ENTITY_NAME_RE = /^(dt\.entity\.[\w:]+|dt\.source_entity)\.name$/;
+const CLASSIC_BINDING_KEY = 'dt.source_entity';
+
+/** Spelling-insensitive form of a column name: case, spaces, underscores and backticks dropped. */
+function squash(name: string): string {
+  return name.toLowerCase().replace(/[\s_`]/g, '');
+}
+
+/**
+ * The column a placeholder name stands for. An exact name wins. Otherwise the
+ * columns that match ignoring case, spaces, underscores and backticks, and of
+ * those the one without spaces: a rewritten metric key spells a dimension
+ * `Broker_ID` while the series also carries `Broker ID`, and Davis reads the
+ * underscore name reliably.
+ */
+function matchColumn(name: string, columns: ReadonlySet<string>): string | undefined {
+  if (columns.has(name)) return name;
+  const want = squash(name);
+  if (!want) return undefined;
+  const hits = [...columns].filter((c) => squash(c) === want);
+  return hits.find((c) => !/\s/.test(c)) ?? hits[0];
+}
+
+/**
+ * Point an alert's event template at the columns the approved query emits.
+ *
+ * Davis fills `{dims:X}` and bare `{X}` from any column of the query result, but
+ * a placeholder that names a column the query does not emit goes out as literal
+ * text in the alert. So every placeholder is resolved against `ctx.columns`:
+ *   - built-ins (bare only) and names that are already a column stay as they are
+ *   - a classic entity id or name (`dt.entity.*`, `dt.source_entity`, with `.name`)
+ *     becomes the query's entity column (`ctx.entityColumn`) or its `.name`
+ *     column. When there is no entity column and `ctx.withoutEntity` is set (the
+ *     reviewer chose to publish with no entity) the placeholder is removed and the
+ *     whitespace around it closed; otherwise it is reported unresolved
+ *   - anything else matches a column ignoring case, spaces, underscores and
+ *     backticks (see `matchColumn`), else it is reported unresolved
+ * Every placeholder keeps its form, `dims:` or bare.
+ *
+ * Two properties are rebuilt rather than mapped: the classic `dt.source_entity`
+ * binding is dropped and `dt.smartscape_source.id` is `{<entityColumn>}`, or
+ * absent without an entity column. An entity column always binds; `withoutEntity`
+ * only decides what happens to the entity placeholders when there is none.
+ *
+ * `nameColumn` is `<entityColumn>.name` when the result references it. The query
+ * may not emit it; the caller adds it (`withNodeNameColumn`) when it does not.
+ * `unresolved` lists each unmapped placeholder once, as written. The properties
+ * given are not modified.
+ */
+export function mapEventFields(
+  props: EventProp[],
+  ctx: { columns: ReadonlySet<string>; entityColumn?: string; withoutEntity: boolean },
+): { props: EventProp[]; changes: EventTemplateChange[]; unresolved: string[]; nameColumn?: string } {
+  const entity = ctx.entityColumn;
+  const entityName = entity ? `${entity}.name` : undefined;
+  const binding = entity ? `{${entity}}` : undefined;
+  const changes: EventTemplateChange[] = [];
+  const unresolved: string[] = [];
+  let nameColumn: string | undefined;
+
+  const mapText = (text: string): string => {
+    let out = '';
+    let last = 0;
+    let removed = false;
+    for (const m of text.matchAll(PLACEHOLDER_RE)) {
+      const whole = m[0];
+      const form = m[1] ?? '';
+      const name = m[2]!;
+      out += text.slice(last, m.index!);
+      last = m.index! + whole.length;
+
+      if (!form && BUILTIN_PLACEHOLDERS.has(name)) {
+        out += whole;
+      } else if (ctx.columns.has(name)) {
+        out += whole;
+      } else if (entityName && name === entityName) {
+        // Already the name column of the entity; the query still has to emit it.
+        out += whole;
+        nameColumn = entityName;
+      } else if (CLASSIC_ENTITY_NAME_RE.test(name) || CLASSIC_ENTITY_ID_RE.test(name)) {
+        const isName = CLASSIC_ENTITY_NAME_RE.test(name);
+        if (entity) {
+          out += `{${form}${isName ? entityName : entity}}`;
+          if (isName) nameColumn = entityName;
+        } else if (ctx.withoutEntity) {
+          const next = text[last];
+          if (next === undefined || /\s/.test(next)) out = out.replace(/[ \t]+$/, '');
+          removed = true;
+        } else {
+          out += whole;
+          if (!unresolved.includes(whole)) unresolved.push(whole);
+        }
+      } else {
+        const column = matchColumn(name, ctx.columns);
+        if (column) {
+          out += `{${form}${column}}`;
+        } else {
+          out += whole;
+          if (!unresolved.includes(whole)) unresolved.push(whole);
+        }
+      }
+    }
+    out += text.slice(last);
+    return removed ? out.trim() : out;
+  };
+
+  const hasSmartscapeBinding = props.some((p) => p?.key === SOURCE_ID_DIM);
+  const out: EventProp[] = [];
+  let placed = false;
+  for (const p of props) {
+    if (p?.key === CLASSIC_BINDING_KEY) {
+      const before = String(p.value ?? '');
+      // The classic binding is replaced where it stood, unless a Smartscape one exists to keep.
+      if (binding && !hasSmartscapeBinding && !placed) {
+        out.push({ key: SOURCE_ID_DIM, value: binding });
+        placed = true;
+        changes.push({ field: `${CLASSIC_BINDING_KEY} → ${SOURCE_ID_DIM}`, before, after: binding });
+      } else {
+        changes.push({ field: CLASSIC_BINDING_KEY, before, after: '(removed)' });
+      }
+      continue;
+    }
+    if (p?.key === SOURCE_ID_DIM) {
+      const before = String(p.value ?? '');
+      if (!binding || placed) {
+        changes.push({ field: SOURCE_ID_DIM, before, after: '(removed)' });
+        continue;
+      }
+      placed = true;
+      if (p.value !== binding) changes.push({ field: SOURCE_ID_DIM, before, after: binding });
+      out.push({ ...p, value: binding });
+      continue;
+    }
+    if (typeof p?.value === 'string') {
+      const mapped = mapText(p.value);
+      if (mapped !== p.value) changes.push({ field: String(p.key ?? ''), before: p.value, after: mapped });
+      out.push({ ...p, value: mapped });
+    } else {
+      out.push({ ...p });
+    }
+  }
+  if (binding && !placed) {
+    out.push({ key: SOURCE_ID_DIM, value: binding });
+    changes.push({ field: SOURCE_ID_DIM, before: '(absent)', after: binding });
+  }
+
+  return { props: out, changes, unresolved, nameColumn };
+}
+
+/**
+ * The query with a column added that holds the entity's name, for event text that
+ * reads `{dims:<entity>.name}`. A trailing comment ends at the newline, so the
+ * new command is always on its own line.
+ */
+export function withNodeNameColumn(query: string, entityColumn: string): string {
+  return `${query.trimEnd()}\n| fieldsAdd ${entityColumn}.name = getNodeName(${entityColumn})`;
+}
+
+// ---------------------------------------------------------------------------
+// Columns without a run
+
+/** `name =` (not `==`) at the start of an entry; the name may be backtick-quoted. */
+const ASSIGNED_NAME_RE = /^\s*(?:`([^`]+)`|([\w.]+))\s*=(?!=)/;
+const COMMAND_NAME_RE = /^\|\s*([A-Za-z]+)/;
+
+/** Split on commas that sit outside every bracket. Expects code with strings and comments blanked. */
+function topLevelEntries(code: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const c of code) {
+    if ('([{'.includes(c)) depth++;
+    else if (')]}'.includes(c)) depth--;
+    if (c === ',' && depth === 0) {
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+function assignedName(entry: string): string | undefined {
+  const m = ASSIGNED_NAME_RE.exec(entry);
+  return m ? (m[1] ?? m[2]) : undefined;
+}
+
+/** The names a list of entries emits: the left side of `x = …`, or a bare name when `bare` is set. */
+function entryNames(entries: string[], bare: boolean): string[] {
+  const names: string[] = [];
+  for (const entry of entries) {
+    const assigned = assignedName(entry);
+    if (assigned) names.push(assigned);
+    else if (bare) {
+      const name = entry.replace(/`/g, '').trim();
+      if (name) names.push(name);
+    }
+  }
+  return names;
+}
+
+/**
+ * Every pipeline command at any bracket depth: its name and what follows the
+ * name, up to the next `|` at that depth or the bracket that ends it.
+ */
+function pipelineCommands(code: string): Array<{ name: string; body: string }> {
+  const out: Array<{ name: string; body: string }> = [];
+  const starts: Array<number | undefined> = [];
+  let depth = 0;
+  const finish = (d: number, end: number): void => {
+    const start = starts[d];
+    if (start === undefined) return;
+    starts[d] = undefined;
+    const head = COMMAND_NAME_RE.exec(code.slice(start, end));
+    if (head) out.push({ name: head[1]!, body: code.slice(start + head[0].length, end) });
+  };
+  for (let i = 0; i < code.length; i++) {
+    const c = code[i]!;
+    if ('([{'.includes(c)) {
+      depth++;
+    } else if (')]}'.includes(c)) {
+      finish(depth, i);
+      depth = Math.max(0, depth - 1);
+    } else if (c === '|') {
+      finish(depth, i);
+      starts[depth] = i;
+    }
+  }
+  for (let d = 0; d < starts.length; d++) finish(d, code.length);
+  return out;
+}
+
+/**
+ * The columns a query is expected to emit, read from its text: each timeseries'
+ * aggregation names, `timeframe`, `interval` and the names of its top-level
+ * `by:{}` (an alias takes its left-hand name), plus every `fieldsAdd x =` and
+ * `fields x = …` / bare `fields a, b` name. For when no run returned rows to read
+ * the real columns from. It is partial on purpose (a `summarize`, `parse` or
+ * `fieldsRename` adds columns it does not see); a missing column makes a
+ * placeholder read as unresolved, which sends the alert back for review rather
+ * than out with literal text.
+ */
+export function staticColumns(query: string): Set<string> {
+  const mask = codeMask(query);
+  // Split by UTF-16 unit, not code point: the mask is indexed by unit.
+  const code = query.split('').map((c, i) => (mask[i] ? c : ' ')).join('');
+  const columns = new Set<string>();
+
+  const series = timeseriesCommands(query);
+  if (series.length) {
+    columns.add('timeframe');
+    columns.add('interval');
+  }
+  for (const cmd of series) {
+    for (const raw of topLevelEntries(code.slice(cmd.start, cmd.end))) {
+      const entry = raw.trim();
+      const by = /^by\s*:\s*\{([\s\S]*)\}$/.exec(entry);
+      if (by) {
+        for (const name of entryNames(topLevelEntries(by[1]!), true)) columns.add(name);
+      } else if (entry.startsWith('{') && entry.endsWith('}')) {
+        for (const name of entryNames(topLevelEntries(entry.slice(1, -1)), false)) columns.add(name);
+      } else {
+        const name = assignedName(entry);
+        if (name) columns.add(name);
+      }
+    }
+  }
+
+  for (const { name, body } of pipelineCommands(code)) {
+    if (name !== 'fieldsAdd' && name !== 'fields') continue;
+    for (const column of entryNames(topLevelEntries(body), name === 'fields')) columns.add(column);
+  }
+  return columns;
+}
+
+// ---------------------------------------------------------------------------
+// The value a publish writes, and comparing it
+
+type AnalyzerInputs = { input?: Array<{ key?: string; value?: string }> };
+
+/**
+ * The detector value to write: a copy of `live` with the approved query in the
+ * input that holds the query (whichever of `query` / `query.expression` the
+ * detector uses) and `props` as the event template's properties. Nothing else
+ * changes; the threshold, every other input, `enabled`, the title and the actor
+ * stay exactly as they are live. Throws when the detector has no query input,
+ * since publishing then would silently write nothing. Neither argument is modified.
+ */
+export function buildPublishValue(live: Record<string, unknown>, query: string, props: EventProp[]): Record<string, unknown> {
+  const out = structuredClone(live);
+  const analyzer = out.analyzer as AnalyzerInputs | undefined;
+  const target = findQueryInput(Array.isArray(analyzer?.input) ? analyzer.input : []);
+  if (!target) {
+    throw new Error('The detector has no query input (analyzer.input key "query" or "query.expression"), so there is nowhere to put the approved query.');
+  }
+  target.value = query;
+  const template = (out.eventTemplate ??= {}) as { properties?: EventProp[] };
+  template.properties = structuredClone(props);
+  return out;
+}
+
+/** Key order must not matter: the Settings API may hand a value back with its keys in any order. */
+function sortedJson(v: unknown): string {
+  return JSON.stringify(v, (_key, val: unknown) =>
+    val && typeof val === 'object' && !Array.isArray(val)
+      ? Object.fromEntries(Object.entries(val).sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0)))
+      : val,
+  );
+}
+
+/** The two parts of a detector value a publish writes. Absent event properties read as none. */
+function publishedParts(v: Record<string, unknown>): { query: string | null; properties: unknown[] } {
+  const inputs = (v?.analyzer as AnalyzerInputs | undefined)?.input;
+  const properties = (v?.eventTemplate as { properties?: unknown } | undefined)?.properties;
+  return {
+    query: findQueryInput(Array.isArray(inputs) ? inputs : [])?.value ?? null,
+    properties: Array.isArray(properties) ? properties : [],
+  };
+}
+
+/**
+ * Do two detector values agree on the parts a publish writes: the query input and
+ * the event properties? Compared as key-sorted JSON, so object key order and any
+ * other field (defaults the API adds, the threshold, `enabled`) are ignored.
+ * Property ORDER still counts: it is the order the template was written in.
+ */
+export function publishedPartsEqual(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  return sortedJson(publishedParts(a)) === sortedJson(publishedParts(b));
 }

@@ -2,7 +2,20 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { BindingOutcome } from './detector-binding.ts';
-import { assertAllowedEnv, decideEntity, driftOf, selectForPublish, type ManifestBatch } from './detector-publish.ts';
+import {
+  BUILTIN_PLACEHOLDERS,
+  assertAllowedEnv,
+  buildPublishValue,
+  decideEntity,
+  driftOf,
+  mapEventFields,
+  publishedPartsEqual,
+  selectForPublish,
+  staticColumns,
+  withNodeNameColumn,
+  type EventProp,
+  type ManifestBatch,
+} from './detector-publish.ts';
 
 const batches: ManifestBatch[] = [
   {
@@ -373,5 +386,388 @@ describe('assertAllowedEnv', () => {
   it('passes when not applying, whatever --allow-env says', () => {
     assert.doesNotThrow(() => assertAllowedEnv(url, undefined, false));
     assert.doesNotThrow(() => assertAllowedEnv(url, 'zzz99999', false));
+  });
+});
+
+const SQS = 'dt.smartscape.aws_sqs_queue';
+
+function map(props: EventProp[], over: { columns?: string[]; entityColumn?: string; withoutEntity?: boolean } = {}) {
+  return mapEventFields(props, { columns: new Set(over.columns ?? []), entityColumn: over.entityColumn, withoutEntity: over.withoutEntity ?? false });
+}
+
+/** The value of the first property with this key. */
+function valueOf(props: EventProp[], key: string): unknown {
+  return props.find((p) => p.key === key)?.value;
+}
+
+describe('mapEventFields: the entity binding', () => {
+  it('drops the classic binding and sets the Smartscape one', () => {
+    const r = map([{ key: 'dt.source_entity', value: '{dims:dt.entity.custom_device}' }], { entityColumn: SQS });
+    assert.equal(
+      r.props.some((p) => p.key === 'dt.source_entity'),
+      false,
+    );
+    assert.equal(valueOf(r.props, 'dt.smartscape_source.id'), `{${SQS}}`);
+    assert.deepEqual(r.unresolved, []);
+  });
+
+  it('sets neither binding key without an entity column', () => {
+    const r = map(
+      [
+        { key: 'dt.source_entity', value: '{dims:dt.entity.custom_device}' },
+        { key: 'dt.smartscape_source.id', value: '{dt.smartscape.aws_old}' },
+      ],
+      { withoutEntity: true },
+    );
+    assert.deepEqual(r.props, []);
+  });
+
+  it('keeps the binding where the classic one stood and the other properties in order', () => {
+    const r = map(
+      [
+        { key: 'event.name', value: 'Queue backlog' },
+        { key: 'dt.source_entity', value: '{dims:dt.entity.custom_device}' },
+        { key: 'event.description', value: 'Check the consumers' },
+      ],
+      { entityColumn: SQS },
+    );
+    assert.deepEqual(
+      r.props.map((p) => p.key),
+      ['event.name', 'dt.smartscape_source.id', 'event.description'],
+    );
+  });
+
+  it('appends the binding when the template had none, and leaves a correct one alone', () => {
+    const added = map([{ key: 'event.name', value: 'x' }], { entityColumn: SQS });
+    assert.deepEqual(added.props, [
+      { key: 'event.name', value: 'x' },
+      { key: 'dt.smartscape_source.id', value: `{${SQS}}` },
+    ]);
+    assert.equal(added.changes.length, 1);
+
+    const same = map([{ key: 'dt.smartscape_source.id', value: `{${SQS}}` }], { entityColumn: SQS });
+    assert.deepEqual(same.props, [{ key: 'dt.smartscape_source.id', value: `{${SQS}}` }]);
+    assert.deepEqual(same.changes, []);
+  });
+
+  it('rebuilds a stale Smartscape binding and keeps a single one when both are present', () => {
+    const r = map(
+      [
+        { key: 'dt.source_entity', value: '{dims:dt.entity.custom_device}' },
+        { key: 'dt.smartscape_source.id', value: '{dt.smartscape.aws_old}' },
+      ],
+      { entityColumn: SQS },
+    );
+    assert.deepEqual(r.props, [{ key: 'dt.smartscape_source.id', value: `{${SQS}}` }]);
+  });
+
+  it('reports the binding change', () => {
+    const r = map([{ key: 'dt.source_entity', value: '{dims:dt.entity.custom_device}' }], { entityColumn: SQS });
+    assert.deepEqual(r.changes, [
+      { field: 'dt.source_entity → dt.smartscape_source.id', before: '{dims:dt.entity.custom_device}', after: `{${SQS}}` },
+    ]);
+  });
+});
+
+describe('mapEventFields: placeholders', () => {
+  it('maps a classic entity id and name', () => {
+    const r = map(
+      [{ key: 'event.name', value: 'High on {dims:dt.entity.custom_device.name} ({dims:dt.entity.custom_device})' }],
+      { entityColumn: SQS, columns: [SQS] },
+    );
+    assert.equal(valueOf(r.props, 'event.name'), `High on {dims:${SQS}.name} ({dims:${SQS}})`);
+    assert.equal(r.nameColumn, `${SQS}.name`);
+    assert.deepEqual(r.unresolved, []);
+    assert.ok(
+      r.changes.some(
+        (c) =>
+          c.field === 'event.name' &&
+          c.before === 'High on {dims:dt.entity.custom_device.name} ({dims:dt.entity.custom_device})' &&
+          c.after === `High on {dims:${SQS}.name} ({dims:${SQS}})`,
+      ),
+    );
+  });
+
+  it('keeps the bare form of a mapped entity placeholder and maps dt.source_entity too', () => {
+    const r = map([{ key: 'event.name', value: '{dt.entity.aws_lambda_function} {dims:dt.source_entity} {dt.source_entity.name}' }], {
+      entityColumn: SQS,
+    });
+    assert.equal(valueOf(r.props, 'event.name'), `{${SQS}} {dims:${SQS}} {${SQS}.name}`);
+    assert.equal(r.nameColumn, `${SQS}.name`);
+  });
+
+  it('sets no name column when no name placeholder was mapped', () => {
+    const r = map([{ key: 'event.name', value: 'On {dims:dt.entity.custom_device}' }], { entityColumn: SQS });
+    assert.equal(r.nameColumn, undefined);
+  });
+
+  it('keeps built-ins and emitted columns, bare or dims', () => {
+    const text = '{threshold} {severity} {dims:ServiceName} {ServiceName}';
+    const r = map([{ key: 'event.description', value: text }], { columns: ['ServiceName'] });
+    assert.equal(valueOf(r.props, 'event.description'), text);
+    assert.deepEqual(r.unresolved, []);
+    assert.deepEqual(r.changes, []);
+  });
+
+  it('knows every built-in placeholder', () => {
+    const builtins = ['threshold', 'severity', 'alert_condition', 'violating_samples', 'dealerting_samples', 'sliding_window', 'metricname', 'metric_value', 'baseline', 'dims'];
+    assert.deepEqual([...BUILTIN_PLACEHOLDERS].sort(), [...builtins].sort());
+    const text = builtins.map((b) => `{${b}}`).join(' ');
+    const r = map([{ key: 'event.description', value: text }]);
+    assert.equal(valueOf(r.props, 'event.description'), text);
+    assert.deepEqual(r.unresolved, []);
+  });
+
+  it('matches a respelled dimension', () => {
+    const r = map([{ key: 'event.name', value: '{dims:cluster_name}' }], { columns: ['Cluster Name'] });
+    assert.equal(valueOf(r.props, 'event.name'), '{dims:Cluster Name}');
+    assert.deepEqual(r.unresolved, []);
+  });
+
+  it('matches regardless of case and backticks, and keeps the bare form', () => {
+    const r = map([{ key: 'event.name', value: '{`CLUSTER_NAME`}' }], { columns: ['Cluster Name'] });
+    assert.equal(valueOf(r.props, 'event.name'), '{Cluster Name}');
+  });
+
+  it('prefers the column without spaces', () => {
+    for (const columns of [
+      ['Broker ID', 'Broker_ID'],
+      ['Broker_ID', 'Broker ID'],
+    ]) {
+      const r = map([{ key: 'event.name', value: '{dims:broker_id}' }], { columns });
+      assert.equal(valueOf(r.props, 'event.name'), '{dims:Broker_ID}', columns.join(' | '));
+    }
+  });
+
+  it('leaves a placeholder that already names a column as it is, even when a sibling spelling exists', () => {
+    const r = map([{ key: 'event.name', value: '{dims:Broker ID}' }], { columns: ['Broker ID', 'Broker_ID'] });
+    assert.equal(valueOf(r.props, 'event.name'), '{dims:Broker ID}');
+  });
+
+  it('reports what it cannot map and leaves the text', () => {
+    const r = map([{ key: 'event.name', value: 'Role {dims:Role}' }], { columns: ['ServiceName'] });
+    assert.deepEqual(r.unresolved, ['{dims:Role}']);
+    assert.equal(valueOf(r.props, 'event.name'), 'Role {dims:Role}');
+    assert.deepEqual(r.changes, []);
+  });
+
+  it('lists an unresolved placeholder once, across properties', () => {
+    const r = map(
+      [
+        { key: 'event.name', value: '{dims:Role} and {Role}' },
+        { key: 'event.description', value: '{dims:Role}' },
+      ],
+      { columns: [] },
+    );
+    assert.deepEqual(r.unresolved, ['{dims:Role}', '{Role}']);
+  });
+
+  it('reports a classic entity placeholder as unresolved when there is no entity and none was waived', () => {
+    const r = map([{ key: 'event.name', value: 'On {dims:dt.entity.custom_device}' }]);
+    assert.deepEqual(r.unresolved, ['{dims:dt.entity.custom_device}']);
+    assert.equal(valueOf(r.props, 'event.name'), 'On {dims:dt.entity.custom_device}');
+  });
+
+  it('leaves a classic entity placeholder alone when the query emits that very column', () => {
+    const r = map([{ key: 'event.name', value: 'On {dims:dt.entity.host}' }], { columns: ['dt.entity.host'] });
+    assert.equal(valueOf(r.props, 'event.name'), 'On {dims:dt.entity.host}');
+    assert.deepEqual(r.unresolved, []);
+  });
+
+  it('without an entity, entity placeholders are removed', () => {
+    const r = map([{ key: 'event.name', value: 'Lag on {dims:dt.entity.custom_device.name}' }], { withoutEntity: true });
+    assert.equal(valueOf(r.props, 'event.name'), 'Lag on');
+    assert.deepEqual(r.unresolved, []);
+    assert.equal(r.changes.length, 1);
+    assert.equal(r.nameColumn, undefined);
+  });
+
+  it('closes the gap a removed placeholder leaves in the middle of a sentence', () => {
+    const r = map([{ key: 'event.name', value: '{dims:dt.entity.custom_device} lag on {dims:dt.entity.custom_device.name} is high' }], {
+      withoutEntity: true,
+    });
+    assert.equal(valueOf(r.props, 'event.name'), 'lag on is high');
+  });
+
+  it('passes non-string values and keyless properties through untouched', () => {
+    const props: EventProp[] = [{ key: 'n', value: 5 }, { value: 'x {dims:Q}' }, { key: 'o', value: { a: 1 } }];
+    const r = map(props, { columns: ['Q'] });
+    assert.deepEqual(r.props, props);
+    assert.deepEqual(r.unresolved, []);
+  });
+
+  it('does not mutate the properties it is given', () => {
+    const props: EventProp[] = [
+      { key: 'dt.source_entity', value: '{dims:dt.entity.custom_device}' },
+      { key: 'event.name', value: 'On {dims:dt.entity.custom_device.name}' },
+    ];
+    const before = JSON.stringify(props);
+    map(props, { entityColumn: SQS });
+    assert.equal(JSON.stringify(props), before);
+  });
+});
+
+describe('withNodeNameColumn', () => {
+  it('appends a fieldsAdd that reads the node name', () => {
+    const out = withNodeNameColumn(`timeseries x=avg(m), by:{${SQS}}`, SQS);
+    assert.ok(out.startsWith(`timeseries x=avg(m), by:{${SQS}}`));
+    assert.ok(out.endsWith(`\n| fieldsAdd ${SQS}.name = getNodeName(${SQS})`));
+  });
+
+  it('does not leave a blank line after a query that ends in a newline', () => {
+    const out = withNodeNameColumn(`timeseries x=avg(m), by:{${SQS}}\n`, SQS);
+    assert.equal(out, `timeseries x=avg(m), by:{${SQS}}\n| fieldsAdd ${SQS}.name = getNodeName(${SQS})`);
+  });
+
+  it('starts the new command on its own line after a trailing comment', () => {
+    const out = withNodeNameColumn(`timeseries x=avg(m), by:{${SQS}} // per queue`, SQS);
+    assert.ok(out.includes('// per queue\n| fieldsAdd'));
+  });
+});
+
+describe('staticColumns', () => {
+  it('lists what a timeseries, its by-clause and the later fields emit', () => {
+    const q = 'timeseries v = avg(m), by:{dt.smartscape_source.id = dt.smartscape.aws_x, QueueName}\n| fieldsAdd env = "a"';
+    assert.deepEqual(staticColumns(q), new Set(['v', 'timeframe', 'interval', 'dt.smartscape_source.id', 'QueueName', 'env']));
+  });
+
+  it('reads backtick-quoted dimensions and several aggregations in braces', () => {
+    const q = 'timeseries {a = avg(m), b = max(m, rollup: total)}, by:{`Cluster Name`, Broker_ID = `Broker ID`}';
+    assert.deepEqual(staticColumns(q), new Set(['a', 'b', 'timeframe', 'interval', 'Cluster Name', 'Broker_ID']));
+  });
+
+  it('reads fields and fieldsAdd names, bare or assigned, and ignores commas inside calls and strings', () => {
+    const q = ['timeseries v = avg(m)', '| fieldsAdd x = if(a > 1, "p,q", "r"), `y z` = 2', '| fields v, timeframe, x = x, `y z`'].join('\n');
+    assert.deepEqual(staticColumns(q), new Set(['v', 'timeframe', 'interval', 'x', 'y z']));
+  });
+
+  it('does not count a by-clause buried in a filter, a comment or a string', () => {
+    const q = 'timeseries v = avg(m, filter: {matchesValue(a, "by:{nope}")}), by:{Real} // by:{alsoNope}';
+    assert.deepEqual(staticColumns(q), new Set(['v', 'timeframe', 'interval', 'Real']));
+  });
+
+  it('reads every timeseries, including one inside an append', () => {
+    const q = 'timeseries a = avg(m), by:{One}\n| append [ timeseries b = avg(n), by:{Two} ]';
+    assert.deepEqual(staticColumns(q), new Set(['a', 'b', 'timeframe', 'interval', 'One', 'Two']));
+  });
+
+  it('is empty for a query with no timeseries and no field commands', () => {
+    assert.deepEqual(staticColumns('fetch logs | limit 5'), new Set());
+  });
+});
+
+type Inputs = Array<{ key: string; value: string }>;
+
+function liveDetector(): Record<string, unknown> {
+  return {
+    enabled: false,
+    title: 'Queue backlog',
+    description: 'd',
+    executionSettings: { actor: 'actor-1' },
+    analyzer: {
+      name: 'dt.statistics.ui.anomaly_detection.StaticThresholdAnomalyDetectionAnalyzer',
+      input: [
+        { key: 'query.expression', value: 'timeseries x=avg(old)' },
+        { key: 'threshold', value: '5' },
+        { key: 'alertCondition', value: 'ABOVE' },
+      ],
+    },
+    eventTemplate: { properties: [{ key: 'event.name', value: 'old name' }], other: 'kept' },
+  };
+}
+
+describe('buildPublishValue', () => {
+  it('changes only the query and the event properties', () => {
+    const live = liveDetector();
+    const props: EventProp[] = [{ key: 'event.name', value: 'new name' }];
+    const out = buildPublishValue(live, 'timeseries x=avg(new)', props);
+
+    const input = (out.analyzer as { input: Inputs }).input;
+    assert.equal(input.find((i) => i.key === 'query.expression')?.value, 'timeseries x=avg(new)');
+    assert.deepEqual((out.eventTemplate as { properties: EventProp[] }).properties, props);
+
+    // Reset those two parts and nothing else differs from live.
+    const back = structuredClone(out);
+    (back.analyzer as { input: Inputs }).input.find((i) => i.key === 'query.expression')!.value = 'timeseries x=avg(old)';
+    (back.eventTemplate as { properties: EventProp[] }).properties = [{ key: 'event.name', value: 'old name' }];
+    assert.deepEqual(back, liveDetector());
+  });
+
+  it('writes the query under the key the detector already uses', () => {
+    const live = liveDetector();
+    (live.analyzer as { input: Inputs }).input[0]!.key = 'query';
+    const out = buildPublishValue(live, 'Q', []);
+    const input = (out.analyzer as { input: Inputs }).input;
+    assert.deepEqual(
+      input.map((i) => i.key),
+      ['query', 'threshold', 'alertCondition'],
+    );
+    assert.equal(input[0]!.value, 'Q');
+  });
+
+  it('never mutates live or the properties it is given', () => {
+    const live = liveDetector();
+    const props: EventProp[] = [{ key: 'event.name', value: 'new name' }];
+    const out = buildPublishValue(live, 'Q', props);
+    assert.deepEqual(live, liveDetector());
+    (out.eventTemplate as { properties: EventProp[] }).properties[0]!.value = 'changed after';
+    assert.equal(props[0]!.value, 'new name');
+  });
+
+  it('adds an event template when the detector had none', () => {
+    const live = liveDetector();
+    delete live.eventTemplate;
+    const out = buildPublishValue(live, 'Q', [{ key: 'a', value: 'b' }]);
+    assert.deepEqual(out.eventTemplate, { properties: [{ key: 'a', value: 'b' }] });
+  });
+
+  it('refuses a detector with no query input rather than publish nothing', () => {
+    const live = liveDetector();
+    (live.analyzer as { input: unknown[] }).input = [{ key: 'threshold', value: '5' }];
+    assert.throws(() => buildPublishValue(live, 'Q', []), /query/);
+  });
+});
+
+describe('publishedPartsEqual', () => {
+  it('ignores key order and other fields', () => {
+    const a = liveDetector();
+    const b: Record<string, unknown> = {
+      eventTemplate: { other: 'x', properties: [{ value: 'old name', key: 'event.name' }] },
+      analyzer: { input: [{ value: 'timeseries x=avg(old)', key: 'query.expression' }, { key: 'threshold', value: '9' }], name: 'other' },
+      enabled: true,
+      extra: { added: 'by the API' },
+    };
+    assert.equal(publishedPartsEqual(a, b), true);
+    assert.equal(publishedPartsEqual(b, a), true);
+  });
+
+  it('is false for a different query or different properties', () => {
+    const a = liveDetector();
+    const q = liveDetector();
+    (q.analyzer as { input: Inputs }).input[0]!.value = 'timeseries x=avg(other)';
+    assert.equal(publishedPartsEqual(a, q), false);
+
+    const p = liveDetector();
+    (p.eventTemplate as { properties: EventProp[] }).properties = [{ key: 'event.name', value: 'different' }];
+    assert.equal(publishedPartsEqual(a, p), false);
+
+    const extra = liveDetector();
+    (extra.eventTemplate as { properties: EventProp[] }).properties.push({ key: 'added', value: 'x' });
+    assert.equal(publishedPartsEqual(a, extra), false);
+  });
+
+  it('finds the query under either key', () => {
+    const a = liveDetector();
+    const b = liveDetector();
+    (b.analyzer as { input: Inputs }).input[0]!.key = 'query';
+    assert.equal(publishedPartsEqual(a, b), true);
+  });
+
+  it('treats absent and empty event properties as the same', () => {
+    const a = liveDetector();
+    const b = liveDetector();
+    (a.eventTemplate as { properties: EventProp[] }).properties = [];
+    delete b.eventTemplate;
+    assert.equal(publishedPartsEqual(a, b), true);
   });
 });
