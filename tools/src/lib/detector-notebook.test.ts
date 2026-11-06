@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import {
   buildReviewQuery,
   parseReviewQuery,
+  parseOriginalBlock,
+  isEffectivelyEmpty,
   buildDetectorNotebook,
   buildDetectorMarkdown,
   chunk,
@@ -64,6 +66,45 @@ describe('buildReviewQuery / parseReviewQuery round-trip', () => {
     const { objectId, query } = parseReviewQuery('smartscapeNodes AWS_SQS_QUEUE | limit 1');
     assert.equal(objectId, undefined);
     assert.equal(query, 'smartscapeNodes AWS_SQS_QUEUE | limit 1');
+  });
+});
+
+describe('parseOriginalBlock', () => {
+  it('is the inverse of buildReviewQuery', () => {
+    const original = 'timeseries a = avg(m)\n| filter x == "y"';
+    assert.equal(parseOriginalBlock(buildReviewQuery('id', 'new', original)), original);
+  });
+
+  it('keeps comment lines and blank lines of the original intact', () => {
+    const original = '// note\ntimeseries a = avg(m)\n\n| filter x == "y"';
+    assert.equal(parseOriginalBlock(buildReviewQuery('id', 'new', original)), original);
+  });
+
+  it('returns undefined when the marker line is missing', () => {
+    assert.equal(parseOriginalBlock('timeseries a = avg(m)'), undefined);
+    assert.equal(parseOriginalBlock(''), undefined);
+  });
+});
+
+describe('isEffectivelyEmpty', () => {
+  it('is true when every line is a // comment', () => {
+    assert.equal(isEffectivelyEmpty('// one\n// two\n  // three'), true);
+  });
+
+  it('is true for a block comment plus whitespace', () => {
+    assert.equal(isEffectivelyEmpty('/* x */\n  '), true);
+  });
+
+  it('is true for the empty string', () => {
+    assert.equal(isEffectivelyEmpty(''), true);
+  });
+
+  it('is false when a query follows a comment', () => {
+    assert.equal(isEffectivelyEmpty('// c\ntimeseries a = avg(m)'), false);
+  });
+
+  it('is false for a query with a trailing block comment', () => {
+    assert.equal(isEffectivelyEmpty('timeseries a = avg(m) /* tail */'), false);
   });
 });
 
@@ -146,6 +187,13 @@ describe('reviewer verdict card', () => {
     assert.equal(p.status, 'Needs Review');
     assert.equal(p.notes, '');
     assert.equal(p.untouched, true, 'a pristine card must not look like an answer');
+  });
+
+  it('parseReviewCard reads an id that contains the letter s', () => {
+    const id =
+      'vu9U3hXa3q0AAAABAB9idWlsdGluOmRhdmlzLmFub21hbHktZGV0ZWN0b3JzAAZ0ZW5hbnQABnRlbmFudAAkZGU4MzE3ZTgtOWYxYy0zNjM0LTkyZWQtYjZhNDI1ODQ4YWUzvu9U3hXa3q0';
+    const p = parseReviewCard(buildReviewCard({ objectId: id, title: 't' } as any));
+    assert.equal(p.objectId, id);
   });
 
   it('reads back a filled-in status and notes', () => {

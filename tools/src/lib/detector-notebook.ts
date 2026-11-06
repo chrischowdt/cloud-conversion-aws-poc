@@ -131,6 +131,32 @@ export function parseReviewQuery(value: string): { objectId?: string; query: str
   return { objectId, query: q };
 }
 
+/**
+ * The classic query a tile was staged from: every line after the ORIGINAL marker
+ * line, with the `// ` that buildReviewQuery put on each line taken off again.
+ * Undefined when the marker line is missing (the reviewer deleted it, or the
+ * tile never had one).
+ */
+export function parseOriginalBlock(value: string): string | undefined {
+  const lines = value.split('\n');
+  const markerIdx = lines.findIndex((l) => l.startsWith('// [CCT-ORIGINAL]'));
+  if (markerIdx < 0) return undefined;
+  return lines
+    .slice(markerIdx + 1)
+    .map((l) => l.replace(/^\/\/ ?/, ''))
+    .join('\n')
+    .trim();
+}
+
+/**
+ * True when nothing runnable is left in a query: only line comments, block
+ * comments and whitespace. A tile whose reviewer commented the whole query out
+ * has no query to publish.
+ */
+export function isEffectivelyEmpty(query: string): boolean {
+  return query.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '').trim() === '';
+}
+
 // ─── markdown tile ──────────────────────────────────────────────────────────
 
 const BUCKET_BADGE: Record<ReviewBucket, string> = {
@@ -348,7 +374,11 @@ export interface ParsedReviewCard {
  * typo surfaces as itself instead of silently becoming an approval.
  */
 export function parseReviewCard(markdown: string): ParsedReviewCard {
-  const idM = new RegExp(REVIEW_TAG + '([^\s`]+)').exec(markdown);
+  // The id runs from the tag to the next whitespace or backtick. (A regex built
+  // from a string literal would turn `\s` into a bare "s" and cut the id at its
+  // first letter s, so the id pattern is a literal and the tag is found by index.)
+  const tagAt = markdown.indexOf(REVIEW_TAG);
+  const idM = tagAt >= 0 ? /^[^\s`]+/.exec(markdown.slice(tagAt + REVIEW_TAG.length)) : null;
   const lines = markdown.split('\n');
 
   let status = '';
@@ -375,7 +405,7 @@ export function parseReviewCard(markdown: string): ParsedReviewCard {
 
   const resolved = canonical ?? status;
   return {
-    objectId: idM?.[1],
+    objectId: idM?.[0],
     status: resolved || DEFAULT_DECISION,
     notes,
     untouched: (!resolved || resolved === DEFAULT_DECISION) && notes === '',
