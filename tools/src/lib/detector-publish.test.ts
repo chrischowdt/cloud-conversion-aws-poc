@@ -226,6 +226,25 @@ describe('driftOf', () => {
     assert.equal(driftOf({ liveQuery: staged, stagedQuery: staged, approvedQuery: staged, liveIsMigrated: false }), 'already-published', 'an approval that changed nothing');
   });
 
+  it('is already-published when the live query is the one a previous apply recorded as published', () => {
+    // A publish can add the entity or a name column beyond the approved text, so
+    // after a publish whose sheet write failed the live query is the published one.
+    const published = `${approved} | fieldsAdd dt.smartscape.aws_lambda_function.name = getNodeName(dt.smartscape.aws_lambda_function)`;
+    const base = { stagedQuery: staged, approvedQuery: approved, publishedQuery: published };
+    assert.equal(driftOf({ ...base, liveQuery: ` ${published}\n`, liveIsMigrated: false }), 'already-published');
+    assert.equal(driftOf({ ...base, liveQuery: published, liveIsMigrated: true }), 'already-published');
+    assert.equal(driftOf({ ...base, stagedQuery: undefined, liveQuery: published, liveIsMigrated: false }), 'already-published', 'even with no staged query');
+    assert.equal(driftOf({ ...base, liveQuery: 'other', liveIsMigrated: false }), 'edited', 'a query that is none of the three still drifts');
+    assert.equal(driftOf({ ...base, liveQuery: staged, liveIsMigrated: false }), 'none', 'a recorded publish does not hide an untouched alert');
+  });
+
+  it('reads a live query that differs from the approved one as before when nothing was published', () => {
+    const published = `${approved} | fieldsAdd x = 1`;
+    assert.equal(driftOf({ liveQuery: published, stagedQuery: staged, approvedQuery: approved, liveIsMigrated: false }), 'edited');
+    assert.equal(driftOf({ liveQuery: published, stagedQuery: staged, approvedQuery: approved, publishedQuery: undefined, liveIsMigrated: false }), 'edited');
+    assert.equal(driftOf({ liveQuery: published, stagedQuery: staged, approvedQuery: approved, publishedQuery: '  ', liveIsMigrated: false }), 'edited', 'a blank record is no record');
+  });
+
   it('is unknown without a staged query', () => {
     assert.equal(driftOf({ liveQuery: staged, approvedQuery: approved, liveIsMigrated: false }), 'unknown');
     assert.equal(driftOf({ liveQuery: staged, stagedQuery: '  ', approvedQuery: approved, liveIsMigrated: false }), 'unknown');
@@ -241,28 +260,61 @@ describe('driftOf', () => {
 });
 
 describe('decideEntity', () => {
-  const warning = { kind: 'alert-unbound', text: 'This alert will not attach to an entity: the reason.' } as BindingOutcome['warning'];
-  const outcome = (kind: BindingOutcome['kind'], query?: string): BindingOutcome => ({ kind, ...(query ? { query } : {}), ...(query ? {} : { warning }) });
+  // Shaped like what resolveBinding returns: bound carries a query and a note;
+  // per-entity and unverified carry a query, a note AND a warning; the outcomes
+  // that stay unbound carry only a warning.
+  const bound: BindingOutcome = { kind: 'bound', query: 'q2', note: 'added the entity: 12 series with and without it, so the grain is unchanged.' };
+  const unverified: BindingOutcome = {
+    kind: 'unverified',
+    query: 'q3',
+    note: 'added the entity to the split.',
+    warning: { kind: 'alert-per-entity', text: 'No data in the last 7 days, so it is unproven whether adding the entity keeps this alert\'s grain.' },
+  };
+  const perEntity: BindingOutcome = {
+    kind: 'per-entity',
+    query: 'q4',
+    note: 'added the entity to the split: 12 series became 40 over the last 7 days.',
+    warning: {
+      kind: 'alert-per-entity',
+      text: 'The classic alert combined several resources into each series (12 series; 40 per resource). It now alerts per resource, so check that the threshold still fits a single resource.',
+    },
+  };
+  const outcome = (kind: 'too-many' | 'skipped' | 'error'): BindingOutcome => ({
+    kind,
+    warning: { kind: 'alert-unbound', text: 'This alert will not attach to an entity: the reason.' },
+  });
 
   it('uses the bound query when the grain is unchanged', () => {
-    assert.deepEqual(decideEntity(outcome('bound', 'q2')), { action: 'use-bound', query: 'q2' });
-    assert.deepEqual(decideEntity(outcome('bound', 'q2'), 'per-resource'), { action: 'use-bound', query: 'q2' });
-    assert.deepEqual(decideEntity(outcome('bound', 'q2'), 'without-entity'), { action: 'unbound' });
+    assert.deepEqual(decideEntity(bound), { action: 'use-bound', query: 'q2' });
+    assert.deepEqual(decideEntity(bound, 'per-resource'), { action: 'use-bound', query: 'q2' });
+    assert.deepEqual(decideEntity(bound, 'without-entity'), { action: 'unbound' });
   });
 
   it('uses the bound query when the grain could not be checked', () => {
-    assert.deepEqual(decideEntity(outcome('unverified', 'q3')), { action: 'use-bound', query: 'q3' });
-    assert.deepEqual(decideEntity(outcome('unverified', 'q3'), 'per-resource'), { action: 'use-bound', query: 'q3' });
-    assert.deepEqual(decideEntity(outcome('unverified', 'q3'), 'without-entity'), { action: 'unbound' });
+    assert.deepEqual(decideEntity(unverified), { action: 'use-bound', query: 'q3' });
+    assert.deepEqual(decideEntity(unverified, 'per-resource'), { action: 'use-bound', query: 'q3' });
+    assert.deepEqual(decideEntity(unverified, 'without-entity'), { action: 'unbound' });
   });
 
   it('sends a per-entity split back for review unless a reviewer accepted it', () => {
-    const d = decideEntity(outcome('per-entity', 'q4'));
+    const d = decideEntity(perEntity);
     assert.equal(d.action, 'skip');
     assert.match(d.action === 'skip' ? d.reason : '', /back for review/);
     assert.match(d.action === 'skip' ? d.reason : '', /publish_override/);
-    assert.deepEqual(decideEntity(outcome('per-entity', 'q4'), 'per-resource'), { action: 'use-bound', query: 'q4' });
-    assert.deepEqual(decideEntity(outcome('per-entity', 'q4'), 'without-entity'), { action: 'unbound' });
+    assert.deepEqual(decideEntity(perEntity, 'per-resource'), { action: 'use-bound', query: 'q4' });
+    assert.deepEqual(decideEntity(perEntity, 'without-entity'), { action: 'unbound' });
+  });
+
+  it('puts the series counts in the per-entity reason', () => {
+    const d = decideEntity(perEntity);
+    assert.match(d.action === 'skip' ? d.reason : '', /12 series; 40 per resource/);
+  });
+
+  it('still skips a per-entity split whose warning is missing', () => {
+    const { warning: _dropped, ...bare } = perEntity;
+    const d = decideEntity(bare);
+    assert.equal(d.action, 'skip');
+    assert.match(d.action === 'skip' ? d.reason : '', /back for review/);
   });
 
   it('skips when no entity can be added, unless the reviewer says it has none', () => {

@@ -113,14 +113,26 @@ export function selectForPublish(
 export type Drift = 'none' | 'edited' | 'owner-migrated' | 'already-published' | 'unknown';
 
 /**
- * Compare the live query with the approved one and with the one the card was
- * staged from, ignoring leading and trailing whitespace. `already-published` is
- * checked first: after a publish the live query equals the approved one, which
- * differs from the staged one, and must not read as an owner edit.
+ * Compare the live query with the approved one, the one a previous apply
+ * published (when given) and the one the card was staged from, ignoring leading
+ * and trailing whitespace. `already-published` is checked first: after a publish
+ * the live query differs from the staged one and must not read as an owner edit.
+ * It equals the approved query only when the publish changed nothing else; a
+ * publish also adds the entity to the split or appends a node-name column, so
+ * after a publish whose sheet write failed it equals `publishedQuery` instead.
  */
-export function driftOf(a: { liveQuery: string; stagedQuery?: string; approvedQuery: string; liveIsMigrated: boolean }): Drift {
+export function driftOf(a: {
+  liveQuery: string;
+  stagedQuery?: string;
+  approvedQuery: string;
+  /** The query a previous apply recorded as published, when there is one. */
+  publishedQuery?: string;
+  liveIsMigrated: boolean;
+}): Drift {
   const live = a.liveQuery.trim();
   if (live === a.approvedQuery.trim()) return 'already-published';
+  const published = a.publishedQuery?.trim();
+  if (published && live === published) return 'already-published';
   const staged = a.stagedQuery?.trim();
   if (!staged) return 'unknown';
   if (live === staged) return 'none';
@@ -160,7 +172,7 @@ export function decideEntity(outcome: BindingOutcome, override?: PublishOverride
       return {
         action: 'skip',
         reason:
-          'emits no entity, and adding one would split this alert into one per resource, so it goes back for review. ' +
+          `emits no entity, and adding one would split this alert into one per resource, so it goes back for review.${detail} ` +
           `Set publish_override to ${OVERRIDE_CHOICES} to publish anyway.`,
       };
     case 'already':
