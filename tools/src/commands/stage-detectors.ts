@@ -326,6 +326,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
             review_copy_id: b.notebookId,
             review_copy_url: b.notebookUrl ?? notebookUiUrl(args.baseUrl, b.notebookId),
             reasons: `review batch ${b.batch}`,
+            review_batch: b.batch,
           });
         }
       }
@@ -529,6 +530,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
           review_copy_url: entry.notebookUrl,
           staged_at: new Date().toISOString(),
           reasons: `review batch ${label}`,
+          review_batch: label,
         });
       }
       created++;

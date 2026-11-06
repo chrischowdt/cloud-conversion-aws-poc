@@ -121,6 +121,23 @@ export function keepsBatchLabel(reasons: string | undefined): boolean {
   return BATCH_LABEL_RE.test(String(reasons ?? ''));
 }
 
+/**
+ * objectId -> review batch label, from the stage-detectors manifest. Only a batch
+ * with a `notebookId` counts: a prepare run or a failed create leaves an entry
+ * whose detectors sit in no notebook, and labelling them would send a reviewer
+ * to a batch that does not exist.
+ */
+export function batchOfDetectors(manifest: {
+  batches?: Array<{ batch: string; notebookId?: string; detectors: Array<{ objectId: string }> }>;
+}): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const b of manifest.batches ?? []) {
+    if (!b.notebookId) continue;
+    for (const d of b.detectors ?? []) out.set(d.objectId, b.batch);
+  }
+  return out;
+}
+
 /** Deep link to the detector's settings object. */
 function detectorUrl(baseUrl: string | undefined, id: string): string | undefined {
   if (!baseUrl) return undefined;
@@ -150,6 +167,17 @@ export async function runRefreshAlertTracker(args: RefreshAlertTrackerArgs): Pro
   // writes the batch label into `reasons`, and blindly rebuilding both wiped
   // them for all 55 staged alerts on the first run against the team workbook.
   const existing = await readRows(trackerPath, ALERTS_SHEET).catch(() => new Map<string, Record<string, string>>());
+
+  // Which review notebook batch each alert sits in. The manifest is absent until
+  // the first publish, which is normal; an unreadable one just means no labels
+  // this run (a row with no review_batch keeps whatever the sheet already has).
+  let batchOf = new Map<string, string>();
+  const manifestPath = join(base, 'migration', 'detector-review', 'manifest.json');
+  if (existsSync(manifestPath)) {
+    try {
+      batchOf = batchOfDetectors(JSON.parse(await readFile(manifestPath, 'utf8')));
+    } catch { /* leave the column as the sheet has it */ }
+  }
 
   const results = (await readFile(scanPath, 'utf8'))
     .split('\n')
@@ -193,6 +221,7 @@ export async function runRefreshAlertTracker(args: RefreshAlertTrackerArgs): Pro
       lane: conf.lane,
       priority: conf.level === 'blocked' ? 'low' : 'medium',
       status: nextStatus(existing.get(r.id)?.['status'], conf.level),
+      review_batch: batchOf.get(r.id),
       // Keep the batch label a staged row carries; `reasons` is the only place
       // the sheet records which review notebook an alert is in.
       reasons: keepsBatchLabel(existing.get(r.id)?.['reasons'])

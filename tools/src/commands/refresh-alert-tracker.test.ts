@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { deriveOwner, keepsBatchLabel, nextStatus } from './refresh-alert-tracker.ts';
+import { batchOfDetectors, deriveOwner, keepsBatchLabel, nextStatus } from './refresh-alert-tracker.ts';
 
 describe('refresh must not rewind work already done', () => {
   // The first run against the team workbook reset status=staged -> candidate and
@@ -36,6 +36,38 @@ describe('refresh must not rewind work already done', () => {
     assert.equal(keepsBatchLabel(''), false);
     assert.equal(keepsBatchLabel(undefined), false);
     assert.equal(keepsBatchLabel('no review batch'), false, 'needs a label after the words');
+  });
+});
+
+describe('nextStatus and the publish statuses', () => {
+  // Publishing (later tasks) writes these. A refresh re-derives confidence from a
+  // fresh scan and must never pull a published alert back to candidate/blocked.
+  it('nextStatus leaves publish statuses alone', () => {
+    for (const s of ['promoted', 'verified', 'rolled-back']) {
+      assert.equal(nextStatus(s, 'blocked'), s);
+    }
+  });
+});
+
+describe('batchOfDetectors', () => {
+  it('maps published batches only', () => {
+    const map = batchOfDetectors({
+      batches: [
+        { batch: 'batch-01', notebookId: 'nb-1', detectors: [{ objectId: 'A' }, { objectId: 'B' }] },
+        // Never published (a prepare run, or a failed create): its ids are not in any notebook.
+        { batch: 'batch-02', detectors: [{ objectId: 'C' }] },
+        { batch: 'batch-03', notebookId: 'nb-3', detectors: [{ objectId: 'D' }] },
+      ],
+    });
+    assert.equal(map.get('A'), 'batch-01');
+    assert.equal(map.get('B'), 'batch-01');
+    assert.equal(map.get('D'), 'batch-03');
+    assert.equal(map.has('C'), false, 'a batch without notebookId is ignored');
+    assert.equal(map.size, 3);
+  });
+
+  it('tolerates a manifest with no batches', () => {
+    assert.equal(batchOfDetectors({}).size, 0);
   });
 });
 
