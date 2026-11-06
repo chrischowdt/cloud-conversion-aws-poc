@@ -6,7 +6,7 @@ import { readdir } from 'node:fs/promises';
 import { rm, mkdtemp } from 'node:fs/promises';
 
 import ExcelJS from 'exceljs';
-import { ALERTS_SHEET, MIGRATION_SHEET, sheetForAssetType, upsertRows, readDecisions, cellStr, isReadyToPublish, isPublished, PUBLISHED, pruneRowsNotInScope, pruneReviewCopyRows, readRows, type TrackerRow, snapshotTracker } from './tracker-xlsx.ts';
+import { ALERTS_SHEET, MIGRATION_SHEET, TOOL_COLUMNS, HUMAN_COLUMNS, sheetForAssetType, upsertRows, readDecisions, cellStr, isReadyToPublish, isPublished, PUBLISHED, pruneRowsNotInScope, pruneReviewCopyRows, readRows, type TrackerRow, snapshotTracker } from './tracker-xlsx.ts';
 
 let dir: string;
 let path: string;
@@ -324,5 +324,121 @@ describe('one workbook, two sheets', () => {
     const how = wb.getWorksheet('how-to')!;
     const text = (how.getColumn(1).values as ExcelJS.CellValue[]).map((v) => cellStr(v)).join('\n');
     assert.match(text, /SHEET "alerts"/, 'the guidance explains the alerts sheet');
+  });
+});
+
+describe('alerts-only columns: review_batch and publish_override', () => {
+  const headerOf = (ws: ExcelJS.Worksheet): string[] =>
+    (ws.getRow(1).values as ExcelJS.CellValue[]).slice(1).map((v) => cellStr(v));
+  const alertRow = (id: string, over: Partial<TrackerRow> = {}): TrackerRow =>
+    row(id, { asset_type: 'anomaly-detector', ...over });
+
+  it('alerts sheet gets review_batch and publish_override, migration sheet does not', async () => {
+    const p = join(dir, 'alert-cols.xlsx');
+    await upsertRows(p, [alertRow('A-1', { review_batch: 'batch-03' })], ALERTS_SHEET);
+    await upsertRows(p, [row('D-1')], MIGRATION_SHEET);
+
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    const alerts = headerOf(wb.getWorksheet(ALERTS_SHEET)!);
+    const migration = headerOf(wb.getWorksheet(MIGRATION_SHEET)!);
+    assert.ok(alerts.includes('review_batch'), 'alerts has review_batch');
+    assert.ok(alerts.includes('publish_override'), 'alerts has publish_override');
+    assert.ok(!migration.includes('review_batch'), 'migration has no review_batch');
+    assert.ok(!migration.includes('publish_override'), 'migration has no publish_override');
+
+    const rec = (await readRows(p, ALERTS_SHEET)).get('A-1')!;
+    assert.equal(rec['review_batch'], 'batch-03');
+    assert.equal(rec['publish_override'], '');
+  });
+
+  it('adds the new columns to an alerts sheet created before they existed', async () => {
+    const p = join(dir, 'alert-evolve.xlsx');
+    // An alerts sheet as it was before these columns: the base headers only.
+    const old = new ExcelJS.Workbook();
+    const oldWs = old.addWorksheet(ALERTS_SHEET);
+    [...TOOL_COLUMNS, ...HUMAN_COLUMNS].forEach((c, i) => {
+      oldWs.getRow(1).getCell(i + 1).value = c.header;
+    });
+    const oldHdr = headerOf(oldWs);
+    oldWs.getCell(2, oldHdr.indexOf('asset_id') + 1).value = 'A-1';
+    oldWs.getCell(2, oldHdr.indexOf('decision') + 1).value = 'In Progress';
+    await old.xlsx.writeFile(p);
+
+    await upsertRows(p, [alertRow('A-1', { review_batch: 'batch-07' })], ALERTS_SHEET);
+    const rec = (await readRows(p, ALERTS_SHEET)).get('A-1')!;
+    assert.equal(rec['review_batch'], 'batch-07');
+    assert.ok('publish_override' in rec, 'publish_override header added');
+    assert.equal(rec['decision'], 'In Progress', 'the reviewer decision is untouched');
+
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    const hdr = headerOf(wb.getWorksheet(ALERTS_SHEET)!);
+    assert.equal(new Set(hdr).size, hdr.length, 'no header was overwritten or duplicated');
+    assert.ok(hdr.includes('notes'));
+  });
+
+  it('never prunes a row whose only human input is a publish_override', async () => {
+    const p = join(dir, 'alert-prune.xlsx');
+    await upsertRows(p, [alertRow('A-1'), alertRow('A-2')], ALERTS_SHEET);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    const ws = wb.getWorksheet(ALERTS_SHEET)!;
+    const hdr = headerOf(ws);
+    const idCol = hdr.indexOf('asset_id') + 1;
+    const ovCol = hdr.indexOf('publish_override') + 1;
+    ws.eachRow((rw, n) => {
+      if (n > 1 && cellStr(rw.getCell(idCol).value) === 'A-1') rw.getCell(ovCol).value = 'Publish per resource';
+    });
+    await wb.xlsx.writeFile(p);
+
+    const res = await pruneRowsNotInScope(p, new Set(), ALERTS_SHEET);
+    assert.equal(res.keptHuman, 1);
+    assert.equal(res.removed, 1);
+    assert.deepEqual([...(await readRows(p, ALERTS_SHEET)).keys()], ['A-1']);
+  });
+
+  it('publish_override survives tool writes', async () => {
+    const p = join(dir, 'alert-override.xlsx');
+    await upsertRows(p, [alertRow('A-1')], ALERTS_SHEET);
+
+    // A reviewer picks an override by hand.
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    const ws = wb.getWorksheet(ALERTS_SHEET)!;
+    const col = headerOf(ws).indexOf('publish_override') + 1;
+    assert.ok(col > 0);
+    ws.getCell(2, col).value = 'Publish without entity';
+    await wb.xlsx.writeFile(p);
+
+    // The tool re-upserts the row (new status, new batch). It must not touch the cell.
+    await upsertRows(p, [alertRow('A-1', { status: 'staged', review_batch: 'batch-04' })], ALERTS_SHEET);
+    const rec = (await readRows(p, ALERTS_SHEET)).get('A-1')!;
+    assert.equal(rec['publish_override'], 'Publish without entity');
+    assert.equal(rec['status'], 'staged');
+    assert.equal(rec['review_batch'], 'batch-04');
+  });
+
+  it('publish_override cells carry the dropdown', async () => {
+    const p = join(dir, 'alert-dropdown.xlsx');
+    await upsertRows(p, [alertRow('A-1'), alertRow('A-2')], ALERTS_SHEET);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    const ws = wb.getWorksheet(ALERTS_SHEET)!;
+    const col = headerOf(ws).indexOf('publish_override') + 1;
+    for (const r of [2, 3]) {
+      const dv = (ws.getCell(r, col) as any).dataValidation;
+      assert.ok(dv, `row ${r} has a dropdown`);
+      assert.deepEqual(dv.formulae, ['"Publish per resource,Publish without entity"']);
+    }
+  });
+
+  it('describes publish_override on the how-to sheet', async () => {
+    const p = join(dir, 'alert-howto.xlsx');
+    await upsertRows(p, [alertRow('A-1')], ALERTS_SHEET);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(p);
+    const text = (wb.getWorksheet('how-to')!.getColumn(1).values as ExcelJS.CellValue[]).map((v) => cellStr(v)).join('\n');
+    assert.match(text, /publish_override/);
   });
 });

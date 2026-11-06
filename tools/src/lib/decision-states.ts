@@ -61,3 +61,34 @@ export function canonicalDecision(raw: string | undefined): DecisionState | unde
   const cleaned = (raw ?? '').replace(/[*_`]/g, '').trim().replace(/[.,;]+$/, '');
   return DECISION_STATES.find((s) => s.toLowerCase() === cleaned.toLowerCase());
 }
+
+/**
+ * The `publish_override` vocabulary (alerts sheet; the dropdown on the cell
+ * offers exactly these two words). It only lifts the "emits no entity" gate on
+ * publishing an alert:
+ *   per-resource   — the reviewer accepts that the alert fires once per resource
+ *   without-entity — the alert is not about one resource; it goes out unbound
+ * Blank means "no override": the tool decides from its own checks.
+ */
+export const PUBLISH_OVERRIDES = ['Publish per resource', 'Publish without entity'] as const;
+export type PublishOverride = 'per-resource' | 'without-entity';
+
+// A Map, not an object literal: a typed `constructor` or `toString` must not
+// resolve to an inherited property.
+const PUBLISH_OVERRIDE_BY_TEXT = new Map<string, PublishOverride>([
+  ['publish per resource', 'per-resource'],
+  ['publish without entity', 'without-entity'],
+]);
+
+/**
+ * Read a raw `publish_override` cell (case, surrounding space and trailing
+ * `.,;` tolerated). `undefined` = nothing chosen; `'invalid'` = something typed
+ * that is not on the list. Callers must not treat `'invalid'` as an override and
+ * must not guess the nearest word: an override authorizes a publish the tool
+ * would not make by itself, so a typo must never become one.
+ */
+export function parsePublishOverride(cell: string | undefined): PublishOverride | 'invalid' | undefined {
+  const cleaned = (cell ?? '').trim().toLowerCase().replace(/[.,;]+$/, '');
+  if (!cleaned) return undefined;
+  return PUBLISH_OVERRIDE_BY_TEXT.get(cleaned) ?? 'invalid';
+}

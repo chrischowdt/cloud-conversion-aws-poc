@@ -35,7 +35,7 @@ export {
   isPublished,
   type DecisionState,
 } from './decision-states.ts';
-import { DECISION_STATES } from './decision-states.ts';
+import { DECISION_STATES, PUBLISH_OVERRIDES } from './decision-states.ts';
 
 /** Columns the tool owns and overwrites. `asset_id` is the join key. */
 export const TOOL_COLUMNS = [
@@ -74,8 +74,28 @@ export const HUMAN_COLUMNS = [
   { key: 'notes', header: 'notes', width: 60 },
 ] as const;
 
+/**
+ * Columns that exist on the `alerts` sheet only. Dashboards and notebooks have no
+ * use for either, and a column that is blank on 1,000 rows is clutter for the
+ * people who review those.
+ *   `review_batch`     — tool-owned: which review-notebook batch holds the alert.
+ *   `publish_override` — reviewer-owned: lets a human publish an alert the tool
+ *                        held back for emitting no entity. The tool reads it
+ *                        and NEVER writes it.
+ */
+export const ALERTS_TOOL_COLUMNS = [{ key: 'review_batch', header: 'review_batch', width: 12 }] as const;
+export const ALERTS_HUMAN_COLUMNS = [{ key: 'publish_override', header: 'publish_override', width: 22 }] as const;
+
 const ALL_COLUMNS = [...TOOL_COLUMNS, ...HUMAN_COLUMNS];
-const TOOL_KEYS = new Set(TOOL_COLUMNS.map((c) => c.key));
+const ALERTS_COLUMNS = [...TOOL_COLUMNS, ...ALERTS_TOOL_COLUMNS, ...HUMAN_COLUMNS, ...ALERTS_HUMAN_COLUMNS];
+const TOOL_KEYS = new Set<string>([...TOOL_COLUMNS, ...ALERTS_TOOL_COLUMNS].map((c) => c.key));
+/** Every column a reviewer fills in, on any sheet. */
+const ANY_HUMAN_COLUMNS = [...HUMAN_COLUMNS, ...ALERTS_HUMAN_COLUMNS];
+
+/** The columns a sheet carries: the base set, plus the alerts-only ones on `alerts`. */
+function columnsFor(sheetName: string): ReadonlyArray<{ key: string; header: string; width: number }> {
+  return sheetName === ALERTS_SHEET ? ALERTS_COLUMNS : ALL_COLUMNS;
+}
 
 /**
  * What the TRACKER can hold. Wider than `AssetType`, which is deliberately the
@@ -121,6 +141,8 @@ export interface TrackerRow {
   promoted_at?: string;
   verified_at?: string;
   tool_updated?: string;
+  /** Alerts sheet only: the review-notebook batch holding this alert (e.g. `batch-03`). */
+  review_batch?: string;
   /**
    * Human column, normally reviewer-owned. The automation MAY set this to
    * `Published` after a cutover (see module header); no other tool path sets it.
@@ -214,9 +236,9 @@ function headerIndex(ws: ExcelJS.Worksheet): Map<string, number> {
   return map;
 }
 
-function initHeader(ws: ExcelJS.Worksheet): Map<string, number> {
+function initHeader(ws: ExcelJS.Worksheet, sheetName: string): Map<string, number> {
   const map = new Map<string, number>();
-  ALL_COLUMNS.forEach((c, i) => {
+  columnsFor(sheetName).forEach((c, i) => {
     const col = i + 1;
     const cell = ws.getRow(1).getCell(col);
     cell.value = c.header;
@@ -261,6 +283,11 @@ function ensureInstructions(wb: ExcelJS.Workbook): void {
     '  Ready To Publish — reviewed + correct; the automation MAY cut the review copy over the original.',
     '  Published        — set BY the automation after it has cut the row over. Do not set this yourself.',
     '',
+    'PUBLISH OVERRIDE (column "publish_override", alerts sheet only, optional) — leave blank unless the tool held an alert back for emitting no entity.',
+    '  Publish per resource   — the alert will fire once per resource; you have checked the threshold suits that.',
+    '  Publish without entity — the alert is not about one resource (account- or environment-wide); it goes out unbound.',
+    '  Counts only when decision = Ready To Publish and your name is in "reviewer". The tool reads it and never writes it.',
+    '',
     'REVIEW WORKFLOW (per assigned row):',
     '  1. Set decision = In Progress so others know it is taken.',
     '  2. Open the review copy — click "review_copy_url" (a COPY named "[MIGRATION REVIEW] …"; the original is untouched).',
@@ -301,11 +328,11 @@ export async function upsertRows(
   let header: Map<string, number>;
   if (!ws) {
     ws = wb.addWorksheet(sheetName);
-    header = initHeader(ws);
+    header = initHeader(ws, sheetName);
   } else {
     header = headerIndex(ws);
     // Add any tool columns missing from an existing sheet (schema evolution).
-    for (const c of ALL_COLUMNS) {
+    for (const c of columnsFor(sheetName)) {
       if (!header.has(c.header)) {
         const col = header.size + 1;
         ws.getRow(1).getCell(col).value = c.header;
@@ -353,8 +380,9 @@ export async function upsertRows(
     const row = ws.getRow(rowNum);
     for (const [key, val] of Object.entries(withStamp)) {
       // Tool columns are always writable; `decision` is writable ONLY so the
-      // automation can stamp its lifecycle value (Published). No other human col.
-      if (!TOOL_KEYS.has(key as (typeof TOOL_COLUMNS)[number]['key']) && key !== 'decision') continue;
+      // automation can stamp its lifecycle value (Published). No other human col
+      // (`publish_override` included) is ever written.
+      if (!TOOL_KEYS.has(key) && key !== 'decision') continue;
       if (val === undefined) continue;
       const col = header.get(key);
       if (col) row.getCell(col).value = val as ExcelJS.CellValue;
@@ -363,9 +391,34 @@ export async function upsertRows(
   }
 
   applyDecisionDropdown(ws, header);
+  applyOverrideDropdown(ws, header);
   snapshotTracker(path);
   await wb.xlsx.writeFile(path);
   return { updated, added };
+}
+
+/**
+ * Attach a dropdown of PUBLISH_OVERRIDES to every data row's `publish_override`
+ * cell (alerts sheet only — the column does not exist elsewhere). Idempotent.
+ * Like the decision dropdown it only warns on other text, so a typed value still
+ * reaches the tool, which ignores it (`parsePublishOverride` → 'invalid').
+ */
+function applyOverrideDropdown(ws: ExcelJS.Worksheet, header: Map<string, number>): void {
+  const col = header.get('publish_override');
+  if (!col) return;
+  const formulae = [`"${PUBLISH_OVERRIDES.join(',')}"`];
+  const last = Math.max(ws.rowCount, 2);
+  for (let r = 2; r <= last; r++) {
+    ws.getCell(r, col).dataValidation = {
+      type: 'list',
+      allowBlank: true,
+      formulae,
+      showErrorMessage: true,
+      errorStyle: 'warning',
+      error: 'Pick one of: ' + PUBLISH_OVERRIDES.join(', '),
+      errorTitle: 'Publish override',
+    };
+  }
 }
 
 /**
@@ -487,7 +540,7 @@ export async function pruneReviewCopyRows(
   const header = headerIndex(ws);
   const nameCol = header.get('name');
   if (!nameCol) return { removed: 0, keptWithHumanInput: [] };
-  const humanCols = HUMAN_COLUMNS.map((c) => header.get(c.header)).filter((n): n is number => !!n);
+  const humanCols = ANY_HUMAN_COLUMNS.map((c) => header.get(c.header)).filter((n): n is number => !!n);
 
   const doomed: number[] = [];
   const kept: string[] = [];
@@ -537,7 +590,7 @@ export async function pruneRowsNotInScope(
   const idCol = header.get('asset_id');
   const statusCol = header.get('status');
   if (!idCol) return { removed: 0, keptHuman: 0, keptInFlight: 0 };
-  const humanCols = HUMAN_COLUMNS.map((c) => header.get(c.header)).filter((n): n is number => !!n);
+  const humanCols = ANY_HUMAN_COLUMNS.map((c) => header.get(c.header)).filter((n): n is number => !!n);
 
   const doomed: number[] = [];
   let keptHuman = 0, keptInFlight = 0;
