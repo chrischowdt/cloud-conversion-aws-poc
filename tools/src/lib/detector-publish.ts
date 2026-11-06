@@ -12,8 +12,10 @@
 import { SOURCE_ID_DIM, type BindingOutcome } from './detector-binding.ts';
 import { findQueryInput, type EventTemplateChange } from './detector-rewrite.ts';
 import { PUBLISH_OVERRIDES, isReadyToPublish, parsePublishOverride, type PublishOverride } from './decision-states.ts';
+import { DETECTOR_MARKER_RE } from './detector-notebook.ts';
 import { codeMask, timeseriesCommands } from './dql-command.ts';
 import { envIdFromBaseUrl } from './paths.ts';
+import { SettingsApiError } from '../dynatrace/settings.ts';
 
 /** One review batch as the stage-detectors manifest records it. */
 export interface ManifestBatch {
@@ -198,6 +200,42 @@ export function decideEntity(outcome: BindingOutcome, override?: PublishOverride
 
 function noQuery(kind: BindingOutcome['kind']): EntityDecision {
   return { action: 'skip', reason: `the binding check reported "${kind}" without a query, so it goes back for review.` };
+}
+
+/** Every marker line in a tile, wherever it sits. */
+const ALL_MARKERS_RE = new RegExp(DETECTOR_MARKER_RE.source, 'gm');
+
+/**
+ * The review notebook's query tile for one alert, found by its marker line
+ * (`// [CCT-DETECTOR objectId=…]`), never by position: reviewers add, move and
+ * duplicate tiles. Only DQL tiles count, so a marker quoted in a markdown card
+ * is not a query. Two tiles carrying the same alert's marker (a reviewer
+ * duplicated it) is an error rather than a guess, since either could be the
+ * approved one. The whole tile value comes back; the caller reads the approved
+ * query (`parseReviewQuery`) and the staged classic query (`parseOriginalBlock`)
+ * out of it.
+ */
+export function findApprovedTile(
+  sections: Array<{ type?: string; state?: { input?: { value?: string } } }>,
+  objectId: string,
+): { value: string } | { error: string } {
+  const hits: string[] = [];
+  for (const s of sections ?? []) {
+    const value = s?.type === 'dql' ? s.state?.input?.value : undefined;
+    if (typeof value !== 'string') continue;
+    if ([...value.matchAll(ALL_MARKERS_RE)].some((m) => m[1] === objectId)) hits.push(value);
+  }
+  if (hits.length === 0) return { error: 'query tile not found' };
+  if (hits.length > 1) return { error: 'two query tiles for this alert' };
+  return { value: hits[0]! };
+}
+
+/**
+ * The token cannot read or write settings: every later call would fail the same
+ * way, so the run stops at the first one instead of reporting each alert.
+ */
+export function isAuthFailure(e: unknown): boolean {
+  return e instanceof SettingsApiError && (e.status === 401 || e.status === 403);
 }
 
 /**

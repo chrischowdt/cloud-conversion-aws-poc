@@ -45,6 +45,7 @@ import { runMigratePromote } from './commands/migrate-promote.ts';
 import { runMigrateVerify } from './commands/migrate-verify.ts';
 import { runMigrateRollback } from './commands/migrate-rollback.ts';
 import { runStageDetectors } from './commands/stage-detectors.ts';
+import { runPromoteDetectors } from './commands/migrate-promote-detectors.ts';
 import { runMigrateMergeDrift } from './commands/migrate-merge-drift.ts';
 import { runDiscoverManagementZones } from './commands/discover-management-zones.ts';
 import { runDiscoverUsers } from './commands/discover-users.ts';
@@ -242,6 +243,10 @@ COMMANDS
                     --restage [--batches batch-14,batch-15] brings today's
                     conversion to published notebooks, replacing only cards
                     still exactly as staged with nothing on the tracker.
+  migrate-promote-detectors
+                    Alert lane: publish Ready alerts IN PLACE by review batch. PREPARE
+                    (default) runs every gate, writes only a report. Flags: --batches
+                    (required), --ids, --limit, --force, --tracker, --apply --allow-env.
   migrate-pull      Fetch the human-fixed review copies (Document API) into
                     migration/reviewed/ and mark rows in-review. Needs the admin
                     token. Flags: --ids, --limit, --tracker.
@@ -738,6 +743,25 @@ async function main(): Promise<void> {
         liveMetricsPath: getString(args.flags, 'live-metrics'),
         minOverrideSeries: getNumber(args.flags, 'min-override-series'),
         bindEntities: args.flags.get('no-bind-entities') !== true,
+      });
+      return;
+    }
+    case 'migrate-promote-detectors': {
+      // Settings API reads + validateOnly writes, notebook reads, DQL runs:
+      // settings:objects:read+write, document:documents:read (admin), storage reads.
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      const ids = getString(args.flags, 'ids');
+      await runPromoteDetectors({
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
+        trackerPath: trackerPath(args.flags),
+        batches: getString(args.flags, 'batches')?.split(',').map((s) => s.trim()).filter(Boolean) ?? [],
+        ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+        limit: getNumber(args.flags, 'limit'),
+        apply: args.flags.get('apply') === true,
+        force: args.flags.get('force') === true,
+        allowEnv: getString(args.flags, 'allow-env'),
       });
       return;
     }

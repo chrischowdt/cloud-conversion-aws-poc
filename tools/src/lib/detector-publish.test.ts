@@ -2,12 +2,16 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { BindingOutcome } from './detector-binding.ts';
+import { buildReviewQuery } from './detector-notebook.ts';
+import { SettingsApiError } from '../dynatrace/settings.ts';
 import {
   BUILTIN_PLACEHOLDERS,
   assertAllowedEnv,
   buildPublishValue,
   decideEntity,
   driftOf,
+  findApprovedTile,
+  isAuthFailure,
   mapEventFields,
   publishedPartsEqual,
   selectForPublish,
@@ -769,5 +773,55 @@ describe('publishedPartsEqual', () => {
     (a.eventTemplate as { properties: EventProp[] }).properties = [];
     delete b.eventTemplate;
     assert.equal(publishedPartsEqual(a, b), true);
+  });
+});
+
+describe('findApprovedTile', () => {
+  const markdown = (id: string) => ({ type: 'markdown', markdown: `card for ${id}` });
+  const dql = (value: string) => ({ type: 'dql', state: { input: { value } } });
+  const tile = (id: string, query = 'timeseries x = avg(cloud.aws.lambda.Errors.By.FunctionName)') =>
+    dql(buildReviewQuery(id, query, 'timeseries x = avg(cloud.aws.lambda.errors_sum)'));
+
+  it('returns the value of the query tile that carries the alert marker', () => {
+    const mine = tile('vu9U3hXa3q0AAAAB', 'timeseries mine = avg(cloud.aws.lambda.Errors.By.FunctionName)');
+    const sections = [markdown('other'), tile('other-id'), markdown('vu9U3hXa3q0AAAAB'), mine];
+    assert.deepEqual(findApprovedTile(sections, 'vu9U3hXa3q0AAAAB'), { value: mine.state.input.value });
+  });
+
+  it('does not take a tile for an id that only starts with this one', () => {
+    assert.deepEqual(findApprovedTile([tile('A-10')], 'A-1'), { error: 'query tile not found' });
+  });
+
+  it('reports a missing tile', () => {
+    assert.deepEqual(findApprovedTile([markdown('A-1'), dql('timeseries x = avg(y)'), { type: 'dql' }], 'A-1'), {
+      error: 'query tile not found',
+    });
+  });
+
+  it('refuses to choose between two tiles for the same alert', () => {
+    const sections = [tile('A-1', 'timeseries a = avg(one)'), tile('B-1'), tile('A-1', 'timeseries a = avg(two)')];
+    assert.deepEqual(findApprovedTile(sections, 'A-1'), { error: 'two query tiles for this alert' });
+  });
+
+  it('ignores the marker text outside a query tile', () => {
+    const quoted = { type: 'markdown', state: { input: { value: buildReviewQuery('A-1', 'q', 'o') } } };
+    const real = tile('A-1');
+    assert.deepEqual(findApprovedTile([quoted, real], 'A-1'), { value: real.state.input.value });
+  });
+});
+
+describe('isAuthFailure', () => {
+  const err = (status: number) => new SettingsApiError(status, 'https://example/settings/objects/x', 'denied');
+
+  it('is true for a Settings API 401 or 403', () => {
+    assert.equal(isAuthFailure(err(401)), true);
+    assert.equal(isAuthFailure(err(403)), true);
+  });
+
+  it('is false for any other Settings API status, a plain error, or no error', () => {
+    assert.equal(isAuthFailure(err(400)), false);
+    assert.equal(isAuthFailure(err(404)), false);
+    assert.equal(isAuthFailure(new Error('HTTP 403')), false);
+    assert.equal(isAuthFailure(undefined), false);
   });
 });
