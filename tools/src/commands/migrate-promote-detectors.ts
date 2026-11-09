@@ -36,7 +36,8 @@
  * re-read it and leave it alone if anything in it changed since planning;
  * snapshot it to migration/detector-promote/pre/<objectId>.json (the first
  * snapshot ever written wins); write the planned value with the update token of
- * that re-read (never retried: a write that got no answer is settled by reading);
+ * that re-read, and none without one (never retried: a write that got no answer
+ * or a 5xx is settled by reading);
  * re-read and check the stored query and event fields; record the value in
  * published/<objectId>.json. Any HTTP 401/403 stops further writes. One write
  * to the alerts sheet at the end: published and recorded alerts become promoted
@@ -735,6 +736,10 @@ async function applyOne(o: Outcome, deps: ResolvedDeps): Promise<unknown> {
         'and writing the planned value would undo that. Re-run to plan it again.',
     );
   }
+  // The write is locked to this read: without its token it would be an unlocked
+  // write that could overwrite a change made since.
+  const updateToken = typeof live.updateToken === 'string' && live.updateToken ? live.updateToken : undefined;
+  if (!updateToken) return skip('apply: no update token', 'no update token returned by the re-read; not written.');
 
   // 2. Snapshot. The first one ever written wins, so a re-run after a partial
   // failure keeps the original; nothing is written without one.
@@ -749,36 +754,39 @@ async function applyOne(o: Outcome, deps: ResolvedDeps): Promise<unknown> {
   }
 
   // 3. The write, locked to the value just read. Never sent twice: a write that
-  // got no answer may have landed, so it is settled by reading.
+  // got no answer may have landed, so it is settled by reading. A 5xx counts as
+  // no answer: a gateway 502/504 can come back after the write was committed.
+  // Only a 4xx is a definite refusal.
   const notes: string[] = [];
   let checked = false;
   try {
     await deps.settings.putObject(id, {
       value: payload.value,
-      updateToken: typeof live.updateToken === 'string' ? live.updateToken : undefined,
+      updateToken,
       schemaVersion: typeof live.schemaVersion === 'string' ? live.schemaVersion : payload.schemaVersion,
     });
   } catch (e) {
     if (isAuthFailure(e)) return stopHere(e, 'the write was refused');
-    if (e instanceof SettingsApiError) {
+    if (e instanceof SettingsApiError && e.status < 500) {
       const why = e.status === 409 ? ' (the alert changed between the re-read and the write)' : '';
       return skip('apply: the write was refused', `not written: the write was refused${why}: ${errText(e)}`);
     }
+    const noAnswer = e instanceof SettingsApiError ? `the write got a server error (${errText(e)})` : `the write got no answer (${errText(e)})`;
     let after: SettingsObject;
     try {
       after = await deps.settings.getObject(id);
     } catch (e2) {
       skip(
         'apply: the write may have landed',
-        `the write got no answer (${errText(e)}) and the re-read after it failed too (${errText(e2)}), so whether it landed is unknown. ` +
+        `${noAnswer} and the re-read after it failed too (${errText(e2)}), so whether it landed is unknown. ` +
           'Re-read the alert before re-running.',
       );
       return isAuthFailure(e2) ? e2 : undefined;
     }
     if (!publishedPartsEqual(after.value ?? {}, payload.value)) {
-      return skip('apply: the write failed', `not written: the write got no answer (${errText(e)}) and a re-read shows it did not land.`);
+      return skip('apply: the write failed', `not written: ${noAnswer} and a re-read shows it did not land.`);
     }
-    notes.push(`the write got no answer (${errText(e)}), but a re-read shows it landed.`);
+    notes.push(`${noAnswer}, but a re-read shows it landed.`);
     checked = true;
   }
 

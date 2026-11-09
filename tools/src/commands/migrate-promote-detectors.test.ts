@@ -70,7 +70,8 @@ function planned(id: string, result: 'ready' | 'skipped' | 'recorded' = 'ready',
 
 interface Stored {
   value: Record<string, unknown>;
-  updateToken: string;
+  /** Left out, a read returns no token. */
+  updateToken?: string;
   schemaVersion?: string;
 }
 
@@ -320,6 +321,73 @@ describe('apply: the write', () => {
     assert.equal(b.item.result, 'skipped', 'the re-read shows it did not land');
     assert.match(b.item.reasons[0]!, /did not land/);
     assert.equal(existsSync(join(t.promoteDir, 'published', 'B.json')), false);
+  });
+
+  it('settles a server error by a re-read: a gateway 504 after the write was stored counts as published', async () => {
+    const t = await setup(['A']);
+    const s = fakeSettings(t.store, {
+      putLandsThenFails: () => new SettingsApiError(504, 'https://example/settings/objects/A', '{"error":{"message":"Gateway Timeout"}}'),
+    });
+    const o = planned('A');
+
+    const run = await applyAndRecord([o], t.deps(s));
+
+    assert.deepEqual(s.calls.map((c) => c.op), ['get', 'put', 'get'], 'one write, one re-read to settle it, never re-sent');
+    assert.equal(o.item.result, 'published', o.item.reasons.join(' | '));
+    assert.ok(o.item.reasons.some((r) => /HTTP 504/.test(r) && /landed/.test(r)), o.item.reasons.join(' | '));
+    assert.deepEqual(run.published, ['A']);
+    assert.deepEqual(await t.json('published', 'A.json'), { objectId: 'A', publishedAt: NOW.toISOString(), value: o.payload!.value });
+    assert.deepEqual(t.sheets[0]!.rows.map((r) => [r.asset_id, r.status, r.decision]), [['A', 'promoted', 'Published']]);
+  });
+
+  it('settles a server error by a re-read: a 503 with nothing stored is not written', async () => {
+    const t = await setup(['A']);
+    const s = fakeSettings(t.store, {
+      putError: () => new SettingsApiError(503, 'https://example/settings/objects/A', '{"error":{"message":"Service Unavailable"}}'),
+    });
+    const o = planned('A');
+
+    const run = await applyAndRecord([o], t.deps(s));
+
+    assert.deepEqual(s.calls.map((c) => c.op), ['get', 'put', 'get'], 'one write, one re-read to settle it, never re-sent');
+    assert.equal(o.item.result, 'skipped');
+    assert.match(o.item.reasons[0]!, /^not written: /);
+    assert.match(o.item.reasons[0]!, /HTTP 503/);
+    assert.match(o.item.reasons[0]!, /did not land/);
+    assert.deepEqual(run.published, []);
+    assert.equal(run.stop, undefined);
+    assert.equal(existsSync(join(t.promoteDir, 'published', 'A.json')), false);
+  });
+
+  it('treats a 400 as a definite refusal: not written, with no re-read', async () => {
+    const t = await setup(['A']);
+    const s = fakeSettings(t.store, {
+      putError: () => new SettingsApiError(400, 'https://example/settings/objects/A', '{"error":{"message":"bad value"}}'),
+    });
+    const o = planned('A');
+
+    await applyAndRecord([o], t.deps(s));
+
+    assert.deepEqual(s.calls.map((c) => c.op), ['get', 'put']);
+    assert.equal(o.item.result, 'skipped');
+    assert.match(o.item.reasons[0]!, /not written: the write was refused: HTTP 400/);
+  });
+
+  it('never writes without an update token: a re-read that returns none is not written', async () => {
+    const t = await setup(['A']);
+    delete t.store.get('A')!.updateToken;
+    const s = fakeSettings(t.store);
+    const o = planned('A');
+
+    const run = await applyAndRecord([o], t.deps(s));
+
+    assert.deepEqual(s.calls.map((c) => c.op), ['get'], 'the re-read, and no write');
+    assert.equal(o.item.result, 'skipped');
+    assert.match(o.item.reasons[0]!, /^no update token returned by the re-read; not written/);
+    assert.equal(run.stop, undefined);
+    assert.equal(existsSync(join(t.promoteDir, 'pre', 'A.json')), false, 'no snapshot for an alert that is not written');
+    assert.equal(existsSync(join(t.promoteDir, 'published', 'A.json')), false);
+    assert.deepEqual(t.store.get('A')!.value, detector(CLASSIC, CLASSIC_PROPS), 'the live alert is untouched');
   });
 });
 
