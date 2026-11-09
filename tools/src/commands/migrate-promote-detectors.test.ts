@@ -413,6 +413,81 @@ describe('apply: the re-read check', () => {
     await applyAndRecord([o], t.deps(fakeSettings(t.store)));
     assert.deepEqual(o.item.reasons, [BINDING_NOTE]);
   });
+
+  it('notes, without failing, every path the server changed outside the query and event fields', async () => {
+    const t = await setup(['A']);
+    const s = fakeSettings(t.store, {
+      stored: (v) => {
+        v.enabled = false;
+        (v.analyzer as { input: Prop[] }).input.push({ key: 'alertCondition', value: 'ABOVE' });
+        return v;
+      },
+    });
+    const o = planned('A');
+
+    const run = await applyAndRecord([o], t.deps(s));
+
+    assert.equal(o.item.result, 'published');
+    assert.deepEqual(run.published, ['A']);
+    const note = o.item.reasons.find((r) => /outside the query and event fields/.test(r));
+    assert.ok(note, o.item.reasons.join(' | '));
+    assert.match(note, /analyzer\.input\[alertCondition\], enabled/);
+    assert.ok(t.lines.some((l) => /outside the query and event fields/.test(l)), 'printed');
+    assert.match(t.sheets[0]!.rows[0]!.reasons ?? '', /outside the query and event fields/);
+  });
+
+  it('checks the whole value on the re-read that settles a server error too', async () => {
+    const t = await setup(['A']);
+    const s = fakeSettings(t.store, {
+      stored: (v) => ({ ...v, serverDefault: true }),
+      putLandsThenFails: () => new SettingsApiError(504, 'https://example/settings/objects/A', '{"error":{"message":"Gateway Timeout"}}'),
+    });
+    const o = planned('A');
+
+    await applyAndRecord([o], t.deps(s));
+
+    assert.equal(o.item.result, 'published');
+    assert.ok(o.item.reasons.some((r) => /outside the query and event fields, at serverDefault/.test(r)), o.item.reasons.join(' | '));
+  });
+});
+
+describe('apply: an alert recorded from an earlier write', () => {
+  it('turns the pending record it was recorded from into the published record, dated by the write', async () => {
+    const t = await setup(['A']);
+    const sent = detector(APPROVED, NEW_PROPS);
+    await mkdir(join(t.promoteDir, 'published'), { recursive: true });
+    await writeFile(join(t.promoteDir, 'published', 'A.pending.json'), JSON.stringify({ objectId: 'A', pendingAt: '2026-11-05T08:00:00.000Z', approvedQuery: APPROVED, value: sent }));
+    await mkdir(join(t.promoteDir, 'rolled-back'), { recursive: true });
+    await writeFile(join(t.promoteDir, 'rolled-back', 'A.json'), JSON.stringify({ objectId: 'A', rolledBackAt: '2026-11-04T00:00:00.000Z' }));
+    const o = planned('A', 'recorded');
+    o.recordedFrom = 'pending';
+    o.liveValue = structuredClone(sent);
+
+    await applyAndRecord([o], t.deps(fakeSettings(t.store)));
+
+    assert.deepEqual(await t.json('published', 'A.json'), {
+      objectId: 'A',
+      publishedAt: '2026-11-05T08:00:00.000Z',
+      approvedQuery: APPROVED,
+      value: sent,
+      storedValue: sent,
+    });
+    assert.equal(existsSync(join(t.promoteDir, 'published', 'A.pending.json')), false);
+    assert.deepEqual(await readdir(join(t.promoteDir, 'rolled-back')), ['A.20261106T120000.000Z.json'], 'the write it recorded was a publish');
+    assert.equal(t.sheets[0]!.rows[0]!.promoted_at, '2026-11-05T08:00:00.000Z');
+  });
+
+  it('puts a recorded alert’s notes on the sheet after the recorded reason', async () => {
+    const t = await setup(['R']);
+    const o = planned('R', 'recorded', ['already published: …', 'the review tile has changed since this alert was published; re-stage it if the change should go out']);
+
+    await applyAndRecord([o], t.deps(fakeSettings(t.store)));
+
+    assert.equal(
+      t.sheets[0]!.rows[0]!.reasons,
+      'already published, recorded. the review tile has changed since this alert was published; re-stage it if the change should go out',
+    );
+  });
 });
 
 describe('apply: the published record', () => {

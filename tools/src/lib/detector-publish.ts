@@ -881,6 +881,60 @@ export function publishedPartsDiff(a: Record<string, unknown>, b: Record<string,
   return out;
 }
 
+/** An array of objects that each have a distinct string `key`, such as `analyzer.input`. */
+function keyedEntries(v: unknown[]): Map<string, unknown> | undefined {
+  const out = new Map<string, unknown>();
+  for (const e of v) {
+    const key = e && typeof e === 'object' && !Array.isArray(e) ? (e as { key?: unknown }).key : undefined;
+    if (typeof key !== 'string' || out.has(key)) return undefined;
+    out.set(key, e);
+  }
+  return out;
+}
+
+function collectDiffs(a: unknown, b: unknown, path: string, out: string[]): void {
+  if (sortedJson(a) === sortedJson(b)) return;
+  const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+  if (isObj(a) && isObj(b)) {
+    for (const k of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) collectDiffs(a[k], b[k], path ? `${path}.${k}` : k, out);
+    return;
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    const ka = keyedEntries(a);
+    const kb = keyedEntries(b);
+    if (ka && kb) {
+      for (const k of [...new Set([...ka.keys(), ...kb.keys()])].sort()) collectDiffs(ka.get(k), kb.get(k), `${path}[${k}]`, out);
+      return;
+    }
+    for (let i = 0; i < Math.max(a.length, b.length); i++) collectDiffs(a[i], b[i], `${path}[${i}]`, out);
+    return;
+  }
+  out.push(path || '(the whole value)');
+}
+
+/**
+ * Every path at which two detector values differ, OUTSIDE the two parts a
+ * publish writes (the query input's value and the event properties, which have
+ * their own check). Key order does not count; `analyzer.input` and other arrays
+ * of keyed entries are compared by key (`analyzer.input[threshold].value`),
+ * other arrays by position. For the re-read after a write: a field the server
+ * changed or added on its own is worth a note, not a failure. Neither argument
+ * is modified.
+ */
+export function diffOutsidePublishedParts(sent: Record<string, unknown>, stored: Record<string, unknown>): string[] {
+  const strip = (v: Record<string, unknown>): Record<string, unknown> => {
+    const c = structuredClone(v ?? {});
+    const inputs = (c.analyzer as AnalyzerInputs | undefined)?.input;
+    const q = findQueryInput(Array.isArray(inputs) ? inputs : []);
+    if (q) delete q.value;
+    if (c.eventTemplate && typeof c.eventTemplate === 'object') delete (c.eventTemplate as { properties?: unknown }).properties;
+    return c;
+  };
+  const out: string[] = [];
+  collectDiffs(strip(sent), strip(stored), '', out);
+  return out;
+}
+
 /**
  * Whether a rollback may put an alert's snapshot back. `restore` when the live
  * alert still has the query and event fields that were published (its other

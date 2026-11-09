@@ -14,6 +14,7 @@ import {
   assertAllowedEnv,
   buildPublishValue,
   decideEntity,
+  diffOutsidePublishedParts,
   driftOf,
   findApprovedTile,
   isAuthFailure,
@@ -1163,6 +1164,66 @@ describe('rollbackDecision', () => {
     const q = publishedDetector();
     (q.analyzer as { input: Inputs }).input[0]!.value = 'timeseries x=avg(edited)';
     assert.equal(rollbackDecision(q, publishedDetector(), true), 'restore');
+  });
+});
+
+describe('diffOutsidePublishedParts', () => {
+  const sent = (): Record<string, unknown> => ({
+    enabled: true,
+    title: 't',
+    analyzer: {
+      name: 'a',
+      input: [
+        { key: 'query', value: 'timeseries x = avg(m)' },
+        { key: 'threshold', value: '5' },
+      ],
+    },
+    eventTemplate: { properties: [{ key: 'event.name', value: 'n' }] },
+  });
+
+  it('is empty for the same value, whatever the key order', () => {
+    const v = sent();
+    assert.deepEqual(diffOutsidePublishedParts(v, Object.fromEntries(Object.entries(sent()).reverse())), []);
+  });
+
+  it('leaves out the query input and the event properties: their check is separate', () => {
+    const stored = sent();
+    (stored.analyzer as { input: Inputs }).input[0]!.value = 'timeseries changed = avg(m)';
+    (stored.eventTemplate as { properties: EventProp[] }).properties = [];
+    assert.deepEqual(diffOutsidePublishedParts(sent(), stored), []);
+  });
+
+  it('names every other path that differs: changed, added or dropped, inputs by their key', () => {
+    const stored = sent();
+    stored.enabled = false;
+    delete stored.title;
+    (stored.analyzer as { input: Inputs }).input.reverse(); // order alone is no difference
+    (stored.analyzer as { input: Inputs }).input.push({ key: 'alertCondition', value: 'ABOVE' });
+    (stored.analyzer as { input: Inputs }).input.find((i) => i.key === 'threshold')!.value = '6';
+    (stored.eventTemplate as Record<string, unknown>).extra = { a: 1 };
+    assert.deepEqual(diffOutsidePublishedParts(sent(), stored), [
+      'analyzer.input[alertCondition]',
+      'analyzer.input[threshold].value',
+      'enabled',
+      'eventTemplate.extra',
+      'title',
+    ]);
+  });
+
+  it('compares other arrays by position', () => {
+    const a = { ...sent(), tags: ['x', 'y'] };
+    const b = { ...sent(), tags: ['x', 'z', 'w'] };
+    assert.deepEqual(diffOutsidePublishedParts(a, b), ['tags[1]', 'tags[2]']);
+  });
+
+  it('does not modify either value', () => {
+    const a = sent();
+    const b = sent();
+    b.enabled = false;
+    diffOutsidePublishedParts(a, b);
+    assert.deepEqual(a, sent());
+    assert.equal(b.enabled, false);
+    assert.equal(((b.analyzer as { input: Inputs }).input[0]!).value, 'timeseries x = avg(m)');
   });
 });
 

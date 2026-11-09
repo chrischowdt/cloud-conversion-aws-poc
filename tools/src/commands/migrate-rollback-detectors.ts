@@ -66,7 +66,7 @@ import type { DecisionState } from '../lib/decision-states.ts';
 import { envIdFromBaseUrl } from '../lib/paths.ts';
 import { ALERTS_SHEET, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { SettingsApiError, SettingsClient, type SettingsObject } from '../dynatrace/settings.ts';
-import { errText, reasonsText } from './migrate-promote-detectors.ts';
+import { errText, reasonsText, serverChangesNote } from './migrate-promote-detectors.ts';
 
 export interface RollbackDetectorsArgs {
   outDir: string;
@@ -236,6 +236,7 @@ async function rollbackOne(t: PublishedTarget, ctx: Ctx): Promise<{ item: Rollba
   // settled by reading. A 5xx counts as no answer (a gateway 502/504 can come
   // back after the write was committed); only a 4xx is a definite refusal.
   const rolledBackAt = ctx.now().toISOString();
+  let stored: Record<string, unknown> | undefined;
   let checked = false;
   try {
     await ctx.settings.putObject(id, { value: restore, updateToken, schemaVersion: typeof live.schemaVersion === 'string' ? live.schemaVersion : undefined });
@@ -258,6 +259,7 @@ async function rollbackOne(t: PublishedTarget, ctx: Ctx): Promise<{ item: Rollba
     }
     if (!publishedPartsEqual(after.value ?? {}, restore)) return end('skipped', [`not rolled back: ${noAnswer} and a re-read shows it did not land.`]);
     notes.push(`${noAnswer}, but a re-read shows it landed.`);
+    stored = after.value ?? {};
     checked = true;
   }
 
@@ -267,7 +269,8 @@ async function rollbackOne(t: PublishedTarget, ctx: Ctx): Promise<{ item: Rollba
   if (!checked) {
     try {
       const after = await ctx.settings.getObject(id);
-      const parts = publishedPartsDiff(after.value ?? {}, restore);
+      stored = after.value ?? {};
+      const parts = publishedPartsDiff(stored, restore);
       if (parts.length) {
         notes.push(`the re-read after the write does not show the restored ${parts.join(' and ')}: the stored value differs from what was written. Check the alert.`);
       }
@@ -276,6 +279,10 @@ async function rollbackOne(t: PublishedTarget, ctx: Ctx): Promise<{ item: Rollba
       if (isAuthFailure(e)) stop = e;
     }
   }
+  // The whole stored value against the one sent: a field the server changed or
+  // added outside the two parts is worth a note, not a failure.
+  const elsewhere = stored ? serverChangesNote(restore, stored) : undefined;
+  if (elsewhere) notes.push(elsewhere);
   return end(
     'rolled-back',
     [`rolled back ${rolledBackAt}: the query and event fields of the snapshot of ${snapshotAt} are restored; everything else is as it was live.`, ...notes],

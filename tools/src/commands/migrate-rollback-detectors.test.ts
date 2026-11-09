@@ -317,6 +317,23 @@ describe('migrate-rollback-detectors: the write', () => {
     assert.equal(run.items[0]!.result, 'rolled-back', 'the write went through');
     assert.ok(run.items[0]!.reasons.some((r) => /re-read after the write does not show the restored event fields/.test(r)), run.items[0]!.reasons.join(' | '));
   });
+
+  it('notes, without failing, every path the server changed outside the query and event fields', async () => {
+    const t = await publishedAlerts([{ id: 'A' }], {
+      hooks: {
+        stored: (v) => {
+          (v.executionSettings as Record<string, unknown>).actor = 'someone-else';
+          return v;
+        },
+      },
+    });
+
+    const run = await runRollbackDetectors({ ...t.args, ...apply, ids: ['A'] }, t.deps());
+
+    assert.equal(run.items[0]!.result, 'rolled-back');
+    assert.ok(run.items[0]!.reasons.some((r) => /outside the query and event fields, at executionSettings\.actor/.test(r)), run.items[0]!.reasons.join(' | '));
+    assert.ok(t.lines.some((l) => /outside the query and event fields/.test(l)), 'printed');
+  });
 });
 
 describe('migrate-rollback-detectors: auth failures and the sheet', () => {

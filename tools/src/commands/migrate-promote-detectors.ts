@@ -11,19 +11,25 @@
  * Every read is live: the approved query from the batch's review notebook (by the
  * tile's marker line), the detector from the Settings API, and every known copy
  * of the classic query the card was staged from: the base payload `<batch>.json`,
- * the archived payload of that name and the tile's reference block. Then the
- * gates, in order; the first failure decides: empty query, drift (the live query
- * equals none of those copies: the owner edited or migrated the alert since
- * staging; or no copy is known), blocking
- * lint, the approved query fails over the last 2 hours, the entity (an approved
- * query that emits none: the 7-day binding check plus the reviewer's
- * `publish_override`), at most 10,000 series over the last 2 hours, event fields
- * that name a column the query does not emit, the query to publish (with the
- * columns added for its event fields) fails over 2 hours, and the server's own
- * validation (`validateOnly`, which persists nothing). An alert whose live value
- * already has the query and event fields a publish would write is recorded, not
- * written; one that already runs the approved query but lacks the event fields
- * is an event-field-only update.
+ * the archived payload of that name and the tile's reference block.
+ *
+ * An alert whose live value still has the query and event fields of an earlier
+ * apply's record (`published/<id>.json`, what the server stored; or its pending
+ * record) is recorded at once, before any gate and without rebuilding anything
+ * from today's notebook; a tile edited since gets a note. Otherwise the gates,
+ * in order; the first failure decides: a rollback newer than the sheet row, the
+ * tile (found, one alert's only), empty query, drift (the live query equals none
+ * of those copies: the owner edited or migrated the alert since staging; or no
+ * copy is known), blocking lint, the approved query fails over the last 2 hours,
+ * the entity (an approved query that emits none: the 7-day binding check plus
+ * the reviewer's `publish_override`), at most 10,000 series over the last 2
+ * hours, the run's output keeps the entity column, event fields that name a
+ * column the query does not emit, the query to publish (with the columns added
+ * for its event fields) fails over 2 hours, and the server's own validation
+ * (`validateOnly`, which persists nothing). An alert applied by hand (no record)
+ * whose live value already has the query and event fields a publish would write
+ * is recorded, not written; one that already runs the approved query but lacks
+ * the event fields is an event-field-only update.
  *
  * PREPARE (the default) writes only files under
  * migration/detector-promote/prepare/<stamp>/: plan.json, report.md and the
@@ -40,7 +46,8 @@
  * published/<objectId>.pending.json; write the planned value with the update
  * token of that re-read, and none without one (never retried: a write that got
  * no answer or a 5xx is settled by reading); re-read and check the stored query
- * and event fields; rename the pending record to published/<objectId>.json, with
+ * and event fields, noting (not failing on) every other path the server changed;
+ * rename the pending record to published/<objectId>.json, with
  * what the re-read found as `storedValue`; move a rollback's
  * rolled-back/<objectId>.json aside. Any HTTP 401/403 stops further writes. One
  * write to the alerts sheet at the end: published and recorded alerts become
@@ -73,6 +80,7 @@ import {
   buildPublishValue,
   decideEntity,
   detectorValuesEqual,
+  diffOutsidePublishedParts,
   driftOf,
   findApprovedTile,
   isAuthFailure,
@@ -171,6 +179,12 @@ export interface Outcome {
   liveValue?: Record<string, unknown>;
   /** When an apply wrote it. */
   publishedAt?: string;
+  /**
+   * A `recorded` alert whose live value is an earlier apply's record: its
+   * published record, or its pending one (a write that landed without an
+   * answer), which an apply turns into the published record.
+   */
+  recordedFrom?: 'published' | 'pending';
 }
 
 const SEVEN_DAYS_MS = 7 * 864e5;
@@ -318,17 +332,17 @@ export async function planOne(c: PublishCandidate, ctx: PlanCtx): Promise<Outcom
     return { item, gate, payload };
   };
 
-  // 1. The approved query, from the live review notebook.
-  let sections: Sections;
+  // 1. The approved query, from the live review notebook. A tile that cannot be
+  // had is held, not skipped yet: an alert already published is recorded
+  // whatever its tile says now.
+  let tile: { value: string } | { error: string; gate: string; reason: string };
   try {
-    sections = await ctx.sections(c.notebookId);
+    const found = findApprovedTile(await ctx.sections(c.notebookId), c.objectId);
+    tile = 'error' in found ? { ...found, gate: found.error, reason: `${found.error} in review notebook ${c.notebookId}.` } : found;
   } catch (e) {
     if (isAuthFailure(e)) throw e;
-    return skip('review notebook could not be read', `the review notebook ${c.notebookId} could not be read: ${errText(e)}`);
+    tile = { error: 'review notebook could not be read', gate: 'review notebook could not be read', reason: `the review notebook ${c.notebookId} could not be read: ${errText(e)}` };
   }
-  const tile = findApprovedTile(sections, c.objectId);
-  if ('error' in tile) return skip(tile.error, `${tile.error} in review notebook ${c.notebookId}.`);
-  const approved = parseReviewQuery(tile.value).query;
 
   // 2. The live alert.
   let live: SettingsObject;
@@ -346,6 +360,38 @@ export async function planOne(c: PublishCandidate, ctx: PlanCtx): Promise<Outcom
   const records = await ctx.records(c.objectId);
   notes.push(...records.problems);
 
+  // Already published: the live alert still has the query and event fields of
+  // what an earlier apply wrote (what the server stored), or of a write that may
+  // have landed. Recorded at once, before any other gate, never rebuilt from
+  // today's notebook: the publish is out, and a tile edited since is news for
+  // a re-stage, not for this run.
+  const earlier = (
+    [
+      ['pending', records.pending, records.pending?.value],
+      ['published', records.published, records.published ? publishedValueOf(records.published) : undefined],
+    ] as const
+  ).find(([, rec, v]) => rec && v && publishedPartsEqual(value, v));
+  if (earlier) {
+    const [from, rec] = earlier;
+    const when = rec!.publishedAt ?? rec!.pendingAt;
+    const head =
+      `already published${when ? ` (${when})` : ''}: the live alert still has the query and event fields of its ` +
+      `${from === 'pending' ? 'pending record (a write whose answer never came)' : 'published record'}, so it is recorded, not written again.`;
+    let tileNote: string | undefined;
+    if ('error' in tile) {
+      tileNote = `the review tile could not be checked (${tile.error}).`;
+    } else {
+      const publishedFrom = rec!.approvedQuery ?? detectorQuery(rec!.value) ?? '';
+      if (parseReviewQuery(tile.value).query.trim() !== publishedFrom.trim()) {
+        tileNote = 'the review tile has changed since this alert was published; re-stage it if the change should go out';
+      }
+    }
+    item.result = 'recorded';
+    item.diff.query = { before: liveQuery, after: liveQuery };
+    item.reasons = [head, ...(tileNote ? [tileNote] : []), ...notes];
+    return { item, gate: 'already published, recorded only', liveValue: value, recordedFrom: from };
+  }
+
   // A rollback newer than the sheet row: a stale save of the workbook (made
   // before the rollback) shows the row as Ready again. A re-approval after the
   // rollback keeps the tool's status `rolled-back`.
@@ -357,6 +403,9 @@ export async function planOne(c: PublishCandidate, ctx: PlanCtx): Promise<Outcom
         `(its status is ${c.status ? `"${c.status}"` : 'empty'}, not rolled-back).`,
     );
   }
+
+  if ('error' in tile) return skip(tile.gate, tile.reason);
+  const approved = parseReviewQuery(tile.value).query;
 
   // 3. Every known copy of the classic query the card was staged from: base
   // payload, archived payload, live tile.
@@ -486,9 +535,17 @@ export async function planOne(c: PublishCandidate, ctx: PlanCtx): Promise<Outcom
     notes.push(`the 7-day run failed (${errText(e)}), so the columns come from the 2-hour run.`);
   }
   if (!columns.size) columns = columnsOf(final2h);
+  let columnsFromRun = true;
   if (!columns.size) {
     columns = staticColumns(finalQuery);
+    columnsFromRun = false;
     notes.push('no data to read the columns from; event fields were checked against the columns the query text names.');
+  }
+  // The binding property names the entity column, so a run whose output lacks
+  // it (a later `fields` dropped it) would publish an alert attached to nothing.
+  // Columns read from the text cannot show that, so only a run is held to it.
+  if (columnsFromRun && entityColumn && !columns.has(entityColumn)) {
+    return skip('the output drops its entity column', `the query's output drops its entity column (${entityColumn}); keep it in the final fields`);
   }
 
   // Gate 7: every event field reads a column the query emits.
@@ -735,6 +792,25 @@ const RECORDED_REASON = 'already published, recorded';
 /** A cell holds at most 32,767 characters; a reason past this is a server message nobody reads whole. */
 const REASONS_MAX = 2000;
 
+/** At most this many paths are named in a server-changes note. */
+const CHANGED_PATHS_SHOWN = 12;
+
+/**
+ * A note naming every path at which the value the server stored differs from
+ * the value sent, outside the query input and the event properties; undefined
+ * when there is none. Shared with the rollback, whose writes are checked the same way.
+ */
+export function serverChangesNote(sent: Record<string, unknown>, stored: Record<string, unknown>): string | undefined {
+  const paths = diffOutsidePublishedParts(sent, stored);
+  if (!paths.length) return undefined;
+  const shown = paths.slice(0, CHANGED_PATHS_SHOWN).join(', ');
+  const more = paths.length > CHANGED_PATHS_SHOWN ? ` and ${paths.length - CHANGED_PATHS_SHOWN} more` : '';
+  return (
+    `the stored value differs from what was written outside the query and event fields, at ${shown}${more}: ` +
+    'the server changed or added them. Not a failure; check the alert if that is unexpected.'
+  );
+}
+
 /** The reasons as one cell: sentences joined by a space, clipped. */
 export function reasonsText(reasons: string[]): string {
   const text = reasons.map((r) => r.trim()).filter(Boolean).join(' ');
@@ -875,6 +951,10 @@ async function applyOne(o: Outcome, deps: ResolvedDeps): Promise<unknown> {
       if (isAuthFailure(e)) stop = e;
     }
   }
+  // The whole stored value against the one sent: a field the server changed or
+  // added outside the two parts is worth a note, not a failure.
+  const elsewhere = stored ? serverChangesNote(payload.value, stored) : undefined;
+  if (elsewhere) notes.push(elsewhere);
 
   // 6. The record verify, rollback and the next run's drift check read: the
   // pending record, now with what the re-read found, under its final name.
@@ -947,6 +1027,45 @@ async function takeSnapshot(promoteDir: string, id: string, title: string, live:
   return { note };
 }
 
+/**
+ * An alert recorded because its live value is its pending record: that write
+ * landed, its answer never came. The pending record becomes the published one
+ * (dated by the write, with the live value read in this run as what the server
+ * stored), so verify and rollback have a record to compare with, and a
+ * rollback's record is moved aside as after any publish. A failure is a note:
+ * the sheet still gets the row.
+ */
+async function finalizePending(o: Outcome, deps: ResolvedDeps): Promise<void> {
+  const id = o.item.objectId;
+  const read = await readPromoteRecord(deps.promoteDir, 'pending', id);
+  if (read.kind !== 'ok') {
+    o.item.reasons.push(`its pending record could not be made the published record (${read.kind === 'bad' ? read.problem : 'it is gone'}).`);
+    return;
+  }
+  const rec = read.record;
+  try {
+    await writeRecord(read.path, {
+      objectId: id,
+      publishedAt: rec.pendingAt ?? deps.now().toISOString(),
+      approvedQuery: rec.approvedQuery,
+      value: rec.value,
+      ...(o.liveValue ? { storedValue: o.liveValue } : {}),
+    });
+    await rename(read.path, recordPath(deps.promoteDir, 'published', id));
+  } catch (e) {
+    o.item.reasons.push(`its pending record ${read.path} could not be made the published record (${errText(e)}); verify and rollback need one.`);
+    return;
+  }
+  const rolledBack = rolledBackPath(deps.promoteDir, id);
+  if (existsSync(rolledBack)) {
+    try {
+      await moveAside(rolledBack, deps.now());
+    } catch (e) {
+      o.item.reasons.push(`the rollback record ${rolledBack} could not be moved aside (${errText(e)}); move it by hand.`);
+    }
+  }
+}
+
 /** When an earlier apply published an alert, from its record; undefined when there is none. */
 async function earlierPublishAt(promoteDir: string, objectId: string): Promise<string | undefined> {
   try {
@@ -974,7 +1093,13 @@ async function sheetRows(outcomes: Outcome[], deps: ResolvedDeps): Promise<Track
         decision: PUBLISHED,
         promoted_at: (i.result === 'published' ? o.publishedAt : await earlierPublishAt(deps.promoteDir, i.objectId)) ?? deps.now().toISOString(),
         review_batch: i.batch,
-        reasons: i.result === 'recorded' ? RECORDED_REASON : reasonsText(i.reasons),
+        // A recorded alert's first reason is the long form of RECORDED_REASON; its notes follow.
+        reasons:
+          i.result === 'published'
+            ? reasonsText(i.reasons)
+            : i.reasons.length > 1
+              ? reasonsText([`${RECORDED_REASON}.`, ...i.reasons.slice(1)])
+              : RECORDED_REASON,
       });
     } else if (i.result === 'skipped') {
       rows.push({ ...row, reasons: reasonsText(i.reasons) });
@@ -1023,6 +1148,7 @@ export async function applyAndRecord(outcomes: Outcome[], deps: ApplyDeps): Prom
   const notAttempted: string[] = [];
   let stop: unknown;
   for (const o of outcomes) {
+    if (o.item.result === 'recorded' && o.recordedFrom === 'pending') await finalizePending(o, d);
     if (o.item.result !== 'ready') continue;
     if (stop) {
       o.item.reasons = [...o.item.reasons, 'not written: the run stopped before this alert.'];
