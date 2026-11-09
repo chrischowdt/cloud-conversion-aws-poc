@@ -2,7 +2,8 @@
  * detector-publish — the part of publishing a reviewed alert that needs no
  * tenant: which alerts a run may touch, whether an owner changed an alert since
  * its review card was staged, and what to do when the approved query emits no
- * entity.
+ * entity. Also the same questions for verifying and rolling back a publish:
+ * which published alerts a run acts on, and what a rollback may write.
  *
  * Pure on purpose. The publish commands do the Settings, notebook and DQL I/O
  * and ask this module what to do with the answers, so every gate that decides
@@ -107,6 +108,18 @@ export function selectForPublish(
 }
 
 /**
+ * The batch holding each alert's newest card, as `selectForPublish` decides it:
+ * the last batch with a review notebook that lists the alert.
+ */
+function ownerBatches(batches: ManifestBatch[]): Map<string, string> {
+  const ownerBatch = new Map<string, string>();
+  for (const b of batches.filter((x) => x.notebookId)) {
+    for (const d of b.detectors ?? []) ownerBatch.set(d.objectId, b.batch);
+  }
+  return ownerBatch;
+}
+
+/**
  * Why each of `ids` is not a candidate under the rules of `selectForPublish`:
  * the first rule it fails. For ids named with `--ids` that the selection left
  * out, so a typo or a stale id is reported rather than silently dropped.
@@ -117,11 +130,7 @@ export function whyNotSelected(
   batches: ManifestBatch[],
   opts: { batches: string[] },
 ): Array<{ id: string; reason: string }> {
-  // The batch holding each alert's newest card, as selectForPublish decides it.
-  const ownerBatch = new Map<string, string>();
-  for (const b of batches.filter((x) => x.notebookId)) {
-    for (const d of b.detectors ?? []) ownerBatch.set(d.objectId, b.batch);
-  }
+  const ownerBatch = ownerBatches(batches);
   const wanted = new Set(opts.batches);
   return ids.map((id) => {
     const owner = ownerBatch.get(id);
@@ -137,6 +146,75 @@ export function whyNotSelected(
     }
     return { id, reason: 'not selected' };
   });
+}
+
+/** One published alert a verify or rollback run acts on. */
+export interface PublishedTarget {
+  objectId: string;
+  /** The sheet's name for it, else the manifest's title, else the id. */
+  title: string;
+  /** The review batch it was published from, per the manifest; absent when no batch lists it. */
+  batch?: string;
+  /** Its status on the sheet, trimmed and lower-cased. */
+  status: string;
+}
+
+/**
+ * The alerts a verify or rollback run acts on: rows of the alerts sheet whose
+ * `status` is one of `statuses`, in sheet order. `batches` keeps those whose
+ * review batch is one of them, membership read from the manifest by the rule
+ * the publish used (the last published batch that lists the alert); `ids` keeps
+ * the named ones. Both given, an alert must pass both. Neither given, every row
+ * with the status is taken, an alert that is in no batch included (the tool
+ * records one an owner had already applied by hand).
+ *
+ * `unknownBatches` are requested batches the manifest has no published review
+ * notebook for. `notSelected` says why each named id was left out, so a typo or
+ * a stale id is reported rather than silently dropped.
+ */
+export function selectPublished(
+  rows: Map<string, Record<string, string>>,
+  batches: ManifestBatch[],
+  opts: { statuses: readonly string[]; batches?: string[]; ids?: string[] },
+): { targets: PublishedTarget[]; unknownBatches: string[]; notSelected: Array<{ id: string; reason: string }> } {
+  const ownerBatch = ownerBatches(batches);
+  const known = new Set(batches.filter((b) => b.notebookId).map((b) => b.batch));
+  const unknownBatches = (opts.batches ?? []).filter((b) => !known.has(b));
+  const wantedBatches = opts.batches?.length ? new Set(opts.batches) : undefined;
+  const wantedIds = opts.ids?.length ? new Set(opts.ids) : undefined;
+  const statuses = new Set(opts.statuses.map((s) => s.toLowerCase()));
+  const statusText = opts.statuses.join(' or ');
+  const titles = new Map<string, string>();
+  for (const b of batches) for (const d of b.detectors ?? []) if (d.title) titles.set(d.objectId, d.title);
+
+  const why = (id: string): string | undefined => {
+    const row = rows.get(id);
+    if (!row) return 'not on the alerts sheet';
+    const status = (row.status ?? '').trim();
+    if (!statuses.has(status.toLowerCase())) return `status is ${status ? `"${status}"` : 'empty'}, not ${statusText}`;
+    if (wantedBatches) {
+      const batch = ownerBatch.get(id);
+      if (!batch) return 'in no published review batch';
+      if (!wantedBatches.has(batch)) return `its review card is in ${batch}, not in ${[...wantedBatches].join(', ')}`;
+    }
+    return undefined;
+  };
+
+  const targets: PublishedTarget[] = [];
+  for (const [id, row] of rows) {
+    if (wantedIds && !wantedIds.has(id)) continue;
+    if (why(id)) continue;
+    const name = (row.name ?? '').trim();
+    const target: PublishedTarget = { objectId: id, title: name || titles.get(id) || id, status: (row.status ?? '').trim().toLowerCase() };
+    const batch = ownerBatch.get(id);
+    if (batch) target.batch = batch;
+    targets.push(target);
+  }
+  const notSelected = [...(wantedIds ?? [])].flatMap((id) => {
+    const reason = why(id);
+    return reason ? [{ id, reason }] : [];
+  });
+  return { targets, unknownBatches, notSelected };
 }
 
 /**
@@ -356,6 +434,18 @@ export function parseIds(raw: string | boolean | undefined): string[] | undefine
   const ids = [...new Set(raw.split(',').map((s) => s.trim()).filter(Boolean))];
   if (!ids.length) throw new Error(`--ids "${raw}" names no alert id`);
   return ids;
+}
+
+/**
+ * The `--batches` flag as the CLI parsed it, by the rules of `parseIds`: a flag
+ * with no batch throws, since read as "no filter" it would widen the run.
+ */
+export function parseBatches(raw: string | boolean | undefined): string[] | undefined {
+  if (raw === undefined || raw === false) return undefined;
+  if (raw === true) throw new Error('--batches needs a value: a comma-separated list of review batches, e.g. batch-03,batch-04');
+  const batches = [...new Set(raw.split(',').map((s) => s.trim()).filter(Boolean))];
+  if (!batches.length) throw new Error(`--batches "${raw}" names no review batch`);
+  return batches;
 }
 
 // ---------------------------------------------------------------------------
@@ -760,6 +850,66 @@ function publishedParts(v: Record<string, unknown>): { query: string | null; pro
  */
 export function publishedPartsEqual(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
   return sortedJson(publishedParts(a)) === sortedJson(publishedParts(b));
+}
+
+/**
+ * Which of the parts a publish writes differ between two detector values, by the
+ * comparison of `publishedPartsEqual`: empty when they agree. For saying what an
+ * owner changed, or what a write did not store.
+ */
+export function publishedPartsDiff(a: Record<string, unknown>, b: Record<string, unknown>): Array<'query' | 'event fields'> {
+  const pa = publishedParts(a);
+  const pb = publishedParts(b);
+  const out: Array<'query' | 'event fields'> = [];
+  if (sortedJson(pa.query) !== sortedJson(pb.query)) out.push('query');
+  if (sortedJson(pa.properties) !== sortedJson(pb.properties)) out.push('event fields');
+  return out;
+}
+
+/**
+ * Whether a rollback may put an alert's snapshot back. `restore` when the live
+ * alert still has the query and event fields that were published (its other
+ * fields are not compared: a rollback leaves them as they are); otherwise the
+ * alert was edited after publishing and a rollback would discard that edit, so
+ * `refuse-edited`, unless `force`.
+ */
+export function rollbackDecision(live: Record<string, unknown>, published: Record<string, unknown>, force: boolean): 'restore' | 'refuse-edited' {
+  return force || publishedPartsEqual(live, published) ? 'restore' : 'refuse-edited';
+}
+
+/**
+ * The value a rollback writes: a copy of `live` with only the two parts a publish
+ * wrote taken back from `snapshot` (the value snapshotted before the publish):
+ * the query input's value, under whichever key `live` uses, and the event
+ * template's properties (removed when the snapshot had none). Everything else
+ * stays as it is live, so a change an owner made since the publish (a threshold,
+ * `enabled`, another input) survives the rollback, and a snapshot older than the
+ * publish cannot revert a field the publish never touched. Throws when either
+ * value has no query input, since restoring the event fields alone would leave a
+ * half-rolled-back alert. Neither argument is modified.
+ */
+export function restoreValue(live: Record<string, unknown>, snapshot: Record<string, unknown>): Record<string, unknown> {
+  const out = structuredClone(live);
+  const outInputs = (out.analyzer as AnalyzerInputs | undefined)?.input;
+  const target = findQueryInput(Array.isArray(outInputs) ? outInputs : []);
+  if (!target) {
+    throw new Error('The live alert has no query input (analyzer.input key "query" or "query.expression"), so there is nowhere to put the snapshot query back.');
+  }
+  const snapInputs = (snapshot?.analyzer as AnalyzerInputs | undefined)?.input;
+  const source = findQueryInput(Array.isArray(snapInputs) ? snapInputs : []);
+  if (!source || typeof source.value !== 'string') {
+    throw new Error('The snapshot has no query input (analyzer.input key "query" or "query.expression"), so there is no query to restore.');
+  }
+  target.value = source.value;
+
+  const snapTemplate = snapshot.eventTemplate as { properties?: unknown } | undefined;
+  if (Array.isArray(snapTemplate?.properties)) {
+    const template = (out.eventTemplate ??= {}) as { properties?: unknown };
+    template.properties = structuredClone(snapTemplate.properties);
+  } else if (out.eventTemplate && typeof out.eventTemplate === 'object') {
+    delete (out.eventTemplate as { properties?: unknown }).properties;
+  }
+  return out;
 }
 
 /**

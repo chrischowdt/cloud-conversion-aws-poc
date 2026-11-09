@@ -18,9 +18,14 @@ import {
   findApprovedTile,
   isAuthFailure,
   mapEventFields,
+  parseBatches,
   parseLimit,
+  publishedPartsDiff,
   publishedPartsEqual,
+  restoreValue,
+  rollbackDecision,
   selectForPublish,
+  selectPublished,
   staticColumns,
   stagedQueriesOf,
   withColumnAliases,
@@ -1058,5 +1063,211 @@ describe('parseLimit', () => {
 
   it('throws when the flag has no value', () => {
     assert.throws(() => parseLimit(true), (e: Error) => e.message === '--limit needs a value: a positive integer');
+  });
+});
+
+describe('parseBatches', () => {
+  it('reads a comma-separated list, trimmed, without repeats', () => {
+    assert.deepEqual(parseBatches('batch-03, batch-04,,batch-03'), ['batch-03', 'batch-04']);
+  });
+
+  it('is undefined when the flag is absent', () => {
+    assert.equal(parseBatches(undefined), undefined);
+  });
+
+  it('throws when the flag has no value: read as "no filter" it would widen the run', () => {
+    assert.throws(() => parseBatches(true), (e: Error) => e.message === '--batches needs a value: a comma-separated list of review batches, e.g. batch-03,batch-04');
+  });
+
+  it('throws when the value names no batch', () => {
+    for (const raw of ['', ' , ']) {
+      assert.throws(() => parseBatches(raw), (e: Error) => e.message === `--batches "${raw}" names no review batch`, raw);
+    }
+  });
+});
+
+/** A detector as a publish leaves it: a different query and event fields than `liveDetector`. */
+function publishedDetector(): Record<string, unknown> {
+  const v = liveDetector();
+  (v.analyzer as { input: Inputs }).input[0]!.value = 'timeseries x=avg(new)';
+  (v.eventTemplate as { properties: EventProp[] }).properties = [
+    { key: 'event.name', value: 'new name' },
+    { key: 'dt.smartscape_source.id', value: '{dt.smartscape.aws_sqs_queue}' },
+  ];
+  return v;
+}
+
+describe('rollbackDecision', () => {
+  it('restores an alert that still has what was published', () => {
+    assert.equal(rollbackDecision(publishedDetector(), publishedDetector(), false), 'restore');
+  });
+
+  it('ignores key order and every field a publish does not write', () => {
+    const live = publishedDetector();
+    (live.analyzer as { input: Inputs }).input[1]!.value = '50'; // threshold changed by the owner
+    live.enabled = true;
+    const reordered = Object.fromEntries(Object.entries(live).reverse());
+    assert.equal(rollbackDecision(reordered, publishedDetector(), false), 'restore');
+  });
+
+  it('refuses an alert whose query or event fields were edited after publishing', () => {
+    const q = publishedDetector();
+    (q.analyzer as { input: Inputs }).input[0]!.value = 'timeseries x=avg(edited)';
+    assert.equal(rollbackDecision(q, publishedDetector(), false), 'refuse-edited');
+
+    const p = publishedDetector();
+    (p.eventTemplate as { properties: EventProp[] }).properties[0]!.value = 'edited name';
+    assert.equal(rollbackDecision(p, publishedDetector(), false), 'refuse-edited');
+  });
+
+  it('restores an edited alert with force', () => {
+    const q = publishedDetector();
+    (q.analyzer as { input: Inputs }).input[0]!.value = 'timeseries x=avg(edited)';
+    assert.equal(rollbackDecision(q, publishedDetector(), true), 'restore');
+  });
+});
+
+describe('publishedPartsDiff', () => {
+  it('is empty when the parts a publish writes agree', () => {
+    const other = publishedDetector();
+    other.enabled = true;
+    assert.deepEqual(publishedPartsDiff(publishedDetector(), other), []);
+  });
+
+  it('names the query, the event fields, or both', () => {
+    const q = publishedDetector();
+    (q.analyzer as { input: Inputs }).input[0]!.value = 'timeseries x=avg(edited)';
+    assert.deepEqual(publishedPartsDiff(q, publishedDetector()), ['query']);
+
+    const p = publishedDetector();
+    (p.eventTemplate as { properties: EventProp[] }).properties.pop();
+    assert.deepEqual(publishedPartsDiff(p, publishedDetector()), ['event fields']);
+
+    assert.deepEqual(publishedPartsDiff(liveDetector(), publishedDetector()), ['query', 'event fields']);
+  });
+});
+
+describe('restoreValue', () => {
+  /** The published alert after its owner changed the threshold, enabled it and its actor changed. */
+  function editedLive(): Record<string, unknown> {
+    const v = publishedDetector();
+    (v.analyzer as { input: Inputs }).input[1]!.value = '50';
+    v.enabled = true;
+    v.executionSettings = { actor: 'actor-2' };
+    return v;
+  }
+
+  it('takes the query and the event properties from the snapshot', () => {
+    const out = restoreValue(editedLive(), liveDetector());
+    assert.equal(publishedPartsEqual(out, liveDetector()), true);
+    assert.equal((out.analyzer as { input: Inputs }).input[0]!.value, 'timeseries x=avg(old)');
+    assert.deepEqual((out.eventTemplate as { properties: EventProp[] }).properties, [{ key: 'event.name', value: 'old name' }]);
+  });
+
+  it('keeps everything else as it is live: threshold, enabled, actor, other inputs and template fields', () => {
+    const live = editedLive();
+    const out = restoreValue(live, liveDetector());
+    const back = structuredClone(out);
+    (back.analyzer as { input: Inputs }).input[0]!.value = 'timeseries x=avg(new)';
+    (back.eventTemplate as { properties: EventProp[] }).properties = (publishedDetector().eventTemplate as { properties: EventProp[] }).properties;
+    assert.deepEqual(back, editedLive(), 'only the two parts differ from live');
+    assert.equal(out.enabled, true);
+    assert.deepEqual(out.executionSettings, { actor: 'actor-2' });
+    assert.equal((out.analyzer as { input: Inputs }).input[1]!.value, '50');
+    assert.equal((out.eventTemplate as { other?: string }).other, 'kept');
+  });
+
+  it('writes the query under the key the live alert uses', () => {
+    const live = editedLive();
+    (live.analyzer as { input: Inputs }).input[0]!.key = 'query';
+    const out = restoreValue(live, liveDetector());
+    const input = (out.analyzer as { input: Inputs }).input;
+    assert.deepEqual(input.map((i) => i.key), ['query', 'threshold', 'alertCondition']);
+    assert.equal(input[0]!.value, 'timeseries x=avg(old)');
+  });
+
+  it('mutates neither argument, and shares no object with the snapshot', () => {
+    const live = editedLive();
+    const snap = liveDetector();
+    const out = restoreValue(live, snap);
+    assert.deepEqual(live, editedLive());
+    assert.deepEqual(snap, liveDetector());
+    (out.eventTemplate as { properties: EventProp[] }).properties[0]!.value = 'changed after';
+    assert.equal((snap.eventTemplate as { properties: EventProp[] }).properties[0]!.value, 'old name');
+  });
+
+  it('removes the event properties when the snapshot had none', () => {
+    const snap = liveDetector();
+    delete (snap.eventTemplate as { properties?: EventProp[] }).properties;
+    const out = restoreValue(editedLive(), snap);
+    assert.deepEqual(out.eventTemplate, { other: 'kept' });
+    assert.equal(publishedPartsEqual(out, snap), true);
+  });
+
+  it('refuses a live alert or a snapshot with no query input rather than restore half', () => {
+    const noQuery = (v: Record<string, unknown>) => {
+      (v.analyzer as { input: unknown[] }).input = [{ key: 'threshold', value: '5' }];
+      return v;
+    };
+    assert.throws(() => restoreValue(noQuery(editedLive()), liveDetector()), /live alert has no query input/);
+    assert.throws(() => restoreValue(editedLive(), noQuery(liveDetector())), /snapshot has no query input/);
+  });
+});
+
+describe('selectPublished', () => {
+  const manifest: ManifestBatch[] = [
+    { batch: 'batch-01', notebookId: 'nb-1', detectors: [{ objectId: 'A', title: 'a' }, { objectId: 'MOVED', title: 'moved' }, { objectId: 'S', title: 's' }] },
+    { batch: 'batch-02', notebookId: 'nb-2', detectors: [{ objectId: 'B', title: 'b' }, { objectId: 'MOVED', title: 'moved' }, { objectId: 'V', title: 'v' }] },
+    { batch: 'batch-03', detectors: [{ objectId: 'U', title: 'u' }] },
+  ];
+  const rows = new Map<string, Record<string, string>>([
+    ['A', { name: 'Alert A', status: 'promoted', decision: 'Published' }],
+    ['MOVED', { name: 'Alert moved', status: 'Promoted ', decision: 'Published' }],
+    ['S', { name: 'Alert S', status: 'staged', decision: 'Ready To Publish' }],
+    ['B', { name: 'Alert B', status: 'promoted', decision: 'Published' }],
+    ['V', { name: 'Alert V', status: 'verified', decision: 'Published' }],
+    ['HAND', { name: 'Hand-applied', status: 'promoted', decision: 'Published' }],
+  ]);
+  const ids = (r: ReturnType<typeof selectPublished>) => r.targets.map((t) => t.objectId);
+
+  it('takes every row with one of the statuses, in sheet order, when no filter is given', () => {
+    const r = selectPublished(rows, manifest, { statuses: ['promoted'] });
+    assert.deepEqual(ids(r), ['A', 'MOVED', 'B', 'HAND']);
+    assert.deepEqual(r.targets[0], { objectId: 'A', title: 'Alert A', batch: 'batch-01', status: 'promoted' });
+    assert.equal(r.targets[3]!.batch, undefined, 'an alert in no batch still counts');
+  });
+
+  it('takes several statuses', () => {
+    assert.deepEqual(ids(selectPublished(rows, manifest, { statuses: ['promoted', 'verified'] })), ['A', 'MOVED', 'B', 'V', 'HAND']);
+  });
+
+  it('reads batch membership from the manifest: an alert belongs to the last published batch that lists it', () => {
+    assert.deepEqual(ids(selectPublished(rows, manifest, { statuses: ['promoted'], batches: ['batch-01'] })), ['A']);
+    assert.deepEqual(ids(selectPublished(rows, manifest, { statuses: ['promoted'], batches: ['batch-02'] })), ['MOVED', 'B'], 'in sheet order');
+  });
+
+  it('narrows by ids, and intersects ids with batches', () => {
+    assert.deepEqual(ids(selectPublished(rows, manifest, { statuses: ['promoted'], ids: ['HAND', 'B'] })), ['B', 'HAND']);
+    assert.deepEqual(ids(selectPublished(rows, manifest, { statuses: ['promoted'], batches: ['batch-02'], ids: ['B'] })), ['B']);
+  });
+
+  it('reports batches the manifest does not have as published', () => {
+    assert.deepEqual(selectPublished(rows, manifest, { statuses: ['promoted'], batches: ['batch-03', 'batch-09', 'batch-01'] }).unknownBatches, ['batch-03', 'batch-09']);
+  });
+
+  it('says why each named id was left out', () => {
+    const r = selectPublished(rows, manifest, { statuses: ['promoted'], batches: ['batch-01'], ids: ['A', 'NOPE', 'S', 'B', 'V'] });
+    assert.deepEqual(ids(r), ['A']);
+    assert.deepEqual(Object.fromEntries(r.notSelected.map((n) => [n.id, n.reason])), {
+      NOPE: 'not on the alerts sheet',
+      S: 'status is "staged", not promoted',
+      B: 'its review card is in batch-02, not in batch-01',
+      V: 'status is "verified", not promoted',
+    });
+  });
+
+  it('falls back to the manifest title, then the id, for a row with no name', () => {
+    const r = selectPublished(new Map([['A', { status: 'promoted' }], ['X', { status: 'promoted' }]]), manifest, { statuses: ['promoted'] });
+    assert.deepEqual(r.targets.map((t) => t.title), ['a', 'X']);
   });
 });

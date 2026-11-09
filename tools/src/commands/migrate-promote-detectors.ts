@@ -206,7 +206,7 @@ function clip(s: string, n = 300): string {
 }
 
 /** The message a person needs from an API error: the server's own words, not the URL. */
-function errText(e: unknown): string {
+export function errText(e: unknown): string {
   const fromBody = (body: string): string | undefined => {
     try {
       const j = JSON.parse(body) as {
@@ -683,7 +683,7 @@ const RECORDED_REASON = 'already published, recorded';
 const REASONS_MAX = 2000;
 
 /** The reasons as one cell: sentences joined by a space, clipped. */
-function reasonsText(reasons: string[]): string {
+export function reasonsText(reasons: string[]): string {
   const text = reasons.map((r) => r.trim()).filter(Boolean).join(' ');
   return text.length > REASONS_MAX ? `${text.slice(0, REASONS_MAX)}…` : text;
 }

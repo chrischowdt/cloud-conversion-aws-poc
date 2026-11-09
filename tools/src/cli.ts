@@ -46,7 +46,9 @@ import { runMigrateVerify } from './commands/migrate-verify.ts';
 import { runMigrateRollback } from './commands/migrate-rollback.ts';
 import { runStageDetectors } from './commands/stage-detectors.ts';
 import { runPromoteDetectors } from './commands/migrate-promote-detectors.ts';
-import { parseIds, parseLimit } from './lib/detector-publish.ts';
+import { runVerifyDetectors } from './commands/migrate-verify-detectors.ts';
+import { runRollbackDetectors } from './commands/migrate-rollback-detectors.ts';
+import { parseBatches, parseIds, parseLimit } from './lib/detector-publish.ts';
 import { runMigrateMergeDrift } from './commands/migrate-merge-drift.ts';
 import { runDiscoverManagementZones } from './commands/discover-management-zones.ts';
 import { runDiscoverUsers } from './commands/discover-users.ts';
@@ -252,7 +254,24 @@ COMMANDS
                     the alerts sheet. Stops at the first HTTP 401/403. Flags:
                     --batches (required), --ids, --limit, --force (needs --ids),
                     --tracker, --apply, --allow-env.
-  migrate-pull      Fetch the human-fixed review copies (Document API) into
+  migrate-verify-detectors
+                    Alert lane: re-read each promoted alert and compare its query
+                    and event fields with what was published. Equal → status
+                    verified; different, or no published record → a flag in
+                    reasons, status left as is. Reads the tenant only, never
+                    waits for alert events; writes the alerts sheet (no --apply
+                    needed). Flags: --batches, --ids, --tracker.
+  migrate-rollback-detectors
+                    Alert lane: undo a publish. Puts back only the query and event
+                    fields from the pre-publish snapshot, onto the live value, so
+                    later changes to anything else survive. Refuses an alert edited
+                    after publishing (says what differs) unless --force, and one
+                    with no snapshot. PREPARE (default) reads and writes a plan
+                    only. --apply --allow-env <env-id> writes one at a time, locked
+                    to a fresh read; sheet: rolled-back + Needs Review. Stops at the
+                    first HTTP 401/403. Flags: --ids or --batches (one required),
+                    --force (needs --ids), --tracker, --apply, --allow-env.
+  migrate-pull     Fetch the human-fixed review copies (Document API) into
                     migration/reviewed/ and mark rows in-review. Needs the admin
                     token. Flags: --ids, --limit, --tracker.
   migrate-promote   Cutover: update each APPROVED original IN PLACE via the
@@ -765,6 +784,37 @@ async function main(): Promise<void> {
         // A bare --ids or --limit throws: read as "no filter", it would widen an apply to the whole batch.
         ids: parseIds(args.flags.get('ids')),
         limit: parseLimit(args.flags.get('limit')),
+        apply: args.flags.get('apply') === true,
+        force: args.flags.get('force') === true,
+        allowEnv: getString(args.flags, 'allow-env'),
+      });
+      return;
+    }
+    case 'migrate-verify-detectors': {
+      // Settings API reads only: settings:objects:read. Writes the alerts sheet.
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runVerifyDetectors({
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
+        trackerPath: trackerPath(args.flags),
+        // A bare --batches or --ids throws rather than read as "no filter".
+        batches: parseBatches(args.flags.get('batches')),
+        ids: parseIds(args.flags.get('ids')),
+      });
+      return;
+    }
+    case 'migrate-rollback-detectors': {
+      // Settings API reads, and writes with --apply: settings:objects:read+write.
+      const { baseUrl, token } = requireBaseAndToken(args.flags);
+      await runRollbackDetectors({
+        outDir: tenantOut(args.flags, baseUrl),
+        baseUrl,
+        token,
+        trackerPath: trackerPath(args.flags),
+        // A bare --batches or --ids throws: read as "no filter", it would widen a rollback.
+        batches: parseBatches(args.flags.get('batches')),
+        ids: parseIds(args.flags.get('ids')),
         apply: args.flags.get('apply') === true,
         force: args.flags.get('force') === true,
         allowEnv: getString(args.flags, 'allow-env'),
