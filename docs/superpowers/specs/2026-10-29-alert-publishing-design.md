@@ -1,6 +1,6 @@
 # Publishing migrated alerts — design
 
-_2026-10-29, updated 2026-11-06. Status: decisions settled; build plan in docs/superpowers/plans/._
+_2026-10-29, updated 2026-11-09. Status: built; the decisions taken during the build are listed at the end. Build plan in docs/superpowers/plans/._
 
 ## Why
 
@@ -91,33 +91,35 @@ Three commands, the alert counterparts of the dashboard ones. Each reads and wri
 4. **Read the alert live** (`getObject`, with its `updateToken`).
 5. **Build the value:** the live value, with only the query input replaced by the approved query and the event fields updated (rules below). Everything else is byte-identical to live.
 6. **Gates.** Any failure skips the alert, records why in `reasons`, and the run continues:
-   - **drift:** the live query is not the classic query the card was staged from. The staged query is taken from the base payload `<batch>.json`, or failing that from the card's reference block in the live notebook. One base payload, batch-01's, was overwritten by a later prepare run, so the fallback is needed. With neither, the alert is skipped as "staged version unknown". In the dry run the two sources covered all 344.
+   - **drift:** the live query is not the classic query the card was staged from. An alert is unchanged when its live query equals the staged query from ANY known source: the batch's base payload `<batch>.json`, the archived payload `migration/detector-review-archive/<batch>.json`, or the card's reference block in the live review tile. One base payload, batch-01's, was overwritten by a later prepare run, so the other sources are needed. With none of them known, the alert is skipped as "staged version unknown". In the dry run the base payload and the tile covered all 344.
      - A drifted alert is skipped. Its `reasons` say either "owner changed the alert after review" or, when the live query has no classic references left, "owner already migrated it".
+     - An alert whose live query already equals the approved query (or the query an earlier apply of ours published) is not drift. It is **recorded only when nothing would change**: the live value already has the query and event fields a publish would write, so the sheet gets the row and the tenant gets no write. Otherwise it is published as an **event-field-only update**: the query stays, the event fields change.
      - The decision is left as it is. The migration team settles each case.
      - `--force` with `--ids` publishes one anyway, once a reviewer has confirmed the approved query covers the owner's change. _(my call)_
      - Measured on the lower environment, 21 alerts drift: 18 owner edits, plus 3 alerts we patched on 1 October that their owners later migrated. None is explained by our own fix alone, so no prior-state allow-list is needed.
    - **empty query:** nothing but comments and whitespace.
    - blocking output lint (`lib/output-lint.ts`).
-   - the query errors when run on the tenant, over a window the alert itself uses (builder: pick a window that reflects the detector's evaluation, not 24h).
-   - the query produces more than 10,000 series.
+   - the query errors when run on the tenant, over a window the alert itself uses: the last 2 hours, not 24h.
+   - the query produces more than 10,000 series. The count is the **2-hour run of the final query**, the one that would be published, which is the scale Davis evaluates at. It is not a 7-day count: a 7-day count overstates what one evaluation sees. The no-entity check (`resolveBinding`, see "Alerts with no entity") still uses 7 days, as staging does.
    - **an event field still points at a column the query doesn't emit** after the rules below.
+   - **the final query errors when run.** After any entity, name-column or alias edit (rules below), the query that would go out is run once over 2 hours before it can be published, so a column added only for an event field can't break the alert.
    - the server's `validateOnly` write fails.
 7. **Prepare output:** per alert, the payload that would be written, a readable diff (query and each event field, before → after), and every gate result. Per run, a summary by batch.
    - **Prepare writes nothing to the workbook, only the report.** The workbook is a file reviewers keep open, rewritten whole on each save, and a stale save has already reverted the tool's rows once. _(my call, same as the dashboard promote)_
    - The migration team reads the report to see which alerts are blocked and why.
    - An apply run records a skipped alert's reason in `reasons`.
 8. **Apply, per alert:**
-   1. Re-read and re-check drift.
+   1. Re-read the alert and skip it if ANY part of it changed since planning, not only its query: writing the planned value would undo a threshold, enabled-state or event-field change made in between.
    2. Snapshot the live value to `migration/detector-promote/pre/<objectId>.json`. First snapshot wins, so a re-run after a partial failure keeps the original.
-   3. PUT with the `updateToken`; no automatic retry.
+   3. PUT with the `updateToken` of that re-read. No write is made without the re-read's update token. A write is never re-sent: a 5xx (or no answer) is settled by one re-read, which shows whether it landed. Any HTTP 401/403 stops further writes.
    4. Re-read and confirm the stored value equals the payload.
    5. Update the sheet row: `status` promoted, `decision` Published, `promoted_at`, `reasons`.
 
    A failed sheet write never undoes a publish; the command says so and names the ids to record. This is the same rule the dashboards follow.
 
-**`migrate-verify-detectors [--batches] [--ids]`.** For each promoted row: re-read the alert and compare its stored value with the published payload. Equal → `status` verified, `verified_at`. Different → flagged in `reasons` (someone edited it since, or the write didn't stick). No events, no waiting.
+**`migrate-verify-detectors [--batches] [--ids]`.** For each promoted row: re-read the alert and compare its stored value with the published payload. Equal → `status` verified, `verified_at`. Different → flagged in `reasons` (someone edited it since, or the write didn't stick). No events, no waiting. An alert the tool **recorded but did not publish** (it already had the approved query and event fields, so there is no published record to compare with) is reported as "no published record", and its status is left alone.
 
-**`migrate-rollback-detectors (--ids a,b | --batches <list>) [--apply] [--force]`.** For each promoted or verified row: re-read the alert. If it still equals what was published, PUT the snapshot back with the current `updateToken`. If it was edited after publishing, refuse unless `--force`, and say what changed. Sheet: `status` rolled-back; `decision` set to Needs Review (my call), so the next publish run doesn't pick the alert up again until a person re-approves it.
+**`migrate-rollback-detectors (--ids a,b | --batches <list>) [--apply] [--force]`.** For each promoted or verified row: re-read the alert. If its query and event fields still equal what was published, restore the snapshot's **query input and event fields only**, written onto the CURRENT live value with the current `updateToken`. Everything else stays as it is live, so an owner's later change to the threshold or enabled state survives the rollback. If the query or event fields were edited after publishing, refuse unless `--force`, and say what changed. An alert with **no snapshot** (the tool recorded it, never published it) cannot be rolled back. `--force` needs `--ids`: it discards an edit, so it names the alerts. Sheet: `status` rolled-back; `decision` set to Needs Review (my call), so the next publish run doesn't pick the alert up again until a person re-approves it.
 
 ### Event field rules
 
@@ -135,11 +137,13 @@ Placeholders that are neither are remapped:
 | a classic entity name (`dt.entity.<type>.name`, `dt.source_entity.name`) | `<entity column>.name`, and if the query doesn't emit that column, `\| fieldsAdd <entity column>.name = getNodeName(<entity column>)` is appended to the query. A name lookup after the `timeseries` doesn't change the series and was measured to fill placeholders. |
 | a classic dimension the new metric spells differently (`cluster_name` ↔ `` `Cluster Name` ``, `broker_id` ↔ `` `Broker ID` ``) | the emitted column it matches, compared ignoring case, spaces, underscores and backticks |
 
+**A placeholder that resolves to a column whose name contains whitespace** (`` `Cluster Name` ``, `` `Broker ID` ``) is rewritten to an underscore alias, and the alias column is appended to the query: `` | fieldsAdd Cluster_Name = `Cluster Name` ``. Davis filling a placeholder from a spaced column name is unverified, while columns added by a later `fieldsAdd` are measured to fill, so the publish does not depend on the unverified case.
+
 Anything still unresolved blocks the alert, naming the field and the missing column. The fix is to make the approved query emit that column, in the notebook, where reviewers already work. On the lower environment these rules map every field on 261 of the 342 alerts. 28 still have a field to fix, usually a classic dimension the reviewer's query no longer splits by. For the other 53 the query returned no data, so their columns are unknown; the builder must get their column set another way, e.g. a longer window or the result type metadata.
 
 ### Alerts with no entity
 
-When the approved query emits no entity column, the publish runs the same read-only 7-day check that staging uses (`resolveBinding`, `lib/detector-binding.ts`).
+When the approved query emits no entity column, the publish runs the same read-only 7-day check that staging uses (`resolveBinding`, `lib/detector-binding.ts`). This is the one place a 7-day count is used; the series-cap gate counts the 2-hour run of the final query.
 
 | Check result | Lower count | Without an override | `publish_override` = Publish per resource | `publish_override` = Publish without entity |
 |---|---|---|---|---|
@@ -165,7 +169,7 @@ Rules:
 ### Sheet changes
 
 - New **human** column `publish_override` (dropdown: Publish per resource / Publish without entity), kept across every tool write like the other human columns; see above.
-- New **tool** column `review_batch` (`batch-NN`), written by `stage-detectors` going forward and backfilled from the manifest by `refresh-alert-tracker` (and `stage-detectors --record-only --apply`). Never by a prepare run. _(my call)_ Selection reads the batch from the manifest, so publishing doesn't depend on the backfill having run.
+- New **tool** column `review_batch` (`batch-NN`), written by `stage-detectors` going forward. `stage-detectors --record-only --apply` fills it only on rows it records for the first time; **`refresh-alert-tracker` is what backfills rows already on the sheet**, from the manifest. Never by a prepare run. _(my call)_ Selection reads the batch from the manifest, so publishing doesn't depend on the backfill having run.
 - Statuses on the alerts sheet: staged → promoted → verified, or rolled-back. A skipped alert keeps its status and gets its reason in `reasons`.
 - `decision` remains human-owned. The tool writes only `Published` (after a publish) and `Needs Review` (after a rollback).
 
@@ -198,7 +202,7 @@ Moving slowly is a matter of `--batches` with one batch per run, plus `--limit`.
 ## Left to the builder
 
 - Command and file names beyond those above; where the payload and report files go under `migration/`.
-- The evaluation window used for the "query runs" gate, and how column sets are found for queries that return no data.
+- The evaluation window used for the "query runs" gate (built as 2 hours), and how column sets are found for queries that return no data (built as: the 7-day run, else the 2-hour run, else the columns the query text names).
 - Whether the three commands share a module (expected: a pure `lib/detector-publish.ts` holding selection, value assembly, event-field rules and drift, unit-tested, with the commands doing I/O).
 - Report format (markdown alongside JSON, like the scans).
 - Concurrency (the one-off used 4).
@@ -212,3 +216,17 @@ Moving slowly is a matter of `--batches` with one batch per run, plus `--limit`.
 ## Open questions
 
 None. The no-entity case was decided on 2026-11-06 (decision 7).
+
+## Changes during the build (2026-11-09)
+
+Decisions taken while building the three commands. Each is also stated above, where its topic lives.
+
+1. **`review_batch` backfill.** `stage-detectors --record-only --apply` fills `review_batch` only on rows it records for the first time. `refresh-alert-tracker` is what backfills rows already on the sheet.
+2. **The series cap is counted at alert scale.** The gate counts the 2-hour run of the final query, not a 7-day count. The no-entity check (`resolveBinding`) still uses 7 days, as staging does.
+3. **Drift has three sources.** An alert is unchanged when its live query equals the staged query from any known source: the batch's base payload, `migration/detector-review-archive/<batch>.json`, or the reference block in the live review tile.
+4. **Already approved.** An alert whose live query already equals the approved (or previously published) query is recorded only when nothing would change; otherwise it is published as an event-field-only update.
+5. **Spaced column names get an alias.** A placeholder that resolves to a column whose name contains whitespace gets an underscore alias column (`` | fieldsAdd Cluster_Name = `Cluster Name` ``), because Davis filling spaced names is unverified, while columns added by a later `fieldsAdd` are measured to fill.
+6. **The final query is run.** The query that would be published, after any entity, name-column or alias edit, is run once over 2 hours before it can be published.
+7. **Apply is conservative.** Apply re-reads the alert and skips it if ANY part changed since planning. A 5xx on the write is settled by one re-read and never re-sent. No write is made without the re-read's update token. Any 401/403 stops further writes.
+8. **Rollback restores two parts.** It restores only the query input and event fields from the snapshot, onto the CURRENT live value, so later owner changes elsewhere (threshold, enabled) survive. An alert with no snapshot (recorded, not published by the tool) cannot be rolled back. `--force` requires `--ids`.
+9. **Verify and recorded alerts.** Verify reports "no published record" for an alert the tool recorded but did not publish, and leaves its status alone.
