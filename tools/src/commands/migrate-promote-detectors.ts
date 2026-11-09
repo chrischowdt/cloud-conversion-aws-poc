@@ -34,20 +34,27 @@
  * same way, from fresh reads in the same run, never from files an earlier
  * prepare left. Then, for each alert the plan marks ready, one at a time:
  * re-read it and leave it alone if anything in it changed since planning;
- * snapshot it to migration/detector-promote/pre/<objectId>.json (the first
- * snapshot ever written wins); write the planned value with the update token of
- * that re-read, and none without one (never retried: a write that got no answer
- * or a 5xx is settled by reading);
- * re-read and check the stored query and event fields; record the value in
- * published/<objectId>.json. Any HTTP 401/403 stops further writes. One write
- * to the alerts sheet at the end: published and recorded alerts become promoted
- * / Published, skipped ones get their reason. A failed sheet write never undoes a
- * publish; the command names the ids to record.
+ * snapshot it to migration/detector-promote/pre/<objectId>.json (an existing
+ * snapshot is kept while its query and event fields still equal live, a retry;
+ * otherwise it is moved aside and a fresh one taken); write
+ * published/<objectId>.pending.json; write the planned value with the update
+ * token of that re-read, and none without one (never retried: a write that got
+ * no answer or a 5xx is settled by reading); re-read and check the stored query
+ * and event fields; rename the pending record to published/<objectId>.json, with
+ * what the re-read found as `storedValue`; move a rollback's
+ * rolled-back/<objectId>.json aside. Any HTTP 401/403 stops further writes. One
+ * write to the alerts sheet at the end: published and recorded alerts become
+ * promoted / Published, skipped ones get their reason. A failed sheet write never
+ * undoes a publish; the command names the ids to record.
+ *
+ * An alert an applied rollback left a `rolled-back/` record for is skipped while
+ * its sheet row's status is not `rolled-back`: such a row was saved before the
+ * rollback (a stale save of the workbook), so its Ready decision is not news.
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 
 import { REPO_ROOT, SKILL_DAC_AWS_METRICS, SKILL_MANUAL_AWS_METRICS, SKILL_PER_KEY_AWS_METRICS, envIdFromBaseUrl } from '../lib/paths.ts';
 import { liveMetricsPathIfPresent } from '../lib/live-metrics.ts';
@@ -58,7 +65,7 @@ import { entityCandidatesPathIfPresent } from '../lib/entity-candidates.ts';
 import { loadRecipeIndex, type RecipeIndex } from '../lib/recipe-lookup.ts';
 import { rewriteDql } from '../lib/dql-rewriter.ts';
 import { lintQuery } from '../lib/output-lint.ts';
-import { detectorQuery, findQueryInput, type EventTemplateChange } from '../lib/detector-rewrite.ts';
+import { detectorQuery, type EventTemplateChange } from '../lib/detector-rewrite.ts';
 import { DAVIS_SERIES_CAP, SOURCE_ID_DIM, emittedEntityColumn, resolveBinding, type BindingOutcome } from '../lib/detector-binding.ts';
 import { isEffectivelyEmpty, parseReviewQuery } from '../lib/detector-notebook.ts';
 import {
@@ -83,6 +90,16 @@ import {
   type ManifestBatch,
   type PublishCandidate,
 } from '../lib/detector-publish.ts';
+import {
+  moveAside,
+  publishedValueOf,
+  readPromoteRecord,
+  readRolledBack,
+  recordPath,
+  rolledBackPath,
+  writeRecord,
+  type PromoteRecord,
+} from '../lib/detector-promote-records.ts';
 import { PUBLISHED, PUBLISH_OVERRIDES, type PublishOverride } from '../lib/decision-states.ts';
 import { ALERTS_SHEET, readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { DqlClient, DqlError, type DqlResult } from '../dynatrace/dql.ts';
@@ -138,6 +155,8 @@ export interface PayloadFile {
   batch: string;
   /** The live query when this was planned; an apply skips the alert if it changed since. */
   liveQuery: string;
+  /** The review tile's query the value was built from; kept in the published record. */
+  approvedQuery?: string;
   schemaVersion?: string;
   value: Record<string, unknown>;
 }
@@ -256,15 +275,31 @@ interface PayloadRead {
   problem?: string;
 }
 
-interface Ctx {
-  args: PromoteDetectorsArgs;
+/** An earlier apply's records of one alert, each only when it could be read. */
+export interface EarlierRecords {
+  /** `published/<id>.json`: what an earlier publish wrote, and what the server stored. */
+  published?: PromoteRecord;
+  /** `published/<id>.pending.json`: a write that may have landed (no answer and no re-read, or a crash). */
+  pending?: PromoteRecord;
+  /** Why a record file that exists could not be read. */
+  problems: string[];
+}
+
+/** What planning one alert reads, injectable so every gate can be tested without a tenant. */
+export interface PlanCtx {
+  /** `--force` and `--ids`: a drifted alert is published only when both name it. */
+  args: Pick<PromoteDetectorsArgs, 'force' | 'ids'>;
+  /** For telling an owner-migrated alert from an owner edit. */
   index: RecipeIndex;
-  settings: SettingsClient;
+  /** Reads the live alert; `putObject` is only ever called with `validateOnly`. */
+  settings: Pick<SettingsClient, 'getObject' | 'putObject'>;
   run: (query: string, windowMs: number) => Promise<DqlResult>;
   sections: (notebookId: string) => Promise<Sections>;
   /** A batch's base payload (`detector-review/`) or archived one (`detector-review-archive/`). */
   payload: (kind: 'base' | 'archive', batch: string) => Promise<PayloadRead>;
-  publishedQuery: (objectId: string) => Promise<string | undefined>;
+  records: (objectId: string) => Promise<EarlierRecords>;
+  /** The record an applied rollback left (`rolled-back/<id>.json`), when there is one. */
+  rolledBack: (objectId: string) => Promise<{ rolledBackAt?: string } | undefined>;
 }
 
 const STAGED_FROM_TEXT: Record<StagedFrom, string> = {
@@ -274,7 +309,7 @@ const STAGED_FROM_TEXT: Record<StagedFrom, string> = {
 };
 
 /** Read everything one alert needs and run its gates. Throws only on an auth failure. */
-async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
+export async function planOne(c: PublishCandidate, ctx: PlanCtx): Promise<Outcome> {
   const item: PublishPlanItem = { objectId: c.objectId, title: c.title, batch: c.batch, result: 'skipped', reasons: [], diff: { fields: [] } };
   const notes: string[] = c.note ? [c.note] : [];
   const skip = (gate: string, reason: string, payload?: PayloadFile): Outcome => {
@@ -308,6 +343,20 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
   if (typeof value.title === 'string' && value.title.trim()) item.title = value.title;
   const liveQuery = detectorQuery(value);
   if (liveQuery === undefined) return skip('the alert has no query input', 'the live alert has no query input, so there is nowhere to put the approved query.');
+  const records = await ctx.records(c.objectId);
+  notes.push(...records.problems);
+
+  // A rollback newer than the sheet row: a stale save of the workbook (made
+  // before the rollback) shows the row as Ready again. A re-approval after the
+  // rollback keeps the tool's status `rolled-back`.
+  const rolledBack = await ctx.rolledBack(c.objectId);
+  if (rolledBack && c.status !== 'rolled-back') {
+    return skip(
+      'rolled back since the sheet row was saved',
+      `rolled back on ${rolledBack.rolledBackAt ?? 'an unknown date'}; the sheet row looks older than that — re-approve it after the rollback ` +
+        `(its status is ${c.status ? `"${c.status}"` : 'empty'}, not rolled-back).`,
+    );
+  }
 
   // 3. Every known copy of the classic query the card was staged from: base
   // payload, archived payload, live tile.
@@ -337,7 +386,11 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
     liveQuery,
     stagedQueries: staged.map((s) => s.query),
     approvedQuery: approved,
-    publishedQuery: await ctx.publishedQuery(c.objectId),
+    // What the server stored when the record has it, else what was sent; and a write that may have landed.
+    publishedQueries: [
+      records.published ? detectorQuery(publishedValueOf(records.published)) : undefined,
+      records.pending ? detectorQuery(records.pending.value) : undefined,
+    ].filter((q): q is string => typeof q === 'string'),
     liveIsMigrated,
   });
   if (drift !== 'none' && drift !== 'already-published') {
@@ -488,7 +541,7 @@ async function planOne(c: PublishCandidate, ctx: Ctx): Promise<Outcome> {
     return skip('the alert has no query input', errText(e));
   }
   const schemaVersion = typeof live.schemaVersion === 'string' ? live.schemaVersion : undefined;
-  const payload: PayloadFile = { objectId: c.objectId, title: item.title, batch: c.batch, liveQuery, schemaVersion, value: newValue };
+  const payload: PayloadFile = { objectId: c.objectId, title: item.title, batch: c.batch, liveQuery, approvedQuery: approved, schemaVersion, value: newValue };
 
   if (publishedPartsEqual(value, newValue)) {
     item.result = 'recorded';
@@ -741,23 +794,33 @@ async function applyOne(o: Outcome, deps: ResolvedDeps): Promise<unknown> {
   const updateToken = typeof live.updateToken === 'string' && live.updateToken ? live.updateToken : undefined;
   if (!updateToken) return skip('apply: no update token', 'no update token returned by the re-read; not written.');
 
-  // 2. Snapshot. The first one ever written wins, so a re-run after a partial
-  // failure keeps the original; nothing is written without one.
-  const prePath = join(deps.promoteDir, 'pre', `${id}.json`);
-  try {
-    await mkdir(dirname(prePath), { recursive: true });
-    await writeFile(prePath, JSON.stringify({ objectId: id, title: item.title, snapshotAt: deps.now().toISOString(), value }, null, 2), { flag: 'wx' });
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') {
-      return skip('apply: snapshot failed', `not written: the snapshot ${prePath} could not be written (${errText(e)}), and nothing is written without one.`);
-    }
-  }
+  // 2. Snapshot; nothing is written without one.
+  const snap = await takeSnapshot(deps.promoteDir, id, item.title, value, deps.now());
+  if ('error' in snap) return skip('apply: snapshot failed', `not written: ${snap.error}, and nothing is written without one.`);
+  const notes: string[] = snap.note ? [snap.note] : [];
 
-  // 3. The write, locked to the value just read. Never sent twice: a write that
+  // 3. The pending record, just before the write: a crash after the write reads
+  // as already published on the next run, not as an owner edit. It becomes the
+  // published record once the write is checked, and goes when it did not land.
+  const pendingPath = recordPath(deps.promoteDir, 'pending', id);
+  const approvedQuery = payload.approvedQuery;
+  try {
+    await writeRecord(pendingPath, { objectId: id, pendingAt: deps.now().toISOString(), approvedQuery, value: payload.value });
+  } catch (e) {
+    return skip(
+      'apply: pending record failed',
+      `not written: the pending record ${pendingPath} could not be written (${errText(e)}); without it a crash after the write would read as an owner edit.`,
+    );
+  }
+  const dropPending = async (): Promise<void> => {
+    await rm(pendingPath, { force: true }).catch(() => undefined);
+  };
+
+  // 4. The write, locked to the value just read. Never sent twice: a write that
   // got no answer may have landed, so it is settled by reading. A 5xx counts as
   // no answer: a gateway 502/504 can come back after the write was committed.
   // Only a 4xx is a definite refusal.
-  const notes: string[] = [];
+  let stored: Record<string, unknown> | undefined;
   let checked = false;
   try {
     await deps.settings.putObject(id, {
@@ -766,8 +829,12 @@ async function applyOne(o: Outcome, deps: ResolvedDeps): Promise<unknown> {
       schemaVersion: typeof live.schemaVersion === 'string' ? live.schemaVersion : payload.schemaVersion,
     });
   } catch (e) {
-    if (isAuthFailure(e)) return stopHere(e, 'the write was refused');
+    if (isAuthFailure(e)) {
+      await dropPending();
+      return stopHere(e, 'the write was refused');
+    }
     if (e instanceof SettingsApiError && e.status < 500) {
+      await dropPending();
       const why = e.status === 409 ? ' (the alert changed between the re-read and the write)' : '';
       return skip('apply: the write was refused', `not written: the write was refused${why}: ${errText(e)}`);
     }
@@ -779,25 +846,28 @@ async function applyOne(o: Outcome, deps: ResolvedDeps): Promise<unknown> {
       skip(
         'apply: the write may have landed',
         `${noAnswer} and the re-read after it failed too (${errText(e2)}), so whether it landed is unknown. ` +
-          'Re-read the alert before re-running.',
+          `Re-read the alert before re-running; ${pendingPath} stays, so a re-run reads a write that landed as already published.`,
       );
       return isAuthFailure(e2) ? e2 : undefined;
     }
     if (!publishedPartsEqual(after.value ?? {}, payload.value)) {
+      await dropPending();
       return skip('apply: the write failed', `not written: ${noAnswer} and a re-read shows it did not land.`);
     }
     notes.push(`${noAnswer}, but a re-read shows it landed.`);
+    stored = after.value ?? {};
     checked = true;
   }
 
-  // 4. Re-read and check the parts the publish wrote. A mismatch does not undo
+  // 5. Re-read and check the parts the publish wrote. A mismatch does not undo
   // the write (it went through); it is recorded and printed for a person.
   let stop: unknown;
   if (!checked) {
     try {
       const after = await deps.settings.getObject(id);
-      if (!publishedPartsEqual(after.value ?? {}, payload.value)) {
-        const part = detectorQuery(after.value ?? {}) !== detectorQuery(payload.value) ? 'query' : 'event fields';
+      stored = after.value ?? {};
+      if (!publishedPartsEqual(stored, payload.value)) {
+        const part = detectorQuery(stored) !== detectorQuery(payload.value) ? 'query' : 'event fields';
         notes.push(`the re-read after the write does not show the published ${part}: the stored value differs from what was written. Check the alert.`);
       }
     } catch (e) {
@@ -806,14 +876,29 @@ async function applyOne(o: Outcome, deps: ResolvedDeps): Promise<unknown> {
     }
   }
 
-  // 5. The record verify, rollback and the next run's drift check read.
+  // 6. The record verify, rollback and the next run's drift check read: the
+  // pending record, now with what the re-read found, under its final name.
   const publishedAt = deps.now().toISOString();
-  const publishedPath = join(deps.promoteDir, 'published', `${id}.json`);
+  const publishedPath = recordPath(deps.promoteDir, 'published', id);
   try {
-    await mkdir(dirname(publishedPath), { recursive: true });
-    await writeFile(publishedPath, JSON.stringify({ objectId: id, publishedAt, value: payload.value }, null, 2));
+    await writeRecord(pendingPath, { objectId: id, publishedAt, approvedQuery, value: payload.value, ...(stored ? { storedValue: stored } : {}) });
+    await rename(pendingPath, publishedPath);
   } catch (e) {
-    notes.push(`its record ${publishedPath} could not be written (${errText(e)}); verify and rollback need it, so copy this run's payloads/${id}.json there.`);
+    notes.push(
+      `its record ${publishedPath} could not be written (${errText(e)}); verify and rollback need it, so copy this run's payloads/${id}.json there ` +
+        `(${pendingPath} holds what was sent).`,
+    );
+  }
+
+  // 7. A rollback's record would make the next run read the sheet row as older
+  // than the rollback; this publish is newer, so it is moved aside.
+  const rolledBack = rolledBackPath(deps.promoteDir, id);
+  if (existsSync(rolledBack)) {
+    try {
+      await moveAside(rolledBack, deps.now());
+    } catch (e) {
+      notes.push(`the rollback record ${rolledBack} could not be moved aside (${errText(e)}); move it by hand, or a later run reads this alert as rolled back.`);
+    }
   }
 
   item.result = 'published';
@@ -824,6 +909,42 @@ async function applyOne(o: Outcome, deps: ResolvedDeps): Promise<unknown> {
   for (const note of notes) log(`      ${note}`);
   if (stop) log(`  ! the re-read after writing ${id} was refused. Stopping.`);
   return stop;
+}
+
+/**
+ * Snapshot the live value to `pre/<id>.json` before it is written. An existing
+ * snapshot is kept when the live alert's query and event fields still equal its
+ * own: a retry of an earlier attempt that did not write (a refused or failed
+ * write), and the two parts a rollback restores are the same either way.
+ * Otherwise it is out of date (the alert was published, rolled back and changed
+ * since), so it is moved aside to `pre/<id>.<stamp>.json` and a fresh one taken:
+ * a rollback restoring the old one would discard the change. Returns a note when
+ * it moved one, or why no snapshot could be taken.
+ */
+async function takeSnapshot(promoteDir: string, id: string, title: string, live: Record<string, unknown>, now: Date): Promise<{ note?: string } | { error: string }> {
+  const prePath = recordPath(promoteDir, 'pre', id);
+  const existing = await readPromoteRecord(promoteDir, 'pre', id);
+  if (existing.kind === 'ok' && publishedPartsEqual(live, existing.record.value)) return {};
+  let note: string | undefined;
+  if (existing.kind !== 'missing') {
+    let movedTo: string;
+    try {
+      movedTo = await moveAside(prePath, now);
+    } catch (e) {
+      return { error: `the earlier snapshot ${prePath} could not be moved aside (${errText(e)})` };
+    }
+    const where = join('pre', basename(movedTo));
+    note =
+      existing.kind === 'ok'
+        ? `the earlier snapshot (${existing.record.snapshotAt ?? 'unknown time'}) no longer matched the alert's query and event fields, so it was moved to ${where} and a fresh one taken.`
+        : `the earlier snapshot could not be read (${existing.problem}), so it was moved to ${where} and a fresh one taken.`;
+  }
+  try {
+    await writeRecord(prePath, { objectId: id, title, snapshotAt: now.toISOString(), value: live }, 'wx');
+  } catch (e) {
+    return { error: `the snapshot ${prePath} could not be written (${errText(e)})` };
+  }
+  return { note };
 }
 
 /** When an earlier apply published an alert, from its record; undefined when there is none. */
@@ -1014,9 +1135,9 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
     });
 
   // One read per notebook and per payload file, shared by every alert in it.
-  const notebooks = new Map<string, ReturnType<Ctx['sections']>>();
+  const notebooks = new Map<string, ReturnType<PlanCtx['sections']>>();
   const payloads = new Map<string, Promise<PayloadRead>>();
-  const ctx: Ctx = {
+  const ctx: PlanCtx = {
     args,
     index,
     settings,
@@ -1063,17 +1184,16 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
       }
       return p;
     },
-    publishedQuery: async (objectId) => {
-      const file = join(promoteDir, 'published', `${objectId}.json`);
-      if (!existsSync(file)) return undefined;
-      try {
-        const rec = JSON.parse(await readFile(file, 'utf8')) as { value?: { analyzer?: { input?: Array<{ key?: string; value?: string }> } } };
-        const inputs = rec.value?.analyzer?.input;
-        return findQueryInput(Array.isArray(inputs) ? inputs : [])?.value;
-      } catch {
-        return undefined;
+    records: async (objectId) => {
+      const out: EarlierRecords = { problems: [] };
+      for (const kind of ['published', 'pending'] as const) {
+        const r = await readPromoteRecord(promoteDir, kind, objectId);
+        if (r.kind === 'ok') out[kind] = r.record;
+        else if (r.kind === 'bad') out.problems.push(`the record ${r.path} could not be read (${r.problem}), so it was left out.`);
       }
+      return out;
     },
+    rolledBack: (objectId) => readRolledBack(promoteDir, objectId),
   };
 
   const started = Date.now();

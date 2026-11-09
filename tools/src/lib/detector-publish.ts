@@ -37,6 +37,8 @@ export interface PublishCandidate {
   notebookId: string;
   /** Who approved it (trimmed). Empty when nobody is named. */
   reviewer: string;
+  /** The row's `status`, trimmed and lower-cased: `rolled-back` on a row re-approved after a rollback. */
+  status: string;
   /** The reviewer's `publish_override`, only when it is valid and a reviewer is named. */
   override?: PublishOverride;
   /** Why a `publish_override` on the row was ignored. */
@@ -89,9 +91,10 @@ export function selectForPublish(
       const row = rows.get(d.objectId);
       // A decision of Published is not Ready To Publish, so it is already out here.
       if (!row || !isReadyToPublish(row.decision)) continue;
-      if (PUBLISHED_STATUSES.has((row.status ?? '').trim().toLowerCase())) continue;
+      const status = (row.status ?? '').trim().toLowerCase();
+      if (PUBLISHED_STATUSES.has(status)) continue;
       const reviewer = (row.reviewer ?? '').trim();
-      const candidate: PublishCandidate = { objectId: d.objectId, title: d.title, batch: b.batch, notebookId: b.notebookId!, reviewer };
+      const candidate: PublishCandidate = { objectId: d.objectId, title: d.title, batch: b.batch, notebookId: b.notebookId!, reviewer, status };
       const override = parsePublishOverride(row.publish_override);
       if (override === 'invalid') {
         candidate.note = `publish_override ignored: "${(row.publish_override ?? '').trim()}" is not ${OVERRIDE_CHOICES}.`;
@@ -248,12 +251,14 @@ export function driftOf(a: {
   approvedQuery: string;
   /** The query a previous apply recorded as published, when there is one. */
   publishedQuery?: string;
+  /** More queries an earlier apply wrote, or may have (its pending record); equal to any is `already-published`. */
+  publishedQueries?: string[];
   liveIsMigrated: boolean;
 }): Drift {
   const live = a.liveQuery.trim();
   if (live === a.approvedQuery.trim()) return 'already-published';
-  const published = a.publishedQuery?.trim();
-  if (published && live === published) return 'already-published';
+  const published = [a.publishedQuery, ...(a.publishedQueries ?? [])].map((q) => q?.trim()).filter((q): q is string => !!q);
+  if (published.includes(live)) return 'already-published';
   const staged = [a.stagedQuery, ...(a.stagedQueries ?? [])].map((q) => q?.trim()).filter((q): q is string => !!q);
   if (!staged.length) return 'unknown';
   if (staged.includes(live)) return 'none';

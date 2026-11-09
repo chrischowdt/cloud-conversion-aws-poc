@@ -18,9 +18,13 @@
  *     hand): refused, "no snapshot; cannot roll back"
  *   - read the live alert; already holding the snapshot's parts: recorded as
  *     rolled back, not written again (a re-run after a failed sheet write)
- *   - its query and event fields still what was published (`published/<id>.json`)
+ *   - its query and event fields still what was published (`published/<id>.json`:
+ *     what the server stored when the record has it, else what was sent)
  *     → restore; edited since, or no published record to check against →
  *     refused, saying what differs, unless --force (which needs --ids)
+ *   - after a restore, or an "already rolled back" record, an apply leaves
+ *     `detector-promote/rolled-back/<id>.json` ({ objectId, rolledBackAt }), so a
+ *     stale save of the workbook showing the alert Ready cannot publish it again
  *
  * PREPARE (the default) reads the alerts and writes only files: plan.json and
  * the value each alert would get (payloads/<id>.json) under
@@ -50,7 +54,14 @@ import {
   rollbackDecision,
   type PublishedTarget,
 } from '../lib/detector-publish.ts';
-import { loadPublishedTargets, promoteDirOf, readPromoteRecord } from '../lib/detector-promote-records.ts';
+import {
+  loadPublishedTargets,
+  promoteDirOf,
+  publishedValueOf,
+  readPromoteRecord,
+  rolledBackPath,
+  writeRolledBack,
+} from '../lib/detector-promote-records.ts';
 import type { DecisionState } from '../lib/decision-states.ts';
 import { envIdFromBaseUrl } from '../lib/paths.ts';
 import { ALERTS_SHEET, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
@@ -183,9 +194,11 @@ async function rollbackOne(t: PublishedTarget, ctx: Ctx): Promise<{ item: Rollba
     }
     notes.push(`--force: restored without a check for an edit made after publishing (${why}); the value before the rollback is in ${beforePath}.`);
   } else {
-    const parts = publishedPartsDiff(value, published.record.value);
+    // What the server stored when the record has it: a field it normalised is not an edit.
+    const publishedValue = publishedValueOf(published.record);
+    const parts = publishedPartsDiff(value, publishedValue);
     const what = `its ${partsPhrase(parts, 'no longer matches', 'no longer match')} what was published${published.record.publishedAt ? ` (${published.record.publishedAt})` : ''}`;
-    if (rollbackDecision(value, published.record.value, ctx.force) === 'refuse-edited') {
+    if (rollbackDecision(value, publishedValue, ctx.force) === 'refuse-edited') {
       return end('refused', [
         `not rolled back: edited after publishing: ${what}, and a rollback would discard that edit. ` +
           `Once a person has checked it, restore the snapshot's query and event fields anyway with ${forceHint}; nothing else in the alert is written.`,
@@ -334,11 +347,23 @@ export async function runRollbackDetectors(args: RollbackDetectorsArgs, deps: Ro
     const r = await rollbackOne(t, ctx);
     const i = r.item;
     run.items.push(i);
+    // The mark a publish run checks: a sheet row saved before this rollback (a
+    // stale save showing it Ready again) must not re-publish the alert.
+    if (apply && (i.result === 'rolled-back' || i.result === 'recorded')) {
+      try {
+        await writeRolledBack(ctx.promoteDir, i.objectId, now().toISOString());
+      } catch (e) {
+        i.reasons.push(
+          `the rollback record ${rolledBackPath(ctx.promoteDir, i.objectId)} could not be written (${errText(e)}); ` +
+            'until a person writes it, a stale save of the workbook showing this alert Ready could publish it again.',
+        );
+      }
+    }
     if (i.result === 'rolled-back') log(`  ✓ rolled back ${i.objectId} (${i.title})`);
     else if (i.result === 'recorded') log(`  = ${i.objectId} (${i.title}): already rolled back; recorded only`);
     else if (i.result === 'would-restore') log(`  would restore ${i.objectId} (${i.title})`);
     else log(`  ! ${i.objectId} (${i.title}): ${i.reasons[0] ?? i.result}`);
-    if (i.result === 'rolled-back' || i.result === 'would-restore') for (const note of i.reasons.slice(1)) log(`      ${note}`);
+    if (i.result === 'rolled-back' || i.result === 'would-restore' || i.result === 'recorded') for (const note of i.reasons.slice(1)) log(`      ${note}`);
     if (r.stop) {
       stop = r.stop;
       log('  ! the token was refused. Stopping.');

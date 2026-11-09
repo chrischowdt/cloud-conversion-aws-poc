@@ -55,6 +55,19 @@ describe('migrate-verify-detectors', () => {
     assert.equal(t.settings.calls.some((c) => c.op === 'put'), false);
   });
 
+  it('compares with what the server stored when the record has it, not with what was sent', async () => {
+    const stored = detector(APPROVED, [{ key: 'event.name', value: 'normalised by the server' }]);
+    const t = await publishedAlerts([
+      { id: 'S', stored, live: { value: stored, updateToken: 'x' } },
+      { id: 'W', stored }, // live still holds what was sent, which the server did not keep
+    ]);
+
+    const run = await runVerifyDetectors(t.args, t.deps());
+
+    assert.deepEqual(run.verified, ['S']);
+    assert.deepEqual(run.flagged, ['W']);
+  });
+
   it('reports "no published record" for an alert the tool recorded without publishing it, and the run still succeeds', async () => {
     const t = await publishedAlerts([{ id: 'HAND', published: null, pre: null }, { id: 'A' }]);
 

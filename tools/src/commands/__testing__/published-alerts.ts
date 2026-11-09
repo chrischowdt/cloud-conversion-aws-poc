@@ -65,6 +65,8 @@ export interface AlertFixture {
   live?: Stored | null;
   /** `published/<id>.json`'s value; default the published value. `null`: no file. */
   published?: Record<string, unknown> | null;
+  /** `published/<id>.json`'s storedValue (what the re-read after the write found); default none. */
+  stored?: Record<string, unknown>;
   /** `pre/<id>.json`'s value; default the value before the publish. `null`: no file. */
   pre?: Record<string, unknown> | null;
 }
@@ -96,7 +98,10 @@ export async function publishedAlerts(alerts: AlertFixture[], opts: { manifest?:
     const pre = a.pre === undefined ? preValue() : a.pre;
     if (pre) await writeFile(join(promoteDir, 'pre', `${a.id}.json`), JSON.stringify({ objectId: a.id, title: `Queue backlog ${a.id}`, snapshotAt: SNAPSHOT_AT, value: pre }, null, 2));
     const published = a.published === undefined ? publishedValue() : a.published;
-    if (published) await writeFile(join(promoteDir, 'published', `${a.id}.json`), JSON.stringify({ objectId: a.id, publishedAt: PUBLISHED_AT, value: published }, null, 2));
+    if (published) {
+      const rec = { objectId: a.id, publishedAt: PUBLISHED_AT, value: published, ...(a.stored ? { storedValue: a.stored } : {}) };
+      await writeFile(join(promoteDir, 'published', `${a.id}.json`), JSON.stringify(rec, null, 2));
+    }
     const live = a.live === undefined ? { value: publishedValue(), updateToken: `tok-${a.id}-0`, schemaVersion: '1.2.3' } : a.live;
     if (live) store.set(a.id, live);
   }

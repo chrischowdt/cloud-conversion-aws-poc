@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { runRollbackDetectors } from './migrate-rollback-detectors.ts';
 import { SettingsApiError } from '../dynatrace/settings.ts';
 import { ALERTS_SHEET, readRows } from '../lib/tracker-xlsx.ts';
-import { APPROVED, CLASSIC, CLASSIC_PROPS, ENV, NEW_PROPS, detector, preValue, publishedAlerts, publishedValue } from './__testing__/published-alerts.ts';
+import { APPROVED, CLASSIC, CLASSIC_PROPS, ENV, NEW_PROPS, NOW, detector, preValue, publishedAlerts, publishedValue } from './__testing__/published-alerts.ts';
 import type { Call } from './__testing__/fake-settings.ts';
 
 // migrate-rollback-detectors writes LIVE alerts. Driven here by a fake Settings
@@ -112,6 +112,46 @@ describe('migrate-rollback-detectors: restore', () => {
     assert.equal(row.status, 'rolled-back');
     assert.equal(row.decision, 'Needs Review');
     assert.match(row.reasons!, /already rolled back/);
+  });
+
+  it('leaves a rolled-back record after a restore and after an already-rolled-back record, so a stale sheet save cannot re-publish the alert', async () => {
+    const t = await publishedAlerts([{ id: 'A' }, { id: 'R', live: { value: preValue(), updateToken: 'tok-R-0' } }]);
+
+    await runRollbackDetectors({ ...t.args, ...apply, ids: ['A', 'R'] }, t.deps());
+
+    for (const id of ['A', 'R']) {
+      assert.deepEqual(JSON.parse(await readFile(join(t.promoteDir, 'rolled-back', `${id}.json`), 'utf8')), { objectId: id, rolledBackAt: NOW.toISOString() }, id);
+    }
+  });
+
+  it('leaves no rolled-back record in prepare, or for an alert it refuses or skips', async () => {
+    const t = await publishedAlerts([{ id: 'A' }, { id: 'E', live: { value: detector(`${APPROVED} // edited`, NEW_PROPS), updateToken: 'x' } }, { id: 'GONE', live: null }]);
+
+    await runRollbackDetectors({ ...t.args, ids: ['A', 'E', 'GONE'] }, t.deps());
+    await runRollbackDetectors({ ...t.args, ...apply, ids: ['E', 'GONE'] }, t.deps());
+
+    assert.equal(existsSync(join(t.promoteDir, 'rolled-back')), false);
+  });
+
+  it('compares the live alert with what the server stored, when the record has it', async () => {
+    // The server normalised the event text on the publish; the alert still holds what it stored.
+    const stored = detector(APPROVED, [{ key: 'event.name', value: 'normalised by the server' }]);
+    const t = await publishedAlerts([{ id: 'A', stored, live: { value: stored, updateToken: 'tok-A-0' } }]);
+
+    const run = await runRollbackDetectors({ ...t.args, ...apply, ids: ['A'] }, t.deps());
+
+    assert.equal(run.items[0]!.result, 'rolled-back', run.items[0]!.reasons.join(' | '));
+    assert.deepEqual(t.store.get('A')!.value, preValue());
+  });
+
+  it('refuses an alert that still has what was sent but not what the server stored', async () => {
+    const stored = detector(APPROVED, [{ key: 'event.name', value: 'normalised by the server' }]);
+    const t = await publishedAlerts([{ id: 'A', stored }]);
+
+    const run = await runRollbackDetectors({ ...t.args, ...apply, ids: ['A'] }, t.deps());
+
+    assert.equal(run.items[0]!.result, 'refused');
+    assert.match(run.items[0]!.reasons[0]!, /event fields no longer match/);
   });
 
   it('writes the real workbook: rolled-back and Needs Review', async () => {

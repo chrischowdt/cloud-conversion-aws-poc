@@ -1,14 +1,16 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { applyAndRecord, runPromoteDetectors, type ApplyDeps, type Outcome } from './migrate-promote-detectors.ts';
+import { runRollbackDetectors } from './migrate-rollback-detectors.ts';
 import { SettingsApiError } from '../dynatrace/settings.ts';
 import type { TrackerRow } from '../lib/tracker-xlsx.ts';
 import { fakeSettings, type Stored } from './__testing__/fake-settings.ts';
+import { ENV, preValue, publishedAlerts } from './__testing__/published-alerts.ts';
 
 // The apply half of migrate-promote-detectors: everything that touches a LIVE
 // alert. Driven here by a fake Settings API that behaves like the real one where
@@ -136,10 +138,11 @@ describe('apply: the drift re-check', () => {
 });
 
 describe('apply: the snapshot', () => {
-  it('keeps the first snapshot: an existing pre/<id>.json is not overwritten', async () => {
+  it('keeps an existing snapshot whose query and event fields still equal the live alert: a retry of an earlier attempt', async () => {
     const t = await setup(['A']);
     await mkdir(join(t.promoteDir, 'pre'), { recursive: true });
-    const first = JSON.stringify({ objectId: 'A', title: 'Queue backlog A', snapshotAt: '2026-10-01T00:00:00.000Z', value: { original: true } });
+    // Same query and event fields as live; only a field a publish never writes differs.
+    const first = JSON.stringify({ objectId: 'A', title: 'Queue backlog A', snapshotAt: '2026-10-01T00:00:00.000Z', value: detector(CLASSIC, CLASSIC_PROPS, '50') });
     await writeFile(join(t.promoteDir, 'pre', 'A.json'), first);
     const o = planned('A');
 
@@ -147,6 +150,80 @@ describe('apply: the snapshot', () => {
 
     assert.equal(o.item.result, 'published');
     assert.equal(await readFile(join(t.promoteDir, 'pre', 'A.json'), 'utf8'), first);
+    assert.deepEqual(await readdir(join(t.promoteDir, 'pre')), ['A.json'], 'nothing moved aside');
+  });
+
+  it('moves an out-of-date snapshot aside and takes a fresh one of the live value', async () => {
+    const t = await setup(['A']);
+    await mkdir(join(t.promoteDir, 'pre'), { recursive: true });
+    const old = JSON.stringify({ objectId: 'A', title: 'Queue backlog A', snapshotAt: '2026-10-01T00:00:00.000Z', value: detector(CLASSIC, [{ key: 'event.name', value: 'old text' }]) });
+    await writeFile(join(t.promoteDir, 'pre', 'A.json'), old);
+    const o = planned('A');
+
+    await applyAndRecord([o], t.deps(fakeSettings(t.store)));
+
+    assert.equal(o.item.result, 'published');
+    assert.deepEqual((await t.json('pre', 'A.json')) as object, {
+      objectId: 'A',
+      title: 'Queue backlog A',
+      snapshotAt: NOW.toISOString(),
+      value: detector(CLASSIC, CLASSIC_PROPS),
+    });
+    assert.equal(await readFile(join(t.promoteDir, 'pre', 'A.20261106T120000.000Z.json'), 'utf8'), old, 'the old one is kept, moved aside');
+    assert.ok(o.item.reasons.some((r) => /earlier snapshot .* moved to pre[\\/]A\.20261106T120000\.000Z\.json/.test(r)), o.item.reasons.join(' | '));
+  });
+
+  it('keeps the first snapshot on a retry after a refused write', async () => {
+    const t = await setup(['A']);
+    let refuse = true;
+    const s = fakeSettings(t.store, {
+      putError: () => (refuse ? new SettingsApiError(409, 'https://example/settings/objects/A', '{"error":{"message":"the object was modified"}}') : undefined),
+    });
+    const first = planned('A');
+    await applyAndRecord([first], t.deps(s, { now: () => new Date('2026-11-06T11:00:00.000Z') }));
+    assert.equal(first.item.result, 'skipped');
+    const snapshot = await readFile(join(t.promoteDir, 'pre', 'A.json'), 'utf8');
+
+    refuse = false;
+    const retry = planned('A');
+    await applyAndRecord([retry], t.deps(s));
+
+    assert.equal(retry.item.result, 'published');
+    assert.equal(await readFile(join(t.promoteDir, 'pre', 'A.json'), 'utf8'), snapshot, 'the retry keeps it');
+    assert.equal(JSON.parse(snapshot).snapshotAt, '2026-11-06T11:00:00.000Z');
+    assert.deepEqual(await readdir(join(t.promoteDir, 'pre')), ['A.json']);
+  });
+
+  it('never restores an out-of-date snapshot: publish, roll back, owner edit, publish again, roll back keeps the edit', async () => {
+    const f = await publishedAlerts([{ id: 'A', status: 'staged', decision: 'Ready To Publish', live: { value: preValue(), updateToken: 't0', schemaVersion: '1' }, pre: null, published: null }]);
+    const outcome = (): Outcome => ({
+      item: { objectId: 'A', title: 'Queue backlog', batch: 'batch-03', result: 'ready', reasons: [], diff: { fields: [] } },
+      gate: 'ready',
+      liveValue: structuredClone(f.store.get('A')!.value),
+      payload: { objectId: 'A', title: 'Queue backlog', batch: 'batch-03', liveQuery: CLASSIC, value: detector(APPROVED, NEW_PROPS) },
+    });
+    const applyDeps: ApplyDeps = { settings: f.settings, promoteDir: f.promoteDir, trackerPath: f.trackerPath, log: () => {}, now: () => NOW };
+    const rollback = (at: string) =>
+      runRollbackDetectors({ ...f.args, ids: ['A'], apply: true, allowEnv: ENV }, { settings: f.settings, log: () => {}, now: () => new Date(at) });
+    const eventName = () => (f.store.get('A')!.value.eventTemplate as { properties: Prop[] }).properties.find((p) => p.key === 'event.name')!.value;
+
+    await applyAndRecord([outcome()], applyDeps);
+    assert.equal((await rollback('2026-11-06T13:00:00.000Z')).items[0]!.result, 'rolled-back');
+    assert.ok(existsSync(join(f.promoteDir, 'rolled-back', 'A.json')), 'the rollback leaves its record');
+
+    // Back on classic, the owner rewords the title. Its query is untouched.
+    const edited = structuredClone(f.store.get('A')!.value);
+    (edited.eventTemplate as { properties: Prop[] }).properties[0]!.value = 'OWNER FIX: backlog on {dims:dt.entity.custom_device.name}';
+    f.store.set('A', { value: edited, updateToken: 't-owner', schemaVersion: '1' });
+
+    const again = outcome();
+    await applyAndRecord([again], { ...applyDeps, now: () => new Date('2026-11-07T09:00:00.000Z') });
+    assert.equal(again.item.result, 'published');
+    assert.equal(existsSync(join(f.promoteDir, 'rolled-back', 'A.json')), false, 'moved aside once published again');
+    assert.ok(existsSync(join(f.promoteDir, 'rolled-back', 'A.20261107T090000.000Z.json')));
+
+    assert.equal((await rollback('2026-11-07T10:00:00.000Z')).items[0]!.result, 'rolled-back');
+    assert.equal(eventName(), 'OWNER FIX: backlog on {dims:dt.entity.custom_device.name}', "the owner's edit survives the second rollback");
   });
 
   it('snapshots the value read just before the write, with its title and time', async () => {
@@ -254,7 +331,7 @@ describe('apply: the write', () => {
     assert.equal(o.item.result, 'published', o.item.reasons.join(' | '));
     assert.ok(o.item.reasons.some((r) => /HTTP 504/.test(r) && /landed/.test(r)), o.item.reasons.join(' | '));
     assert.deepEqual(run.published, ['A']);
-    assert.deepEqual(await t.json('published', 'A.json'), { objectId: 'A', publishedAt: NOW.toISOString(), value: o.payload!.value });
+    assert.deepEqual(await t.json('published', 'A.json'), { objectId: 'A', publishedAt: NOW.toISOString(), value: o.payload!.value, storedValue: o.payload!.value });
     assert.deepEqual(t.sheets[0]!.rows.map((r) => [r.asset_id, r.status, r.decision]), [['A', 'promoted', 'Published']]);
   });
 
@@ -339,12 +416,99 @@ describe('apply: the re-read check', () => {
 });
 
 describe('apply: the published record', () => {
-  it('writes published/<id>.json after a successful write', async () => {
+  it('writes published/<id>.json after a successful write: what was sent, what the re-read found, and the approved query', async () => {
     const t = await setup(['A']);
     const o = planned('A');
+    o.payload!.approvedQuery = APPROVED;
     await applyAndRecord([o], t.deps(fakeSettings(t.store)));
 
-    assert.deepEqual(await t.json('published', 'A.json'), { objectId: 'A', publishedAt: NOW.toISOString(), value: o.payload!.value });
+    assert.deepEqual(await t.json('published', 'A.json'), {
+      objectId: 'A',
+      publishedAt: NOW.toISOString(),
+      approvedQuery: APPROVED,
+      value: o.payload!.value,
+      storedValue: o.payload!.value,
+    });
+    assert.equal(existsSync(join(t.promoteDir, 'published', 'A.pending.json')), false, 'the pending record became the published one');
+  });
+
+  it('keeps what the server stored next to what was sent', async () => {
+    const t = await setup(['A']);
+    const s = fakeSettings(t.store, { stored: (v) => ({ ...v, serverDefault: 'added' }) });
+    const o = planned('A');
+    await applyAndRecord([o], t.deps(s));
+
+    const rec = (await t.json('published', 'A.json')) as { value: unknown; storedValue: unknown };
+    assert.deepEqual(rec.value, o.payload!.value);
+    assert.deepEqual(rec.storedValue, { ...o.payload!.value, serverDefault: 'added' });
+  });
+
+  it('writes the pending record just before the write', async () => {
+    const t = await setup(['A']);
+    let pendingAtPut: unknown;
+    const s = fakeSettings(t.store, {
+      putError: () => {
+        const p = join(t.promoteDir, 'published', 'A.pending.json');
+        pendingAtPut = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : undefined;
+        return undefined;
+      },
+    });
+    const o = planned('A');
+    o.payload!.approvedQuery = APPROVED;
+    await applyAndRecord([o], t.deps(s));
+
+    assert.deepEqual(pendingAtPut, { objectId: 'A', pendingAt: NOW.toISOString(), approvedQuery: APPROVED, value: o.payload!.value });
+  });
+
+  it('removes the pending record when the write is refused or did not land', async () => {
+    const t = await setup(['R', 'N']);
+    const s = fakeSettings(t.store, {
+      putError: (id) =>
+        id === 'R'
+          ? new SettingsApiError(409, 'https://example/settings/objects/R', '{"error":{"message":"the object was modified"}}')
+          : new SettingsApiError(503, 'https://example/settings/objects/N', '{"error":{"message":"Service Unavailable"}}'),
+    });
+    await applyAndRecord([planned('R'), planned('N')], t.deps(s));
+
+    for (const id of ['R', 'N']) {
+      assert.equal(existsSync(join(t.promoteDir, 'published', `${id}.pending.json`)), false, id);
+      assert.equal(existsSync(join(t.promoteDir, 'published', `${id}.json`)), false, id);
+    }
+  });
+
+  it('keeps the pending record when whether the write landed is unknown', async () => {
+    const t = await setup(['A']);
+    const s = fakeSettings(t.store, {
+      putLandsThenFails: () => new TypeError('fetch failed'),
+      getError: (_id, nth) => (nth === 1 ? new TypeError('fetch failed') : undefined),
+    });
+    const o = planned('A');
+    await applyAndRecord([o], t.deps(s));
+
+    assert.equal(o.item.result, 'skipped');
+    assert.match(o.item.reasons[0]!, /whether it landed is unknown/);
+    assert.ok(existsSync(join(t.promoteDir, 'published', 'A.pending.json')), 'the next run reads a landed write as published, not as an owner edit');
+  });
+
+  it('moves the rolled-back record aside once it publishes the alert again', async () => {
+    const t = await setup(['A']);
+    await mkdir(join(t.promoteDir, 'rolled-back'), { recursive: true });
+    await writeFile(join(t.promoteDir, 'rolled-back', 'A.json'), JSON.stringify({ objectId: 'A', rolledBackAt: '2026-11-05T00:00:00.000Z' }));
+
+    await applyAndRecord([planned('A')], t.deps(fakeSettings(t.store)));
+
+    assert.deepEqual(await readdir(join(t.promoteDir, 'rolled-back')), ['A.20261106T120000.000Z.json']);
+  });
+
+  it('leaves the rolled-back record when the alert is not written', async () => {
+    const t = await setup(['A']);
+    await mkdir(join(t.promoteDir, 'rolled-back'), { recursive: true });
+    await writeFile(join(t.promoteDir, 'rolled-back', 'A.json'), JSON.stringify({ objectId: 'A', rolledBackAt: '2026-11-05T00:00:00.000Z' }));
+    const s = fakeSettings(t.store, { putError: () => new SettingsApiError(400, 'https://example/settings/objects/A', '{"error":{"message":"bad value"}}') });
+
+    await applyAndRecord([planned('A')], t.deps(s));
+
+    assert.deepEqual(await readdir(join(t.promoteDir, 'rolled-back')), ['A.json']);
   });
 });
 

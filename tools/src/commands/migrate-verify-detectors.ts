@@ -24,7 +24,7 @@
 import { join } from 'node:path';
 
 import { isAuthFailure, publishedPartsDiff, type PublishedTarget } from '../lib/detector-publish.ts';
-import { loadPublishedTargets, promoteDirOf, readPromoteRecord } from '../lib/detector-promote-records.ts';
+import { loadPublishedTargets, promoteDirOf, publishedValueOf, readPromoteRecord } from '../lib/detector-promote-records.ts';
 import { ALERTS_SHEET, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { SettingsApiError, SettingsClient, type SettingsObject } from '../dynatrace/settings.ts';
 import { errText } from './migrate-promote-detectors.ts';
@@ -96,7 +96,8 @@ async function verifyOne(
   const value = live.value ?? {};
   if (typeof value.title === 'string' && value.title.trim()) row.name = value.title;
 
-  const parts = publishedPartsDiff(value, rec.record.value);
+  // What the server stored when the record has it, else what was sent.
+  const parts = publishedPartsDiff(value, publishedValueOf(rec.record));
   if (parts.length) {
     const when = rec.record.publishedAt ? ` (published ${rec.record.publishedAt})` : '';
     return flag(

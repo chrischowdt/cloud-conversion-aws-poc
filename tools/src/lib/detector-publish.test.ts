@@ -88,7 +88,16 @@ describe('selectForPublish', () => {
       batch: 'batch-01',
       notebookId: 'nb-1',
       reviewer: 'reviewer-a',
+      status: 'staged',
     });
+  });
+
+  it("carries the row's status, trimmed and lower-cased: a re-approval after a rollback keeps rolled-back", () => {
+    const rows = sheet();
+    rows.set('A-1', row({ status: ' Rolled-Back ' }));
+    rows.set('A-2', row({ status: '' }));
+    const { candidates } = selectForPublish(rows, batches, { batches: ['batch-01'] });
+    assert.deepEqual(candidates.map((c) => c.status), ['rolled-back', '']);
   });
 
   it('accepts the decision in any case', () => {
@@ -266,6 +275,14 @@ describe('driftOf', () => {
     assert.equal(driftOf({ ...base, stagedQuery: undefined, liveQuery: published, liveIsMigrated: false }), 'already-published', 'even with no staged query');
     assert.equal(driftOf({ ...base, liveQuery: 'other', liveIsMigrated: false }), 'edited', 'a query that is none of the three still drifts');
     assert.equal(driftOf({ ...base, liveQuery: staged, liveIsMigrated: false }), 'none', 'a recorded publish does not hide an untouched alert');
+  });
+
+  it('is already-published when the live query is any query an earlier apply wrote or may have written (its pending record)', () => {
+    const pending = `${approved}\n| fieldsAdd x = 1`;
+    const base = { stagedQuery: staged, approvedQuery: approved, publishedQuery: 'an older publish', publishedQueries: [pending] };
+    assert.equal(driftOf({ ...base, liveQuery: pending, liveIsMigrated: true }), 'already-published');
+    assert.equal(driftOf({ ...base, publishedQuery: undefined, liveQuery: ` ${pending} `, liveIsMigrated: true }), 'already-published');
+    assert.equal(driftOf({ ...base, liveQuery: 'other', liveIsMigrated: false }), 'edited');
   });
 
   it('reads a live query that differs from the approved one as before when nothing was published', () => {
