@@ -13,7 +13,7 @@
 import { SOURCE_ID_DIM, type BindingOutcome } from './detector-binding.ts';
 import { findQueryInput, type EventTemplateChange } from './detector-rewrite.ts';
 import { PUBLISH_OVERRIDES, isReadyToPublish, parsePublishOverride, type PublishOverride } from './decision-states.ts';
-import { DETECTOR_MARKER_RE, parseOriginalBlock } from './detector-notebook.ts';
+import { DETECTOR_MARKER_RE, parseOriginalBlock, parseReviewQuery } from './detector-notebook.ts';
 import { codeMask, timeseriesCommands } from './dql-command.ts';
 import { envIdFromBaseUrl } from './paths.ts';
 import { SettingsApiError } from '../dynatrace/settings.ts';
@@ -331,17 +331,27 @@ const ALL_MARKERS_RE = new RegExp(DETECTOR_MARKER_RE.source, 'gm');
  * approved one. The whole tile value comes back; the caller reads the approved
  * query (`parseReviewQuery`) and the staged classic query (`parseOriginalBlock`)
  * out of it.
+ *
+ * A tile is this alert's only when `parseReviewQuery` reads this alert's id out
+ * of it. A tile whose markers name several alerts (a reviewer pasted one card's
+ * tile into another's) is an error for every alert it names: read by its first
+ * marker it would hand the other alert this alert's query.
  */
 export function findApprovedTile(
   sections: Array<{ type?: string; state?: { input?: { value?: string } } }>,
   objectId: string,
 ): { value: string } | { error: string } {
   const hits: string[] = [];
+  let merged = false;
   for (const s of sections ?? []) {
     const value = s?.type === 'dql' ? s.state?.input?.value : undefined;
     if (typeof value !== 'string') continue;
-    if ([...value.matchAll(ALL_MARKERS_RE)].some((m) => m[1] === objectId)) hits.push(value);
+    const ids = new Set([...value.matchAll(ALL_MARKERS_RE)].map((m) => m[1]));
+    if (!ids.has(objectId)) continue;
+    if (ids.size > 1) merged = true;
+    else if (parseReviewQuery(value).objectId === objectId) hits.push(value);
   }
+  if (merged) return { error: 'tile carries markers for several alerts' };
   if (hits.length === 0) return { error: 'query tile not found' };
   if (hits.length > 1) return { error: 'two query tiles for this alert' };
   return { value: hits[0]! };

@@ -909,6 +909,28 @@ describe('findApprovedTile', () => {
     const real = tile('A-1');
     assert.deepEqual(findApprovedTile([quoted, real], 'A-1'), { value: real.state.input.value });
   });
+
+  it('refuses a tile holding two alerts’ cards, for every alert it names: one tile pasted into another, the other deleted', () => {
+    // Read as one alert's tile, the first marker would hand the other alert this alert's query.
+    const merged = dql(
+      buildReviewQuery('A-1', 'timeseries a = avg(cloud.aws.lambda.Errors.By.FunctionName)', 'classic a') +
+        buildReviewQuery('B-1', 'timeseries b = avg(cloud.aws.lambda.Throttles.By.FunctionName)', 'classic b'),
+    );
+    for (const id of ['A-1', 'B-1']) {
+      assert.deepEqual(findApprovedTile([markdown(id), merged], id), { error: 'tile carries markers for several alerts' }, id);
+    }
+  });
+
+  it('refuses a merged tile even when the alert also has a tile of its own', () => {
+    const merged = dql(buildReviewQuery('A-1', 'timeseries a = avg(one)', 'o') + buildReviewQuery('B-1', 'timeseries b = avg(two)', 'o'));
+    assert.deepEqual(findApprovedTile([tile('A-1'), merged], 'A-1'), { error: 'tile carries markers for several alerts' });
+  });
+
+  it('takes a tile whose markers all name this alert', () => {
+    const value = buildReviewQuery('A-1', 'timeseries a = avg(one)', 'o');
+    const twice = dql(`${value}\n// [CCT-DETECTOR objectId=A-1]\n`);
+    assert.deepEqual(findApprovedTile([twice], 'A-1'), { value: twice.state.input.value });
+  });
 });
 
 describe('isAuthFailure', () => {
