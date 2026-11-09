@@ -427,6 +427,25 @@ export function assertAllowedEnv(baseUrl: string, allowEnv: string | undefined, 
 }
 
 /**
+ * The whole command that records alerts an apply wrote but could not put on
+ * the sheet (its workbook was locked): the same command, narrowed to those ids,
+ * which finds them already written and records them without writing again.
+ */
+export function commandToRecord(
+  command: 'migrate-promote-detectors' | 'migrate-rollback-detectors',
+  a: { trackerPath: string; batches?: string[]; ids: string[]; allowEnv: string },
+): string {
+  return [
+    `cct ${command}`,
+    `--tracker "${a.trackerPath}"`,
+    ...(a.batches?.length ? [`--batches ${a.batches.join(',')}`] : []),
+    `--ids ${a.ids.join(',')}`,
+    '--apply',
+    `--allow-env ${a.allowEnv}`,
+  ].join(' ');
+}
+
+/**
  * The `--limit` flag as the CLI parsed it: a value, `true` when given with no
  * value, or absent. Anything but a positive integer throws, naming what was
  * typed: a limit that silently read as "no limit" would publish more than asked.

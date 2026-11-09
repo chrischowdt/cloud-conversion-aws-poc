@@ -47,6 +47,7 @@ import { dirname, join } from 'node:path';
 
 import {
   assertAllowedEnv,
+  commandToRecord,
   isAuthFailure,
   publishedPartsDiff,
   publishedPartsEqual,
@@ -394,6 +395,8 @@ export async function runRollbackDetectors(args: RollbackDetectorsArgs, deps: Ro
 
   // One sheet write for every alert the run decided, the ones before a stop included.
   run.rows = run.items.map(sheetRow).filter((r): r is TrackerRow => r !== undefined);
+  let unrecorded: string[] = [];
+  let recordCommand: string | undefined;
   if (run.rows.length) {
     try {
       await upsert(trackerPath, run.rows, ALERTS_SHEET);
@@ -401,13 +404,13 @@ export async function runRollbackDetectors(args: RollbackDetectorsArgs, deps: Ro
     } catch (e) {
       run.recorded = false;
       const msg = (e as Error)?.message ?? String(e);
-      const ids = run.rows.filter((r) => r.status === 'rolled-back').map((r) => r.asset_id);
-      if (ids.length) {
+      unrecorded = run.rows.filter((r) => r.status === 'rolled-back').map((r) => r.asset_id);
+      if (unrecorded.length) {
+        recordCommand = commandToRecord(COMMAND, { trackerPath, ids: unrecorded, allowEnv: envIdFromBaseUrl(args.baseUrl) });
         log(`\n  ! Rolled back, but could not write the tracker (${msg}).`);
-        log(
-          `    Close ${trackerPath} and re-run with --apply --ids ${ids.join(',')} --allow-env ${envIdFromBaseUrl(args.baseUrl)} to record them: ` +
-            'a re-run finds them already rolled back and records them without writing again.',
-        );
+        log(`    Close ${trackerPath} and run:`);
+        log(`      ${recordCommand}`);
+        log('    It finds them already rolled back and records them without writing again.');
       } else {
         log(`\n  ! Could not write the tracker (${msg}). Nothing was rolled back in this run; the reasons are in ${join(runDir, 'plan.json')}.`);
       }
@@ -420,6 +423,12 @@ export async function runRollbackDetectors(args: RollbackDetectorsArgs, deps: Ro
       `${notAttempted.length ? `, ${notAttempted.length} not attempted (the run stopped)` : ''}, of ${run.items.length}.`,
   );
   log(`Plan, payloads and the values before each write: ${runDir}.`);
-  if (stop) throw new Error(stopText());
+  if (stop) throw new Error(`${stopText()}${recordCommand ? ` The rolled-back alerts are not on the sheet: ${recordCommand}` : ''}`);
+  // The tenant has what the sheet does not: a run that ends here must not read as a success.
+  if (unrecorded.length) {
+    throw new Error(
+      `${COMMAND}: ${unrecorded.length} alert(s) rolled back on the tenant are not on the sheet (${unrecorded.join(', ')}). Close the workbook and run: ${recordCommand}`,
+    );
+  }
   return run;
 }

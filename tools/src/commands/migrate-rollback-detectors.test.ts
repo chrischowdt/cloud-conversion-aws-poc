@@ -235,6 +235,19 @@ describe('migrate-rollback-detectors: refusals', () => {
   });
 });
 
+describe('migrate-rollback-detectors: one reading of --apply', () => {
+  it('reads an apply flag that is not exactly true as prepare, for the mode as well as the env guard', async () => {
+    const t = await publishedAlerts([{ id: 'A' }]);
+
+    const run = await runRollbackDetectors({ ...t.args, ids: ['A'], apply: 'yes' as unknown as boolean }, t.deps());
+
+    assert.equal(puts(t).length, 0);
+    assert.equal(run.items[0]!.result, 'would-restore');
+    assert.match(run.runDir, /detector-rollback[\\/]prepare[\\/]/);
+    assert.equal(t.sheets.length, 0);
+  });
+});
+
 describe('migrate-rollback-detectors: prepare', () => {
   it('reads but never writes: no PUT, no sheet write, the value it would write on disk', async () => {
     const t = await publishedAlerts([{ id: 'A' }, { id: 'E', live: { value: detector(`${APPROVED} // edited`, NEW_PROPS), updateToken: 'x' } }]);
@@ -356,20 +369,44 @@ describe('migrate-rollback-detectors: auth failures and the sheet', () => {
     assert.deepEqual(t.store.get('A')!.value, publishedValue());
   });
 
-  it('keeps the rollback when the sheet write fails, and prints the ids to record', async () => {
+  it('keeps the rollback when the sheet write fails, exits non-zero, and names the whole command that records it', async () => {
     const t = await publishedAlerts([{ id: 'A' }, { id: 'B' }]);
     const deps = t.deps({
       upsert: async () => {
         throw new Error('EBUSY: resource busy or locked');
       },
     });
+    const command = `cct migrate-rollback-detectors --tracker "${t.trackerPath}" --ids A,B --apply --allow-env ${ENV}`;
 
-    const run = await runRollbackDetectors({ ...t.args, ...apply, ids: ['A', 'B'] }, deps);
+    await assert.rejects(runRollbackDetectors({ ...t.args, ...apply, batches: ['batch-03'] }, deps), (e: Error) => {
+      assert.match(e.message, /not on the sheet/);
+      assert.ok(e.message.includes(command), e.message);
+      return true;
+    });
 
-    assert.equal(run.recorded, false);
     assert.deepEqual(t.store.get('A')!.value, preValue());
     const out = t.lines.join('\n');
     assert.match(out, /Rolled back, but could not write the tracker/);
-    assert.match(out, /--apply --ids A,B/);
+    assert.ok(out.includes(command), out);
+
+    // The command it names records them without writing again.
+    const before = puts(t).length;
+    const rerun = await runRollbackDetectors({ ...t.args, ...apply, ids: ['A', 'B'] }, t.deps({ upsert: undefined }));
+    assert.deepEqual(rerun.items.map((i) => i.result), ['recorded', 'recorded']);
+    assert.equal(puts(t).length, before);
+  });
+
+  it('exits zero when the sheet write fails with nothing rolled back', async () => {
+    const t = await publishedAlerts([{ id: 'E', live: { value: detector(`${APPROVED} // edited`, NEW_PROPS), updateToken: 'x' } }]);
+    const deps = t.deps({
+      upsert: async () => {
+        throw new Error('EBUSY: resource busy or locked');
+      },
+    });
+
+    const run = await runRollbackDetectors({ ...t.args, ...apply, ids: ['E'] }, deps);
+
+    assert.equal(run.recorded, false);
+    assert.match(t.lines.join('\n'), /Nothing was rolled back in this run/);
   });
 });

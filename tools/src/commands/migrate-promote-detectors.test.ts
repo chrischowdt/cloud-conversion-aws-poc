@@ -5,10 +5,12 @@ import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { applyAndRecord, runPromoteDetectors, type ApplyDeps, type Outcome } from './migrate-promote-detectors.ts';
+import { applyAndRecord, runPromoteDetectors, type ApplyDeps, type Outcome, type PromoteRunDeps } from './migrate-promote-detectors.ts';
 import { runRollbackDetectors } from './migrate-rollback-detectors.ts';
 import { SettingsApiError } from '../dynatrace/settings.ts';
-import type { TrackerRow } from '../lib/tracker-xlsx.ts';
+import { buildReviewQuery } from '../lib/detector-notebook.ts';
+import { staticColumns } from '../lib/detector-publish.ts';
+import { ALERTS_SHEET, readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
 import { fakeSettings, type Stored } from './__testing__/fake-settings.ts';
 import { ENV, preValue, publishedAlerts } from './__testing__/published-alerts.ts';
 
@@ -87,6 +89,7 @@ async function setup(ids: string[]) {
     },
     log: (line) => lines.push(line),
     now: () => NOW,
+    rerun: { batches: ['batch-03'], allowEnv: 'abc12345' },
     ...over,
   });
   const json = async (...parts: string[]): Promise<unknown> => JSON.parse(await readFile(join(promoteDir, ...parts), 'utf8'));
@@ -202,7 +205,7 @@ describe('apply: the snapshot', () => {
       liveValue: structuredClone(f.store.get('A')!.value),
       payload: { objectId: 'A', title: 'Queue backlog', batch: 'batch-03', liveQuery: CLASSIC, value: detector(APPROVED, NEW_PROPS) },
     });
-    const applyDeps: ApplyDeps = { settings: f.settings, promoteDir: f.promoteDir, trackerPath: f.trackerPath, log: () => {}, now: () => NOW };
+    const applyDeps: ApplyDeps = { settings: f.settings, promoteDir: f.promoteDir, trackerPath: f.trackerPath, log: () => {}, now: () => NOW, rerun: { batches: ['batch-03'], allowEnv: ENV } };
     const rollback = (at: string) =>
       runRollbackDetectors({ ...f.args, ids: ['A'], apply: true, allowEnv: ENV }, { settings: f.settings, log: () => {}, now: () => new Date(at) });
     const eventName = () => (f.store.get('A')!.value.eventTemplate as { properties: Prop[] }).properties.find((p) => p.key === 'event.name')!.value;
@@ -700,11 +703,88 @@ describe('apply: the sheet write fails', () => {
 
     assert.equal(run.recorded, false);
     assert.deepEqual(run.published, ['A', 'B']);
+    assert.deepEqual(run.unrecorded, ['A', 'B']);
+    const command = `cct migrate-promote-detectors --tracker "${t.trackerPath}" --batches batch-03 --ids A,B --apply --allow-env abc12345`;
+    assert.equal(run.recordCommand, command);
     const out = t.lines.join('\n');
     assert.match(out, /Published, but could not write the tracker/);
-    assert.match(out, /A,B/);
-    assert.match(out, /--apply/);
+    assert.ok(out.includes(command), out);
     assert.equal(existsSync(join(t.promoteDir, 'published', 'A.json')), true);
+  });
+});
+
+/**
+ * A whole run against fakes: a tenant out dir with the review manifest and a
+ * real workbook, a review notebook served from memory, a scripted DQL runner and
+ * the fake Settings API. Nothing contacts a tenant.
+ */
+async function wholeRun() {
+  const outDir = await mkdtemp(join(tmpdir(), 'promote-run-'));
+  const reviewDir = join(outDir, 'migration', 'detector-review');
+  await mkdir(reviewDir, { recursive: true });
+  await writeFile(join(reviewDir, 'manifest.json'), JSON.stringify({ batches: [{ batch: 'batch-03', notebookId: 'nb-3', detectors: [{ objectId: 'A', title: 'Queue backlog' }] }] }));
+  const trackerPath = join(outDir, 'migration-tracker.xlsx');
+  await upsertRows(trackerPath, [{ asset_id: 'A', asset_type: 'anomaly-detector', name: 'Queue backlog', status: 'staged', decision: 'Ready To Publish' }], ALERTS_SHEET);
+  const store = new Map<string, Stored>([['A', { value: detector(CLASSIC, CLASSIC_PROPS), updateToken: 'tok-A-0', schemaVersion: '1.2.3' }]]);
+  const settings = fakeSettings(store);
+  const lines: string[] = [];
+  const tile = { type: 'dql', state: { input: { value: buildReviewQuery('A', APPROVED, CLASSIC) } } };
+  const deps = (over: Partial<PromoteRunDeps> = {}): PromoteRunDeps => ({
+    settings,
+    getDocumentFull: async () => ({ content: { sections: [tile] } }),
+    query: async ({ query }) => ({ records: [Object.fromEntries([...staticColumns(query)].map((c) => [c, 'x']))] }),
+    index: { byClassicId: new Map(), byDqlClassicKey: new Map() },
+    log: (line) => lines.push(line),
+    ...over,
+  });
+  const args = { outDir, baseUrl: 'https://abc12345.apps.dynatrace.com', token: 't', trackerPath, batches: ['batch-03'] };
+  return { outDir, trackerPath, store, settings, lines, deps, args };
+}
+
+describe('runPromoteDetectors: a whole run', () => {
+  it('publishes a Ready alert with --apply --allow-env and records it on the sheet', async () => {
+    const r = await wholeRun();
+
+    await runPromoteDetectors({ ...r.args, apply: true, allowEnv: 'abc12345' }, r.deps());
+
+    assert.deepEqual(r.store.get('A')!.value, detector(`${APPROVED}\n| fieldsAdd dt.smartscape.aws_sqs_queue.name = getNodeName(dt.smartscape.aws_sqs_queue)`, NEW_PROPS));
+    const row = (await readRows(r.trackerPath, ALERTS_SHEET)).get('A')!;
+    assert.equal(row.status, 'promoted');
+    assert.equal(row.decision, 'Published');
+  });
+
+  it('reads an apply flag that is not exactly true as prepare, for the mode as well as the env guard', async () => {
+    const r = await wholeRun();
+
+    await runPromoteDetectors({ ...r.args, apply: 'yes' as unknown as boolean }, r.deps());
+
+    assert.equal(r.settings.calls.some((c) => c.op === 'put' && c.validateOnly !== true), false, 'no write without --apply');
+    assert.ok(existsSync(join(r.outDir, 'migration', 'detector-promote', 'prepare')));
+    assert.equal(existsSync(join(r.outDir, 'migration', 'detector-promote', 'apply')), false);
+    assert.equal((await readRows(r.trackerPath, ALERTS_SHEET)).get('A')!.status, 'staged', 'prepare never writes the workbook');
+  });
+
+  it('exits non-zero when the sheet write fails after a publish, naming the whole command that records it', async () => {
+    const r = await wholeRun();
+    const failing = r.deps({
+      upsert: async () => {
+        throw new Error('EBUSY: resource busy or locked');
+      },
+    });
+    const command = `cct migrate-promote-detectors --tracker "${r.trackerPath}" --batches batch-03 --ids A --apply --allow-env abc12345`;
+
+    await assert.rejects(runPromoteDetectors({ ...r.args, apply: true, allowEnv: 'abc12345' }, failing), (e: Error) => {
+      assert.match(e.message, /not on the sheet/);
+      assert.ok(e.message.includes(command), e.message);
+      return true;
+    });
+    assert.ok(r.lines.some((l) => l.includes(command)), 'printed too');
+    assert.equal(r.settings.calls.filter((c) => c.op === 'put' && c.validateOnly !== true).length, 1, 'the publish stands');
+
+    // The command it names records the alert without writing it again.
+    await runPromoteDetectors({ ...r.args, ids: ['A'], apply: true, allowEnv: 'abc12345' }, r.deps());
+    assert.equal(r.settings.calls.filter((c) => c.op === 'put' && c.validateOnly !== true).length, 1);
+    assert.equal((await readRows(r.trackerPath, ALERTS_SHEET)).get('A')!.status, 'promoted');
   });
 });
 

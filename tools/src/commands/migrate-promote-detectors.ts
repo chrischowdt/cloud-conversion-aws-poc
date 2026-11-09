@@ -78,6 +78,7 @@ import { isEffectivelyEmpty, parseReviewQuery } from '../lib/detector-notebook.t
 import {
   assertAllowedEnv,
   buildPublishValue,
+  commandToRecord,
   decideEntity,
   detectorValuesEqual,
   diffOutsidePublishedParts,
@@ -110,7 +111,7 @@ import {
 } from '../lib/detector-promote-records.ts';
 import { PUBLISHED, PUBLISH_OVERRIDES, type PublishOverride } from '../lib/decision-states.ts';
 import { ALERTS_SHEET, readRows, upsertRows, type TrackerRow } from '../lib/tracker-xlsx.ts';
-import { DqlClient, DqlError, type DqlResult } from '../dynatrace/dql.ts';
+import { DqlClient, DqlError, type DqlExecuteRequest, type DqlResult } from '../dynatrace/dql.ts';
 import { DocumentApiError, DocumentClient } from '../dynatrace/document.ts';
 import { SettingsApiError, SettingsClient, type SettingsObject } from '../dynatrace/settings.ts';
 
@@ -771,6 +772,8 @@ export interface ApplyDeps {
   upsert?: (path: string, rows: TrackerRow[], sheet: string) => Promise<unknown>;
   log?: (line: string) => void;
   now?: () => Date;
+  /** The run's `--batches` and `--allow-env`, for the command that records what a failed sheet write left out. */
+  rerun: { batches: string[]; allowEnv: string };
 }
 
 export interface ApplyRun {
@@ -784,6 +787,10 @@ export interface ApplyRun {
   rows: TrackerRow[];
   /** False when the sheet write failed; the publishes stand. */
   recorded: boolean;
+  /** Published or recorded on the tenant but, the sheet write having failed, not on the sheet. */
+  unrecorded: string[];
+  /** With `unrecorded`: the whole command that records them. */
+  recordCommand?: string;
 }
 
 type ResolvedDeps = Required<ApplyDeps>;
@@ -1108,26 +1115,29 @@ async function sheetRows(outcomes: Outcome[], deps: ResolvedDeps): Promise<Track
   return rows;
 }
 
-/** One write to the alerts sheet. A failure never undoes a publish: it names the ids to record. */
-async function recordOnSheet(rows: TrackerRow[], deps: ResolvedDeps): Promise<boolean> {
-  if (!rows.length) return true;
+/**
+ * One write to the alerts sheet. A failure never undoes a publish: it names the
+ * alerts the sheet is missing and the whole command that records them.
+ */
+async function recordOnSheet(rows: TrackerRow[], deps: ResolvedDeps): Promise<{ recorded: boolean; unrecorded: string[]; recordCommand?: string }> {
+  if (!rows.length) return { recorded: true, unrecorded: [] };
   try {
     await deps.upsert(deps.trackerPath, rows, ALERTS_SHEET);
     deps.log(`Recorded ${rows.length} row(s) on the ${ALERTS_SHEET} sheet of ${deps.trackerPath}.`);
-    return true;
+    return { recorded: true, unrecorded: [] };
   } catch (e) {
     const msg = clip((e as Error)?.message ?? String(e), 100);
     const ids = rows.filter((r) => r.status === 'promoted').map((r) => r.asset_id);
-    if (ids.length) {
-      deps.log(`\n  ! Published, but could not write the tracker (${msg}).`);
-      deps.log(
-        `    Close ${deps.trackerPath} and re-run with --apply --ids ${ids.join(',')} to record them: ` +
-          'a re-run finds them already published and records them without writing again.',
-      );
-    } else {
+    if (!ids.length) {
       deps.log(`\n  ! Could not write the tracker (${msg}). Nothing was published in this run; the skip reasons are in the report.`);
+      return { recorded: false, unrecorded: [] };
     }
-    return false;
+    const recordCommand = commandToRecord('migrate-promote-detectors', { trackerPath: deps.trackerPath, batches: deps.rerun.batches, ids, allowEnv: deps.rerun.allowEnv });
+    deps.log(`\n  ! Published, but could not write the tracker (${msg}).`);
+    deps.log(`    Close ${deps.trackerPath} and run:`);
+    deps.log(`      ${recordCommand}`);
+    deps.log('    It finds them already published and records them without writing again.');
+    return { recorded: false, unrecorded: ids, recordCommand };
   }
 }
 
@@ -1163,8 +1173,8 @@ export async function applyAndRecord(outcomes: Outcome[], deps: ApplyDeps): Prom
     if (refused) stop = refused;
   }
   const rows = await sheetRows(outcomes, d);
-  const recorded = await recordOnSheet(rows, d);
-  return { published, notAttempted, stop, rows, recorded };
+  const sheet = await recordOnSheet(rows, d);
+  return { published, notAttempted, stop, rows, ...sheet };
 }
 
 /** Why the token was refused, and what it needs, by the API that refused it. */
@@ -1180,7 +1190,21 @@ function authStopText(e: unknown): string {
 
 // ---------------------------------------------------------------------------
 
-export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<void> {
+/** What a whole run talks to, injectable for tests; each defaults to the real client or loader. */
+export interface PromoteRunDeps {
+  settings?: Pick<SettingsClient, 'getObject' | 'putObject'>;
+  /** Reads a review notebook (the Document API, with admin access). */
+  getDocumentFull?: (id: string) => Promise<{ content: unknown }>;
+  query?: (req: DqlExecuteRequest) => Promise<DqlResult>;
+  /** The recipe index, instead of loading the mapping files. */
+  index?: RecipeIndex;
+  /** Defaults to `upsertRows`. */
+  upsert?: ApplyDeps['upsert'];
+  log?: (line: string) => void;
+}
+
+export async function runPromoteDetectors(args: PromoteDetectorsArgs, deps: PromoteRunDeps = {}): Promise<void> {
+  const log = deps.log ?? ((line: string) => console.log(line));
   const batches = (args.batches ?? []).map((b) => b.trim()).filter(Boolean);
   if (!batches.length) {
     throw new Error('migrate-promote-detectors: --batches is required, e.g. --batches batch-03,batch-04. There is no "publish everything Ready" mode.');
@@ -1195,8 +1219,11 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
   if (args.force && !args.ids?.length) {
     throw new Error('migrate-promote-detectors: --force needs --ids: it publishes named alerts their owner changed after review, never a whole batch.');
   }
-  assertAllowedEnv(args.baseUrl, args.allowEnv, args.apply === true);
-  const mode: ReportMeta['mode'] = args.apply ? 'apply' : 'prepare';
+  // One reading of --apply for the env guard and the mode alike: a value that is
+  // not exactly `true` must not reach the writes with the guard skipped.
+  const apply = args.apply === true;
+  assertAllowedEnv(args.baseUrl, args.allowEnv, apply);
+  const mode: ReportMeta['mode'] = apply ? 'apply' : 'prepare';
 
   const base = args.outDir;
   const reviewDir = join(base, 'migration', 'detector-review');
@@ -1217,38 +1244,40 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
   const selected = selectForPublish(rows, manifest.batches ?? [], { batches, ids: args.ids });
   const unknownBatches = selected.unknownBatches;
   if (unknownBatches.length) {
-    console.log(`Not found in the manifest, or never published as a review notebook: ${unknownBatches.join(', ')}. Continuing with the rest.`);
+    log(`Not found in the manifest, or never published as a review notebook: ${unknownBatches.join(', ')}. Continuing with the rest.`);
   }
   if (args.ids?.length) {
     const picked = new Set(selected.candidates.map((c) => c.objectId));
     const left = whyNotSelected(args.ids.filter((id) => !picked.has(id)), rows, manifest.batches ?? [], { batches });
     if (left.length) {
-      console.log(`${left.length} of the --ids not selected:`);
-      for (const l of left) console.log(`  ${l.id}: ${l.reason}`);
+      log(`${left.length} of the --ids not selected:`);
+      for (const l of left) log(`  ${l.id}: ${l.reason}`);
     }
   }
   const candidates = args.limit === undefined ? selected.candidates : selected.candidates.slice(0, args.limit);
   if (!candidates.length) {
-    console.log(`Nothing to publish: no Ready To Publish alert on the alerts sheet of ${trackerPath} is in ${batches.join(', ')}${args.ids?.length ? ' with the given --ids' : ''}.`);
+    log(`Nothing to publish: no Ready To Publish alert on the alerts sheet of ${trackerPath} is in ${batches.join(', ')}${args.ids?.length ? ' with the given --ids' : ''}.`);
     return;
   }
-  console.log(`${args.apply ? 'Planning' : 'Preparing'} ${candidates.length} alert(s) from ${batches.join(', ')}…`);
+  log(`${apply ? 'Planning' : 'Preparing'} ${candidates.length} alert(s) from ${batches.join(', ')}…`);
 
-  const mappingPath = join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json');
-  const index = await loadRecipeIndex(mappingPath, {
-    dacPath: SKILL_DAC_AWS_METRICS,
-    manualPath: SKILL_MANUAL_AWS_METRICS,
-    perKeyPath: SKILL_PER_KEY_AWS_METRICS,
-    liveMetricsPath: liveMetricsPathIfPresent(base),
-    mzTagsPath: mzTagsPathIfPresent(base),
-    enrichedTagsPath: enrichedTagsPathIfPresent(base),
-    entityArnsPath: entityArnsPathIfPresent(base),
-    entityCandidatesPath: entityCandidatesPathIfPresent(base),
-  });
+  const index =
+    deps.index ??
+    (await loadRecipeIndex(join(REPO_ROOT, 'mappings', 'aws_mapping.with_recipes.json'), {
+      dacPath: SKILL_DAC_AWS_METRICS,
+      manualPath: SKILL_MANUAL_AWS_METRICS,
+      perKeyPath: SKILL_PER_KEY_AWS_METRICS,
+      liveMetricsPath: liveMetricsPathIfPresent(base),
+      mzTagsPath: mzTagsPathIfPresent(base),
+      enrichedTagsPath: enrichedTagsPathIfPresent(base),
+      entityArnsPath: entityArnsPathIfPresent(base),
+      entityCandidatesPath: entityCandidatesPathIfPresent(base),
+    }));
 
-  const settings = new SettingsClient({ baseUrl: args.baseUrl, token: args.token });
-  const docs = new DocumentClient({ baseUrl: args.baseUrl, token: args.token });
-  const dql = new DqlClient({ baseUrl: args.baseUrl, token: args.token });
+  const settings = deps.settings ?? new SettingsClient({ baseUrl: args.baseUrl, token: args.token });
+  const getDocumentFull = deps.getDocumentFull ?? ((id: string) => new DocumentClient({ baseUrl: args.baseUrl, token: args.token }).getDocumentFull(id, true));
+  const dql = deps.query ? undefined : new DqlClient({ baseUrl: args.baseUrl, token: args.token });
+  const runQuery = deps.query ?? ((req: DqlExecuteRequest) => dql!.query(req));
 
   // The first HTTP 401/403 from any API. The workers stop taking alerts once it
   // is set. Recorded here as well as thrown, because some callers (the binding
@@ -1267,11 +1296,11 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
     args,
     index,
     settings,
-    run: (query, windowMs) => {
+    run: (q, windowMs) => {
       const end = new Date();
       return noteAuth(
-        dql.query({
-          query,
+        runQuery({
+          query: q,
           defaultTimeframeStart: new Date(end.getTime() - windowMs).toISOString(),
           defaultTimeframeEnd: end.toISOString(),
           // One past the cap is enough to know a split is too big for Davis.
@@ -1283,7 +1312,7 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
     sections: (notebookId) => {
       let p = notebooks.get(notebookId);
       if (!p) {
-        p = noteAuth(docs.getDocumentFull(notebookId, true)).then((d) => {
+        p = noteAuth(getDocumentFull(notebookId)).then((d) => {
           const content = (typeof d.content === 'string' ? JSON.parse(d.content) : d.content) as { sections?: unknown };
           return Array.isArray(content?.sections) ? content.sections : [];
         });
@@ -1342,7 +1371,7 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
       }
       done++;
       if (done % 25 === 0 || done === candidates.length) {
-        console.log(`  … ${done}/${candidates.length} (${Math.round((Date.now() - started) / 1000)}s)`);
+        log(`  … ${done}/${candidates.length} (${Math.round((Date.now() - started) / 1000)}s)`);
       }
     }
   };
@@ -1367,46 +1396,53 @@ export async function runPromoteDetectors(args: PromoteDetectorsArgs): Promise<v
   const n = (r: PublishPlanItem['result']) => finished.filter((o) => o.item.result === r).length;
   const printSkips = (): void => {
     for (const [gate, k] of countBy(finished.filter((o) => o.item.result === 'skipped'), (o) => o.gate)) {
-      console.log(`  ${String(k).padStart(4)}  ${gate}`);
+      log(`  ${String(k).padStart(4)}  ${gate}`);
     }
     const overridden = finished.filter((o) => o.item.override && o.item.result !== 'skipped').length;
-    if (overridden) console.log(`  ${overridden} going out under a publish_override (listed in the report).`);
+    if (overridden) log(`  ${overridden} going out under a publish_override (listed in the report).`);
   };
 
-  if (!args.apply) {
+  if (!apply) {
     await writePlan();
-    console.log('');
-    console.log(`${n('ready')} ready (server validation passed), ${n('recorded')} already published (recorded only), ${n('skipped')} skipped, of ${finished.length}.`);
+    log('');
+    log(`${n('ready')} ready (server validation passed), ${n('recorded')} already published (recorded only), ${n('skipped')} skipped, of ${finished.length}.`);
     printSkips();
-    console.log('');
-    console.log(`Report: ${join(runDir, 'report.md')}`);
-    console.log(`Plan and payloads: ${runDir}. Nothing was written to the tenant or the workbook.`);
+    log('');
+    log(`Report: ${join(runDir, 'report.md')}`);
+    log(`Plan and payloads: ${runDir}. Nothing was written to the tenant or the workbook.`);
     return;
   }
 
   // The payloads are on disk before the first write; the plan and report are
   // written once the run's results are known.
-  console.log('');
-  console.log(`${n('ready')} ready, ${n('recorded')} already published (recorded only), ${n('skipped')} skipped. Writing the ready ones, one at a time…`);
-  const run = await applyAndRecord(finished, { settings, promoteDir, trackerPath });
+  log('');
+  log(`${n('ready')} ready, ${n('recorded')} already published (recorded only), ${n('skipped')} skipped. Writing the ready ones, one at a time…`);
+  const run = await applyAndRecord(finished, { settings, promoteDir, trackerPath, upsert: deps.upsert, log, rerun: { batches, allowEnv: envIdFromBaseUrl(args.baseUrl) } });
   const stopped = run.stop
     ? `${authStopText(run.stop)} ${run.notAttempted.length} ready alert(s) not written: ${run.notAttempted.join(', ')}.`
     : undefined;
   await writePlan(stopped);
 
-  console.log('');
-  console.log(
+  log('');
+  log(
     `${n('published')} published, ${n('recorded')} already published (recorded only), ${n('skipped')} skipped` +
       `${run.notAttempted.length ? `, ${run.notAttempted.length} not written (the run stopped)` : ''}, of ${finished.length}.`,
   );
   printSkips();
-  console.log('');
-  console.log(`Report: ${join(runDir, 'report.md')}`);
-  console.log(`Snapshots: ${join(promoteDir, 'pre')}. Published values: ${join(promoteDir, 'published')}.`);
+  log('');
+  log(`Report: ${join(runDir, 'report.md')}`);
+  log(`Snapshots: ${join(promoteDir, 'pre')}. Published values: ${join(promoteDir, 'published')}.`);
   if (run.stop) {
     throw new Error(
       `migrate-promote-detectors: stopped. ${stopped} ` +
-        `${run.published.length} alert(s) published before it ${run.recorded ? 'are recorded on the sheet' : 'are not on the sheet yet (see above)'}.`,
+        `${run.published.length} alert(s) published before it ${run.recorded ? 'are recorded on the sheet' : `are not on the sheet yet: ${run.recordCommand ?? '(see above)'}`}.`,
+    );
+  }
+  // The tenant has what the sheet does not: a run that ends here must not read as a success.
+  if (run.unrecorded.length) {
+    throw new Error(
+      `migrate-promote-detectors: ${run.unrecorded.length} alert(s) published or recorded on the tenant are not on the sheet (${run.unrecorded.join(', ')}). ` +
+        `Close the workbook and run: ${run.recordCommand}`,
     );
   }
 }
