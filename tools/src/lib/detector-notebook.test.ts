@@ -190,8 +190,9 @@ describe('reviewer verdict card', () => {
   });
 
   it('parseReviewCard reads an id that contains the letter s', () => {
-    const id =
-      'vu9U3hXa3q0AAAABAB9idWlsdGluOmRhdmlzLmFub21hbHktZGV0ZWN0b3JzAAZ0ZW5hbnQABnRlbmFudAAkZGU4MzE3ZTgtOWYxYy0zNjM0LTkyZWQtYjZhNDI1ODQ4YWUzvu9U3hXa3q0';
+    // Synthetic, settings-object-id shaped: base64-ish, with "s" early, in the middle and at the end.
+    const id = 'sYnThEt1cAAAABAB9sampleQmRhdmlzLmZha2Utb2JqZWN0cwAGdGVzdsMAJHN5bnRoZXRpYy1pZC1mb3ItdGVzdHMss';
+    assert.ok((id.match(/s/g) ?? []).length >= 4, 'the id must hold the letter the old regex stopped at');
     const p = parseReviewCard(buildReviewCard({ objectId: id, title: 't' } as any));
     assert.equal(p.objectId, id);
   });

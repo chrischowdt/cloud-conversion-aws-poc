@@ -683,6 +683,25 @@ describe('mapEventFields: placeholders', () => {
     assert.equal(r.nameColumn, undefined);
   });
 
+  it('lists each property the removed placeholders leave empty, and only those', () => {
+    const r = map(
+      [
+        { key: 'event.name', value: ' {dims:dt.entity.custom_device.name} ' },
+        { key: 'event.description', value: 'On {dims:dt.entity.custom_device}' },
+        { key: 'custom.blank', value: '' },
+        { key: 'custom.ids', value: '{dt.source_entity} {dims:dt.entity.custom_device}' },
+      ],
+      { withoutEntity: true },
+    );
+    assert.deepEqual(r.emptied, ['event.name', 'custom.ids']);
+    assert.equal(valueOf(r.props, 'event.description'), 'On');
+  });
+
+  it('empties nothing when there is an entity to map the placeholders to', () => {
+    const r = map([{ key: 'event.name', value: '{dims:dt.entity.custom_device.name}' }], { entityColumn: 'dt.smartscape.aws_sqs_queue', withoutEntity: true });
+    assert.deepEqual(r.emptied, []);
+  });
+
   it('closes the gap a removed placeholder leaves in the middle of a sentence', () => {
     const r = map([{ key: 'event.name', value: '{dims:dt.entity.custom_device} lag on {dims:dt.entity.custom_device.name} is high' }], {
       withoutEntity: true,
@@ -776,6 +795,27 @@ describe('staticColumns', () => {
 
   it('is empty for a query with no timeseries and no field commands', () => {
     assert.deepEqual(staticColumns('fetch logs | limit 5'), new Set());
+  });
+
+  it('does not read a lookup, join or in() subquery: their columns never reach the result as named', () => {
+    const q = [
+      'timeseries v = avg(m), by:{Q}',
+      '| lookup [fetch dt.entity.x | fieldsAdd inner = 1 | fields inner2], sourceField:Q, lookupField:id',
+      '| join [timeseries w = avg(n), by:{J} | fieldsAdd joined = 1], on:{Q}',
+      '| filter in(Q, [fetch x | fields picked])',
+      '| fieldsAdd outer = 1',
+    ].join('\n');
+    assert.deepEqual(staticColumns(q), new Set(['v', 'timeframe', 'interval', 'Q', 'outer']));
+  });
+
+  it('still reads an append, its timeseries and its field commands', () => {
+    const q = 'timeseries a = avg(m), by:{One}\n| append [timeseries b = avg(n), by:{Two} | fieldsAdd c = 1]';
+    assert.deepEqual(staticColumns(q), new Set(['a', 'b', 'timeframe', 'interval', 'One', 'Two', 'c']));
+  });
+
+  it('does not read an append inside a lookup', () => {
+    const q = 'timeseries a = avg(m), by:{One}\n| lookup [fetch x | append [fetch y | fieldsAdd deep = 1]], sourceField:One, lookupField:id';
+    assert.deepEqual(staticColumns(q), new Set(['a', 'timeframe', 'interval', 'One']));
   });
 });
 

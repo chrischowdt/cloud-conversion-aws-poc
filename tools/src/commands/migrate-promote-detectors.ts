@@ -579,6 +579,12 @@ export async function planOne(c: PublishCandidate, ctx: PlanCtx): Promise<Outcom
         'Make the query emit the column, in the review notebook.',
     );
   }
+  if (mapped.emptied.length) {
+    return skip(
+      'removing the entity placeholders leaves a field empty',
+      `removing the entity placeholders leaves ${mapped.emptied.join(', ')} empty; reword it in the detector`,
+    );
+  }
 
   // The added columns never ran: run the query that would go out once.
   if (!ranOk.has(finalQuery)) {

@@ -337,6 +337,23 @@ describe('planOne: the gates, in order (I5)', () => {
       assert.equal(ran.some((r) => r.query === BOUND && r.windowMs === TWO_HOURS), false, 'the 2-hour cap run never happens');
     });
 
+    it('skips an alert published without entity whose event text is nothing but entity placeholders', async () => {
+      const live = detector(CLASSIC, [
+        { key: 'event.name', value: '{dims:dt.entity.custom_device.name}' },
+        { key: 'dt.source_entity', value: '{dims:dt.entity.custom_device}' },
+      ]);
+      const { item, outcome } = await plan({ tileQuery: NO_ENTITY, live, candidate: { override: 'without-entity' } });
+      assert.equal(outcome.gate, 'removing the entity placeholders leaves a field empty');
+      assert.equal(item.reasons[0], 'removing the entity placeholders leaves event.name empty; reword it in the detector');
+    });
+
+    it('publishes without entity when text is left once the placeholders are removed', async () => {
+      const live = detector(CLASSIC, [{ key: 'event.name', value: 'Backlog on {dims:dt.entity.custom_device.name}' }]);
+      const { item, outcome } = await plan({ tileQuery: NO_ENTITY, live, candidate: { override: 'without-entity' } });
+      assert.equal(item.result, 'ready', item.reasons.join(' | '));
+      assert.deepEqual((outcome.payload!.value.eventTemplate as { properties: Prop[] }).properties, [{ key: 'event.name', value: 'Backlog on' }]);
+    });
+
     it('publishes it per resource under the reviewer’s override', async () => {
       const rows = (q: string, w: number) => (q === BOUND && w === SEVEN_DAYS ? [{ 'dt.smartscape_source.id': 1 }, { 'dt.smartscape_source.id': 2 }, { 'dt.smartscape_source.id': 3 }] : textRows(q));
       const { item } = await plan({ tileQuery: NO_ENTITY, rows, candidate: { override: 'per-resource' } });

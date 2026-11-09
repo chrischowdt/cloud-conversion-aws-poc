@@ -91,6 +91,20 @@ interface ManifestEntry {
   detectors: Array<{ objectId: string; sectionId: string; title: string; bucket: ReviewBucket }>;
 }
 
+/**
+ * What to do once the review notebooks are out: review, then publish one batch
+ * at a time, starting with a prepare run (no --apply). The approved query is read
+ * live from the notebook, so there is no pull step.
+ */
+export function nextStepHint(batches: string[]): string {
+  const first = batches[0] ?? '<batch>';
+  return (
+    'Reviewers open the notebooks, run/fix each DQL tile, save, and set the decision on the alerts sheet. ' +
+    `Then publish one batch at a time, starting with a prepare run: \`cct migrate-promote-detectors --batches ${first}\`` +
+    (batches.length > 1 ? ` (this run staged ${batches.join(', ')}).` : '.')
+  );
+}
+
 const notebookUiUrl = (baseUrl: string, id: string) =>
   `${baseUrl.replace(/\/+$/, '')}/ui/apps/dynatrace.notebooks/notebook/${id}`;
 
@@ -594,7 +608,7 @@ export async function runStageDetectors(args: StageDetectorsArgs): Promise<void>
       ? `shared read-write with group ${args.shareGroupId}`
       : 'env-shared read-write';
     console.log(`Created ${created}/${total} review notebook(s) (${shareNote}). Manifest: ${join(reviewDir, 'manifest.json')}`);
-    console.log('Reviewers open the notebooks, run/fix each DQL tile, save. Then `cct migrate-pull-detectors` + `cct migrate-promote-detectors`.');
+    console.log(nextStepHint(manifest.map((m) => m.batch)));
   } else {
     console.log(`Prepared ${batches.length} notebook payload(s) in ${reviewDir}; no writes made. Inspect them, then re-run with --apply.`);
   }

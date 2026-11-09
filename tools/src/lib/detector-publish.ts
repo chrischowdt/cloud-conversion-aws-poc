@@ -223,8 +223,13 @@ export function selectPublished(
 /**
  * How the live alert's query relates to the review:
  *   none              still the classic query the card was staged from; safe to publish
- *   already-published it already IS the approved query (a re-run after a publish
- *                     whose sheet write failed); record it, do not write again
+ *   already-published it already IS the approved query, or one an earlier apply
+ *                     wrote or may have written: not an owner edit. It goes on
+ *                     through the gates; whether anything is left to write is
+ *                     decided by comparing the value a publish would write with
+ *                     live: recorded when they agree, else an event-field-only
+ *                     update. (An alert still holding a published record's query
+ *                     AND event fields is recorded before this check is reached.)
  *   edited            an owner changed it after review
  *   owner-migrated    differs, and no classic references are left: the owner
  *                     already migrated it
@@ -582,18 +587,21 @@ function placeholderColumn(column: string, columns: ReadonlySet<string>): { name
  * may not emit it; the caller adds it (`withNodeNameColumn`) when it does not.
  * `aliases` lists, once each, the `fieldsAdd <alias> = \`<column>\`` the query
  * needs for the placeholders now naming an alias (`withColumnAliases`).
- * `unresolved` lists each unmapped placeholder once, as written. The properties
- * given are not modified.
+ * `unresolved` lists each unmapped placeholder once, as written. `emptied` lists
+ * the key of each property whose text was nothing but entity placeholders, so
+ * removing them (`withoutEntity`) left it empty: an alert titled "" is worse than
+ * one sent back. The properties given are not modified.
  */
 export function mapEventFields(
   props: EventProp[],
   ctx: { columns: ReadonlySet<string>; entityColumn?: string; withoutEntity: boolean },
-): { props: EventProp[]; changes: EventTemplateChange[]; unresolved: string[]; nameColumn?: string; aliases: ColumnAlias[] } {
+): { props: EventProp[]; changes: EventTemplateChange[]; unresolved: string[]; emptied: string[]; nameColumn?: string; aliases: ColumnAlias[] } {
   const entity = ctx.entityColumn;
   const entityName = entity ? `${entity}.name` : undefined;
   const binding = entity ? `{${entity}}` : undefined;
   const changes: EventTemplateChange[] = [];
   const unresolved: string[] = [];
+  const emptied: string[] = [];
   const aliases: ColumnAlias[] = [];
   let nameColumn: string | undefined;
 
@@ -680,6 +688,8 @@ export function mapEventFields(
     if (typeof p?.value === 'string') {
       const mapped = mapText(p.value);
       if (mapped !== p.value) changes.push({ field: String(p.key ?? ''), before: p.value, after: mapped });
+      // Only removing placeholders can empty a text; one that was blank stays the owner's.
+      if (!mapped.trim() && p.value.trim()) emptied.push(String(p.key ?? '?'));
       out.push({ ...p, value: mapped });
     } else {
       out.push({ ...p });
@@ -690,7 +700,7 @@ export function mapEventFields(
     changes.push({ field: SOURCE_ID_DIM, before: '(absent)', after: binding });
   }
 
-  return { props: out, changes, unresolved, nameColumn, aliases };
+  return { props: out, changes, unresolved, emptied, nameColumn, aliases };
 }
 
 /**
@@ -758,11 +768,12 @@ function entryNames(entries: string[], bare: boolean): string[] {
 }
 
 /**
- * Every pipeline command at any bracket depth: its name and what follows the
- * name, up to the next `|` at that depth or the bracket that ends it.
+ * Every pipeline command at any bracket depth: its name, where its `|` is, and
+ * what follows the name, up to the next `|` at that depth or the bracket that
+ * ends it.
  */
-function pipelineCommands(code: string): Array<{ name: string; body: string }> {
-  const out: Array<{ name: string; body: string }> = [];
+function pipelineCommands(code: string): Array<{ name: string; body: string; start: number }> {
+  const out: Array<{ name: string; body: string; start: number }> = [];
   const starts: Array<number | undefined> = [];
   let depth = 0;
   const finish = (d: number, end: number): void => {
@@ -770,7 +781,7 @@ function pipelineCommands(code: string): Array<{ name: string; body: string }> {
     if (start === undefined) return;
     starts[d] = undefined;
     const head = COMMAND_NAME_RE.exec(code.slice(start, end));
-    if (head) out.push({ name: head[1]!, body: code.slice(start + head[0].length, end) });
+    if (head) out.push({ name: head[1]!, body: code.slice(start + head[0].length, end), start });
   };
   for (let i = 0; i < code.length; i++) {
     const c = code[i]!;
@@ -788,23 +799,55 @@ function pipelineCommands(code: string): Array<{ name: string; body: string }> {
   return out;
 }
 
+/** An `append` command right before a `[`: its subquery's records join the result. */
+const APPEND_BEFORE_RE = /\|\s*append\s*$/;
+
+/**
+ * For each position of `code` (strings and comments blanked): is it inside a
+ * subquery whose columns do not reach the result under their own names? That is
+ * every `[...]` except the one an `| append` opens, and everything nested in one:
+ * a `lookup [...]` brings its columns back prefixed (`lookup.x`), a `join [...]`
+ * as `right.x`, and an `in(x, [...])` brings none.
+ */
+function hiddenSubqueries(code: string): boolean[] {
+  const hidden = new Array<boolean>(code.length).fill(false);
+  const stack: boolean[] = [];
+  for (let i = 0; i < code.length; i++) {
+    const c = code[i]!;
+    const inside = stack.length > 0 && stack[stack.length - 1]!;
+    hidden[i] = inside;
+    if (c === '[') stack.push(inside || !APPEND_BEFORE_RE.test(code.slice(Math.max(0, i - 64), i)));
+    else if (c === '(' || c === '{') stack.push(inside);
+    else if (c === ')' || c === ']' || c === '}') stack.pop();
+  }
+  return hidden;
+}
+
 /**
  * The columns a query is expected to emit, read from its text: each timeseries'
  * aggregation names, `timeframe`, `interval` and the names of its top-level
  * `by:{}` (an alias takes its left-hand name), plus every `fieldsAdd x =` and
- * `fields x = …` / bare `fields a, b` name. For when no run returned rows to read
- * the real columns from. It is partial on purpose (a `summarize`, `parse` or
- * `fieldsRename` adds columns it does not see); a missing column makes a
- * placeholder read as unresolved, which sends the alert back for review rather
- * than out with literal text.
+ * `fields x = …` / bare `fields a, b` name. A subquery counts only when an
+ * `append` opens it: one inside a `lookup [...]`, `join [...]` or `in(...)` is
+ * not read. For when no run returned rows to read the real columns from.
+ *
+ * It is an estimate both ways. It under-reports: a `summarize`, `parse`,
+ * `lookup` or `fieldsRename` adds columns it does not see; a missing column makes
+ * a placeholder read as unresolved, which sends the alert back for review rather
+ * than out with literal text. It also over-reports: a later `fields`,
+ * `fieldsKeep` or `fieldsRemove` can drop a column it listed, and a placeholder
+ * reading that column then passes here but goes out as literal text. So the
+ * entity-column check is not made against these columns, and the report says
+ * when they were used.
  */
 export function staticColumns(query: string): Set<string> {
   const mask = codeMask(query);
   // Split by UTF-16 unit, not code point: the mask is indexed by unit.
   const code = query.split('').map((c, i) => (mask[i] ? c : ' ')).join('');
+  const hidden = hiddenSubqueries(code);
   const columns = new Set<string>();
 
-  const series = timeseriesCommands(query);
+  const series = timeseriesCommands(query).filter((cmd) => !hidden[cmd.start]);
   if (series.length) {
     columns.add('timeframe');
     columns.add('interval');
@@ -824,8 +867,9 @@ export function staticColumns(query: string): Set<string> {
     }
   }
 
-  for (const { name, body } of pipelineCommands(code)) {
+  for (const { name, body, start } of pipelineCommands(code)) {
     if (name !== 'fieldsAdd' && name !== 'fields') continue;
+    if (hidden[start]) continue;
     for (const column of entryNames(topLevelEntries(body), name === 'fields')) columns.add(column);
   }
   return columns;
